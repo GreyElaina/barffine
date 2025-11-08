@@ -1,6 +1,6 @@
 # Barffine
 
-Barffine is an experimental Rust backend tailored for self-hosted or resource-limited deployments of [AFFiNE](../AFFiNE). The goal is to keep the collaboration surface compatible with existing clients while dramatically shrinking the operational footprint.
+Barffine is an experimental Rust backend tailored for self-hosted or resource-limited deployments of [AFFiNE](https://github.com/toeverything/AFFiNE). The goal is to keep the collaboration surface compatible with existing clients while dramatically shrinking the operational footprint.
 
 ## Running locally
 
