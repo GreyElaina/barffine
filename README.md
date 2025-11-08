@@ -1,57 +1,68 @@
 # Barffine
 
-Barffine is an experimental Rust backend tailored for self-hosted or resource-limited deployments of [AFFiNE](https://github.com/toeverything/AFFiNE). The goal is to keep the collaboration surface compatible with existing clients while dramatically shrinking the operational footprint.
+Barffine is an [AFFiNE](https://github.com/toeverything/AFFiNE) compatible backend written in Rust, which provides a REST/GraphQL/Socket.IO/CRDT collaboration interface consistent with the official Node/TS backend with a single binary. It uses only SQLite storage, can be self-hosted in resource-constrained environments, and includes built-in migration, admin creation, document caching, and observability tools.
 
-## Running locally
+## Feature highlights
+- **sqlite-only persistence** powered by `sqlx` with migrations under `server/migrations`. No Postgres or external queues are required.
+- **Single binary deployment** via `cargo run -p barffine-server` with CLI subcommands for serving, migrating, and creating admin accounts.
+- **Drop-in client compatibility**: REST endpoints (under `/api`, `/rpc`, `/workspaces`, etc.), a GraphQL endpoint on `/graphql`, and Socket.IO channels reuse the same shapes as the upstream AFFiNE backend.
+- **Real-time editing pipeline**: CRDT updates flow through `y-octo`, Socket.IO broadcasts, and `/docs/{id}/ws` WebSockets, while adaptive doc caching keeps hot documents in memory.
+- **Configurable feature flags**: `BARFFINE_SERVER_FEATURES` and `FeatureService` mirror AFFiNE feature namespaces so you can advertise the exact capabilities to the UI.
+- **Observability hooks**: structured tracing, Logfire integration (optional `LOGFIRE_TOKEN`), and HTTP metrics middleware ship by default.
 
-```shell
-cargo run -p barffine-server
-```
+## Quick start
+1. Install the latest stable Rust toolchain (Edition 2024 is enabled in `Cargo.toml`).
+2. Copy `.env` or create a new one based on the snippet below to describe your bind address and public URL.
+3. Run the server:
+   ```shell
+   cargo run -p barffine-server
+   ```
+   The default bind address is `127.0.0.1:8081` and the SQLite file is created at `./data/barffine.db`.
+4. Bootstrap an admin account so AFFiNE can log in:
+   ```shell
+   cargo run -p barffine-server -- create-admin <email> <password>
+   ```
+   The command is idempotent; rerunning it rotates the password if the user already exists.
+5. Verify the instance with `curl http://127.0.0.1:8081/health` and point your AFFiNE client at the same base URL.
 
-The server exposes simple health and document snapshot endpoints on `127.0.0.1:8081` by default.
+## Operational commands
+| Command | Description |
+| --- | --- |
+| `cargo run -p barffine-server -- serve` | Start the HTTP, GraphQL, and Socket.IO services (default subcommand). |
+| `cargo run -p barffine-server -- create-admin <email> <password>` | Create or update an administrator and ensure the `admin` role is applied. |
 
-## Add Account
+Planned CLI parity with the Node backend (see `server/src/cli/mod.rs`) documents future subcommands such as `data-migrate` and workspace inspection.
 
-```shell
-cargo run -p barffine-server -- create-admin <username> <password>
-```
+## Configuration
+Barffine loads configuration in the following order (later items win): defaults → optional TOML file pointed to by `BARFFINE_CONFIG_FILE` → environment variables → `.env` (via `dotenvy`). Keep `.env` around for local runs and promote the same values into your process manager when deploying.
 
-## Runtime Configuration
+Key variables:
 
-Barffine's runtime configuration is mainly managed through environment variables, and it also supports loading through optional TOML configuration files (specified by `BARFFINE_CONFIG_FILE`) and `.env` files (the project uses `dotenvy`). The configuration priority is usually: default values -> configuration files -> environment variables -> `.env` (if it exists).
+| Variable | Default / Example | Notes |
+| --- | --- | --- |
+| `BARFFINE_BIND_ADDRESS` | `127.0.0.1:8081` | Socket address for the HTTP listener. |
+| `BARFFINE_DATABASE_PATH` (`BARFFINE_DATABASE_URL`) | `./data/barffine.db` | Path to the sqlite-only database. |
+| `BARFFINE_BASE_URL` / `BARFFINE_PUBLIC_BASE_URL` | Derived from host/port | Used to build absolute links returned to clients. Set both when exposing Barffine behind a proxy. |
+| `BARFFINE_SERVER_HOST` / `BARFFINE_SERVER_PORT` | `127.0.0.1` / `8081` | Populate compatibility metadata surfaced to AFFiNE clients. |
+| `BARFFINE_SERVER_PATH` / `BARFFINE_SERVER_SUB_PATH` | unset | Mount the API under a prefix when sitting behind a reverse proxy. |
+| `AFFINE_VERSION`, `DEPLOYMENT_TYPE`, `SERVER_FLAVOR` | `0.25.0`, `selfhosted`, `allinone` | Advertise compatibility and deployment flavour in `/info`. |
+| `BARFFINE_SERVER_FEATURES` | empty | Comma or semicolon separated list enabling feature flags (e.g., `comment,indexer`). |
+| `BARFFINE_CRYPTO_PRIVATE_KEY` (`AFFINE_CRYPTO_PRIVATE_KEY`) | autogenerated if missing | Used by `DocTokenSigner` to mint RPC tokens; a random key is generated at startup when not provided. |
+| `BARFFINE_ALLOW_GUEST_DEMO_WORKSPACE` | `false` | Allow anonymous demo workspaces. |
+| `BARFFINE_PASSWORD_MIN` / `BARFFINE_PASSWORD_MAX` | upstream defaults | Enforce password length guards. |
+| `BARFFINE_ENVIRONMENT` (`BARFFINE_ENV`) | unset | Emitted with log events and exported to Logfire. |
+| `LOGFIRE_TOKEN` | unset | Enables Logfire export; tracing falls back to `tracing_subscriber` when absent. |
+| `RUST_LOG` | `info` | Standard Rust log filter. |
+| `BARFFINE_TRACE_*` | unset | Control sampling behaviour for custom tracing (see `server/src/observability.rs`). |
 
-Common environment variables and default values (grouped descriptions):
-
-- `BARFFINE_CONFIG_FILE`: Specifies the path to an additional TOML configuration file (overriding the default settings).
-- `BARFFINE_DATABASE_PATH`: Database path (default `./data/barffine.db`; also appears as `BARFFINE_DATABASE_URL` in repository examples).
-- `BARFFINE_BIND_ADDRESS`: Full binding address (e.g., `127.0.0.1:8081`).
-- `BARFFINE_SERVER_HOST` / `AFFINE_SERVER_HOST` (default `127.0.0.1`)
-- `BARFFINE_SERVER_PORT` / `AFFINE_SERVER_PORT` (default `8081`)
-- `BARFFINE_SERVER_PATH`, `BARFFINE_SERVER_SUB_PATH`, `AFFINE_SERVER_PATH`, etc.: Set the service's URL prefix/subpath.
-- `BARFFINE_BASE_URL`, `BARFFINE_PUBLIC_BASE_URL`, `AFFINE_BASE_URL`, `AFFINE_SERVER_BASE_URL`: Used to build the basic address for external access; if not set, it will be automatically generated based on host/port/https.
-- `AFFINE_VERSION`: AFFiNE version (used for compatibility display).
-- `DEPLOYMENT_TYPE` / `BARFFINE_DEPLOYMENT_TYPE` (e.g., `selfhosted`).
-- `SERVER_FLAVOR` / `BARFFINE_FLAVOR` (e.g., `allinone`).
-- `AFFINE_SERVER_MESSAGE` / `BARFFINE_SERVER_MESSAGE`: Used to display server messages in the UI.
-- `BARFFINE_ENVIRONMENT` / `BARFFINE_ENV`: Runtime environment identifier (e.g., development/production).
-- `BARFFINE_CRYPTO_PRIVATE_KEY` / `AFFINE_CRYPTO_PRIVATE_KEY`: Private key for RPC tokens (if not provided, the service will generate a temporary private key and record a warning).
-- `BARFFINE_SERVER_FEATURES`: A list of features separated by commas or semicolons (e.g., indexer, comment).
-- `BARFFINE_ALLOW_GUEST_DEMO_WORKSPACE`: Whether to allow guest demo workspace (boolean).
-- `BARFFINE_PASSWORD_MIN`, `BARFFINE_PASSWORD_MAX`: Password length limits.
-- `RUST_LOG`: Rust log filter (e.g., `info,tower_http=trace`).
-- `LOGFIRE_TOKEN`: Logfire log service token (optional).
-
-- Tracking/Sampling Related: `BARFFINE_TRACE_DEFAULT_RATE`, `BARFFINE_TRACE_FORCE_ALL`, `BARFFINE_TRACE_DEBUG`, `BARFFINE_TRACE_FORCE_PATHS`, `BARFFINE_TRACE_DROP_PATHS`, `BARFFINE_TRACE_RULES` (used to control sampling and tracking behavior).
-
-Example `.env` (examples already exist in the repository, can be used directly or adjusted):
+Example `.env`:
 
 ```dotenv
 AFFINE_VERSION=0.25.0
 DEPLOYMENT_TYPE=selfhosted
 SERVER_FLAVOR=allinone
-BARFFINE_DATABASE_URL=./barffine.db
-# BARFFINE_BASE_URL=http://localhost:8081
-# BARFFINE_PUBLIC_BASE_URL=http://localhost:8081
+
+BARFFINE_DATABASE_URL=./data/barffine.db
 BARFFINE_BASE_URL=http://127.0.0.1:8081
 BARFFINE_PUBLIC_BASE_URL=http://127.0.0.1:8081
 BARFFINE_SERVER_NAME="Barffine Server"
@@ -60,10 +71,3 @@ BARFFINE_SERVER_PORT=8081
 
 RUST_LOG=info,tower_http=trace,axum=debug
 ```
-
-References (view more configuration items and default values):
-
-- `server/src/config.rs`, `core/src/config.rs` (binding address, database path, configuration file parsing)
-- `server/src/state.rs`, `server/src/observability.rs`, `server/src/crypto.rs` (logic and default strategies for reading other environment variables)
-
-Note: Most `BARFFINE_*` variables in Barffine provide corresponding `AFFINE_*` backup names to ensure compatibility with the official AFFiNE implementation.
