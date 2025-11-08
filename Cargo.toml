@@ -1,0 +1,47 @@
+[workspace]
+members = ["core","server"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
+cookie = "0.18"
+headers = "0.4"
+time = "0.3"
+tower = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "sqlite", "chrono", "migrate"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"
+toml = "0.9"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["clock", "serde"] }
+argon2 = { version = "0.5", features = ["std"] }
+rand = "0.9"
+clap = { version = "4.5", features = ["derive"] }
+async-graphql = { version = "7", default-features = false, features = ["chrono", "uuid", "dynamic-schema", "playground"] }
+async-graphql-axum = "7"
+dashmap = "6.1"
+futures-util = "0.3"
+httpdate = "1.0"
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+once_cell = "1.19"
+rand_core = "0.6"
+dotenvy = "0.15"
+socketioxide = { version = "0.18.0", features = ["tracing", "state", "extensions", "v4"] }
+socketioxide-core = "0.17.0"
+p256 = { version = "0.13", features = ["pkcs8"] }
+pkcs8 = { version = "0.10", features = ["pem"] }
+logfire = { version = "0.8.2", default-features = true }
+axum-tracing-opentelemetry = { version = "0.32", features = ["tracing_level_info"] }
+axum-otel-metrics = "0.12.0"
+fastrand = "2.1"
+moka = { version = "0.12", default-features = false, features = ["future"] }

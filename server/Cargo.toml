@@ -1,0 +1,55 @@
+[package]
+name = "barffine-server"
+version = "0.1.0"
+edition.workspace = true
+
+[features]
+default = []
+barffine_extra = []
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+cookie.workspace = true
+headers.workspace = true
+time.workspace = true
+tower.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+barffine-core = { path = "../core", package = "barffine-core" }
+base64.workspace = true
+infer = "0.15"
+argon2.workspace = true
+rand.workspace = true
+rand_core.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+clap.workspace = true
+async-graphql.workspace = true
+async-graphql-axum.workspace = true
+dashmap.workspace = true
+futures-util.workspace = true
+async-trait.workspace = true
+httpdate.workspace = true
+tower-http.workspace = true
+y-octo = { path = "../../AFFiNE/packages/common/y-octo/core" }
+p256.workspace = true
+pkcs8.workspace = true
+once_cell.workspace = true
+dotenvy.workspace = true
+socketioxide.workspace = true
+socketioxide-core.workspace = true
+logfire.workspace = true
+axum-tracing-opentelemetry.workspace = true
+axum-otel-metrics.workspace = true
+fastrand.workspace = true
+moka.workspace = true
+pprof = { version = "0.15", features = ["flamegraph", "protobuf"] }
+tempfile = "3"
+
+[dev-dependencies]
