@@ -9,7 +9,7 @@ use rand_core::OsRng;
 use tracing::{info, warn};
 
 static GENERATED_KEY_NOTICE: Lazy<()> = Lazy::new(|| {
-    info!("No BARFFINE_CRYPTO_PRIVATE_KEY provided. Generated a transient key for doc RPC tokens.");
+    warn!("No BARFFINE_CRYPTO_PRIVATE_KEY provided. Generated a transient key for doc RPC tokens.");
 });
 
 fn read_env_private_key() -> Option<String> {
