@@ -9,7 +9,7 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-y-octo = { path = "../../AFFiNE/packages/common/y-octo/core" }
+y-octo = { git = "https://github.com/toeverything/AFFiNE.git", package = "y-octo" }
 sqlx.workspace = true
 uuid.workspace = true
 chrono.workspace = true
