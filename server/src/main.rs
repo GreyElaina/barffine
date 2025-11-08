@@ -19,10 +19,6 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Barffine server", long_about = None)]
 struct Cli {
-    /// Optional path to a configuration file
-    #[arg(long)]
-    config: Option<PathBuf>,
-
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -50,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
     report_env_status(&env_status);
 
     let cli = Cli::parse();
-    let config = AppConfig::load_with(cli.config.clone())?;
+    let config = AppConfig::load()?;
 
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => run_serve(config).await,
@@ -153,6 +149,17 @@ async fn run_create_admin(
 }
 
 fn init_observability() -> Option<logfire::ShutdownGuard> {
+    // Check if LOGFIRE_TOKEN is empty/missing, if so, directly use fallback
+    if let Ok(token) = std::env::var("LOGFIRE_TOKEN") {
+        if token.trim().is_empty() {
+            init_tracing_fallback();
+            return None;
+        }
+    } else {
+        init_tracing_fallback();
+        return None;
+    }
+    
     let mut builder = logfire::configure()
         .send_to_logfire(SendToLogfire::IfTokenPresent)
         .with_service_name("barffine-server")
