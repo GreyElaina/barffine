@@ -10,7 +10,7 @@ type SharedSampling = &'static SamplingConfig;
 static SAMPLING_CONFIG: OnceCell<SamplingConfig> = OnceCell::new();
 
 /// Initialise sampling configuration from environment, returning the shared config.
-pub fn init_sampling() -> SharedSampling {
+pub(crate) fn init_sampling() -> SharedSampling {
     SAMPLING_CONFIG.get_or_init(SamplingConfig::from_env)
 }
 

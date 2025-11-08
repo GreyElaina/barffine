@@ -21,9 +21,9 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-barffine-core = { path = "../core", package = "barffine-core" }
+barffine-core = { path = "../core" }
 base64.workspace = true
-infer = "0.15"
+infer = "0.19.0"
 argon2.workspace = true
 rand.workspace = true
 rand_core.workspace = true
@@ -37,7 +37,7 @@ futures-util.workspace = true
 async-trait.workspace = true
 httpdate.workspace = true
 tower-http.workspace = true
-y-octo = { git = "https://github.com/toeverything/AFFiNE.git", package = "y-octo" }
+y-octo = { git = "https://github.com/toeverything/AFFiNE.git" }
 p256.workspace = true
 pkcs8.workspace = true
 once_cell.workspace = true

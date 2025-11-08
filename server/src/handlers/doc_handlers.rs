@@ -94,7 +94,7 @@ pub(crate) async fn get_comment_attachment_handler(
         .ok_or_else(|| AppError::comment_attachment_not_found(&workspace_id, &doc_id, &key))?;
 
     if let Some(location) = download.location {
-        let mut response = Response::builder()
+        let response = Response::builder()
             .status(StatusCode::FOUND)
             .header("location", location.uri)
             .body(Body::empty())
@@ -299,7 +299,7 @@ pub(crate) async fn get_doc_history_snapshot_handler(
         }
     }
 
-    let mut response = builder
+    let response = builder
         .body(Body::from(snapshot))
         .map_err(|err| AppError::internal(AnyError::new(err)))?;
 
@@ -1021,7 +1021,7 @@ mod tests {
     #[tokio::test]
     async fn get_doc_markdown_handler_returns_stub() {
         let (_temp_dir, database, state) = setup_state().await;
-        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (workspace_id, _owner_id) = seed_workspace(&state).await;
         let doc_id = Uuid::new_v4().to_string();
         insert_document(&database, &workspace_id, &doc_id, false, "page").await;
 

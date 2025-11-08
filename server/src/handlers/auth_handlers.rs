@@ -204,7 +204,7 @@ pub(crate) async fn feature_handler(State(state): State<AppState>) -> impl IntoR
     }
 }
 
-pub async fn create_session_handler(
+pub(crate) async fn create_session_handler(
     State(state): State<AppState>,
     Json(payload): Json<CreateSessionRequest>,
 ) -> Result<Response, AppError> {

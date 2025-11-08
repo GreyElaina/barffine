@@ -83,7 +83,7 @@ pub struct AppState {
         Arc<DashMap<String, HashMap<String, WorkspaceEmbeddingFileRecord>>>,
     pub workspace_embedding_ignored_docs: Arc<DashMap<String, HashSet<String>>>,
     pub copilot_sessions: Arc<DashMap<String, CopilotSessionRecord>>,
-    pub(crate) doc_token_signer: Arc<DocTokenSigner>,
+    pub doc_token_signer: Arc<DocTokenSigner>,
     pub server_path: Option<String>,
     pub base_url: String,
     pub socket_io: Arc<OnceCell<SocketIo>>,

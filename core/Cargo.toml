@@ -8,12 +8,10 @@ anyhow.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 y-octo = { git = "https://github.com/toeverything/AFFiNE.git", package = "y-octo" }
 sqlx.workspace = true
 uuid.workspace = true
 chrono.workspace = true
-toml.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

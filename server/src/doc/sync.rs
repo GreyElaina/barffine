@@ -73,7 +73,7 @@ pub async fn workspace_snapshot_or_not_found(
 }
 
 #[derive(Clone, Copy, Default)]
-pub struct UpdateBroadcastContext<'a> {
+pub(crate) struct UpdateBroadcastContext<'a> {
     pub editor_id: Option<&'a str>,
     pub editor_user: Option<&'a SessionUser>,
 }
