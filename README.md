@@ -2,15 +2,8 @@
 
 Barffine is an [AFFiNE](https://github.com/toeverything/AFFiNE) compatible backend written in Rust, which provides a REST/GraphQL/Socket.IO/CRDT collaboration interface consistent with the official Node/TS backend with a single binary. It uses only SQLite storage, can be self-hosted in resource-constrained environments, and includes built-in migration, admin creation, document caching, and observability tools.
 
-## Feature highlights
-- **sqlite-only persistence** powered by `sqlx` with migrations under `server/migrations`. No Postgres or external queues are required.
-- **Single binary deployment** via `cargo run -p barffine-server` with CLI subcommands for serving, migrating, and creating admin accounts.
-- **Drop-in client compatibility**: REST endpoints (under `/api`, `/rpc`, `/workspaces`, etc.), a GraphQL endpoint on `/graphql`, and Socket.IO channels reuse the same shapes as the upstream AFFiNE backend.
-- **Real-time editing pipeline**: CRDT updates flow through `y-octo`, Socket.IO broadcasts, and `/docs/{id}/ws` WebSockets, while adaptive doc caching keeps hot documents in memory.
-- **Configurable feature flags**: `BARFFINE_SERVER_FEATURES` and `FeatureService` mirror AFFiNE feature namespaces so you can advertise the exact capabilities to the UI.
-- **Observability hooks**: structured tracing, Logfire integration (optional `LOGFIRE_TOKEN`), and HTTP metrics middleware ship by default.
-
 ## Quick start
+
 1. Install the latest stable Rust toolchain (Edition 2024 is enabled in `Cargo.toml`).
 2. Copy `.env` or create a new one based on the snippet below to describe your bind address and public URL.
 3. Run the server:
