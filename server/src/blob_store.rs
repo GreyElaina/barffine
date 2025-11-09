@@ -13,6 +13,8 @@ use barffine_core::{
 };
 use sqlx::{Pool, Row, Sqlite, sqlite::SqliteRow};
 
+use crate::user::avatar::AVATAR_STORAGE_NAMESPACE;
+
 /// Naive in-memory blob storage used for local development and tests.
 pub struct InMemoryBlobStorage {
     entries: RwLock<HashMap<String, (BlobMetadata, Vec<u8>)>>,
@@ -184,6 +186,10 @@ impl SqliteBlobStorage {
         (len.min(i64::MAX as u64)) as i64
     }
 
+    fn table_for(namespace: &str) -> BlobTable {
+        BlobTable::for_namespace(namespace)
+    }
+
     fn build_metadata(row: &SqliteRow) -> Result<BlobMetadata> {
         let content_type = row.try_get::<Option<String>, _>("content_type")?;
         let content_length = row
@@ -224,36 +230,19 @@ impl BlobStorage for SqliteBlobStorage {
         let last_modified = Self::encode_last_modified(&metadata);
         let now = Self::now_timestamp();
 
-        sqlx::query(
-            r#"
-            INSERT INTO workspace_blobs (
-                workspace_id, blob_key, content, content_type, content_length,
-                etag, last_modified, created_at, deleted_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
-            ON CONFLICT(workspace_id, blob_key) DO UPDATE SET
-                content = excluded.content,
-                content_type = excluded.content_type,
-                content_length = excluded.content_length,
-                etag = excluded.etag,
-                last_modified = excluded.last_modified,
-                deleted_at = NULL,
-                created_at = CASE
-                    WHEN workspace_blobs.deleted_at IS NULL THEN workspace_blobs.created_at
-                    ELSE excluded.created_at
-                END
-            "#,
-        )
-        .bind(&descriptor.workspace_id)
-        .bind(&descriptor.key)
-        .bind(content)
-        .bind(metadata.content_type.clone())
-        .bind(Self::clamp_length(content_length))
-        .bind(metadata.etag.clone())
-        .bind(last_modified)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
+        let table = Self::table_for(&descriptor.workspace_id);
+
+        sqlx::query(table.upsert_sql())
+            .bind(&descriptor.workspace_id)
+            .bind(&descriptor.key)
+            .bind(content)
+            .bind(metadata.content_type.clone())
+            .bind(Self::clamp_length(content_length))
+            .bind(metadata.etag.clone())
+            .bind(last_modified)
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
 
         Ok(BlobLocation::new(
             format!(
@@ -269,17 +258,12 @@ impl BlobStorage for SqliteBlobStorage {
         descriptor: &BlobDescriptor,
         _prefer_presigned: bool,
     ) -> Result<Option<BlobDownload>> {
-        let row = sqlx::query(
-            r#"
-            SELECT content, content_type, content_length, etag, last_modified
-            FROM workspace_blobs
-            WHERE workspace_id = ? AND blob_key = ? AND deleted_at IS NULL
-            "#,
-        )
-        .bind(&descriptor.workspace_id)
-        .bind(&descriptor.key)
-        .fetch_optional(&self.pool)
-        .await?;
+        let table = Self::table_for(&descriptor.workspace_id);
+        let row = sqlx::query(table.select_sql())
+            .bind(&descriptor.workspace_id)
+            .bind(&descriptor.key)
+            .fetch_optional(&self.pool)
+            .await?;
 
         let Some(row) = row else {
             debug!(
@@ -297,30 +281,20 @@ impl BlobStorage for SqliteBlobStorage {
     }
 
     async fn delete(&self, descriptor: &BlobDescriptor, permanently: bool) -> Result<()> {
+        let table = Self::table_for(&descriptor.workspace_id);
         if permanently {
-            sqlx::query(
-                r#"
-                DELETE FROM workspace_blobs
-                WHERE workspace_id = ? AND blob_key = ?
-                "#,
-            )
-            .bind(&descriptor.workspace_id)
-            .bind(&descriptor.key)
-            .execute(&self.pool)
-            .await?;
+            sqlx::query(table.hard_delete_sql())
+                .bind(&descriptor.workspace_id)
+                .bind(&descriptor.key)
+                .execute(&self.pool)
+                .await?;
         } else {
-            sqlx::query(
-                r#"
-                UPDATE workspace_blobs
-                SET deleted_at = ?
-                WHERE workspace_id = ? AND blob_key = ?
-                "#,
-            )
-            .bind(Self::now_timestamp())
-            .bind(&descriptor.workspace_id)
-            .bind(&descriptor.key)
-            .execute(&self.pool)
-            .await?;
+            sqlx::query(table.soft_delete_sql())
+                .bind(Self::now_timestamp())
+                .bind(&descriptor.workspace_id)
+                .bind(&descriptor.key)
+                .execute(&self.pool)
+                .await?;
         }
 
         Ok(())
@@ -341,30 +315,20 @@ impl BlobStorage for SqliteBlobStorage {
     }
 
     async fn release_deleted(&self, workspace_id: &str) -> Result<()> {
-        sqlx::query(
-            r#"
-            DELETE FROM workspace_blobs
-            WHERE workspace_id = ? AND deleted_at IS NOT NULL
-            "#,
-        )
-        .bind(workspace_id)
-        .execute(&self.pool)
-        .await?;
+        let table = Self::table_for(workspace_id);
+        sqlx::query(table.release_deleted_sql())
+            .bind(workspace_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     async fn list(&self, workspace_id: &str) -> Result<Vec<ListedBlobRecord>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT blob_key, content_type, content_length, last_modified, created_at
-            FROM workspace_blobs
-            WHERE workspace_id = ? AND deleted_at IS NULL
-            ORDER BY blob_key
-            "#,
-        )
-        .bind(workspace_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let table = Self::table_for(workspace_id);
+        let rows = sqlx::query(table.list_sql())
+            .bind(workspace_id)
+            .fetch_all(&self.pool)
+            .await?;
 
         let mut blobs = Vec::with_capacity(rows.len());
         for row in rows {
@@ -388,21 +352,189 @@ impl BlobStorage for SqliteBlobStorage {
     }
 
     async fn total_size(&self, workspace_id: &str) -> Result<i64> {
-        let row = sqlx::query(
-            r#"
-            SELECT COALESCE(SUM(content_length), 0) AS total
-            FROM workspace_blobs
-            WHERE workspace_id = ? AND deleted_at IS NULL
-            "#,
-        )
-        .bind(workspace_id)
-        .fetch_one(&self.pool)
-        .await?;
+        let table = Self::table_for(workspace_id);
+        let row = sqlx::query(table.total_size_sql())
+            .bind(workspace_id)
+            .fetch_one(&self.pool)
+            .await?;
 
         let total = row.try_get::<i64, _>("total")?;
         Ok(total)
     }
 }
+
+#[derive(Copy, Clone)]
+enum BlobTable {
+    Workspace,
+    Namespace,
+}
+
+impl BlobTable {
+    fn for_namespace(namespace: &str) -> Self {
+        if namespace == AVATAR_STORAGE_NAMESPACE {
+            BlobTable::Namespace
+        } else {
+            BlobTable::Workspace
+        }
+    }
+
+    fn upsert_sql(self) -> &'static str {
+        match self {
+            BlobTable::Workspace => UPSERT_WORKSPACE_BLOB_SQL,
+            BlobTable::Namespace => UPSERT_NAMESPACE_BLOB_SQL,
+        }
+    }
+
+    fn select_sql(self) -> &'static str {
+        match self {
+            BlobTable::Workspace => SELECT_WORKSPACE_BLOB_SQL,
+            BlobTable::Namespace => SELECT_NAMESPACE_BLOB_SQL,
+        }
+    }
+
+    fn hard_delete_sql(self) -> &'static str {
+        match self {
+            BlobTable::Workspace => HARD_DELETE_WORKSPACE_BLOB_SQL,
+            BlobTable::Namespace => HARD_DELETE_NAMESPACE_BLOB_SQL,
+        }
+    }
+
+    fn soft_delete_sql(self) -> &'static str {
+        match self {
+            BlobTable::Workspace => SOFT_DELETE_WORKSPACE_BLOB_SQL,
+            BlobTable::Namespace => SOFT_DELETE_NAMESPACE_BLOB_SQL,
+        }
+    }
+
+    fn release_deleted_sql(self) -> &'static str {
+        match self {
+            BlobTable::Workspace => RELEASE_DELETED_WORKSPACE_BLOBS_SQL,
+            BlobTable::Namespace => RELEASE_DELETED_NAMESPACE_BLOBS_SQL,
+        }
+    }
+
+    fn list_sql(self) -> &'static str {
+        match self {
+            BlobTable::Workspace => LIST_WORKSPACE_BLOBS_SQL,
+            BlobTable::Namespace => LIST_NAMESPACE_BLOBS_SQL,
+        }
+    }
+
+    fn total_size_sql(self) -> &'static str {
+        match self {
+            BlobTable::Workspace => TOTAL_SIZE_WORKSPACE_BLOBS_SQL,
+            BlobTable::Namespace => TOTAL_SIZE_NAMESPACE_BLOBS_SQL,
+        }
+    }
+}
+
+const UPSERT_WORKSPACE_BLOB_SQL: &str = r#"
+    INSERT INTO workspace_blobs (
+        workspace_id, blob_key, content, content_type, content_length,
+        etag, last_modified, created_at, deleted_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+    ON CONFLICT(workspace_id, blob_key) DO UPDATE SET
+        content = excluded.content,
+        content_type = excluded.content_type,
+        content_length = excluded.content_length,
+        etag = excluded.etag,
+        last_modified = excluded.last_modified,
+        deleted_at = NULL,
+        created_at = CASE
+            WHEN workspace_blobs.deleted_at IS NULL THEN workspace_blobs.created_at
+            ELSE excluded.created_at
+        END
+"#;
+
+const UPSERT_NAMESPACE_BLOB_SQL: &str = r#"
+    INSERT INTO namespace_blobs (
+        namespace, blob_key, content, content_type, content_length,
+        etag, last_modified, created_at, deleted_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+    ON CONFLICT(namespace, blob_key) DO UPDATE SET
+        content = excluded.content,
+        content_type = excluded.content_type,
+        content_length = excluded.content_length,
+        etag = excluded.etag,
+        last_modified = excluded.last_modified,
+        deleted_at = NULL,
+        created_at = CASE
+            WHEN namespace_blobs.deleted_at IS NULL THEN namespace_blobs.created_at
+            ELSE excluded.created_at
+        END
+"#;
+
+const SELECT_WORKSPACE_BLOB_SQL: &str = r#"
+    SELECT content, content_type, content_length, etag, last_modified
+    FROM workspace_blobs
+    WHERE workspace_id = ? AND blob_key = ? AND deleted_at IS NULL
+"#;
+
+const SELECT_NAMESPACE_BLOB_SQL: &str = r#"
+    SELECT content, content_type, content_length, etag, last_modified
+    FROM namespace_blobs
+    WHERE namespace = ? AND blob_key = ? AND deleted_at IS NULL
+"#;
+
+const HARD_DELETE_WORKSPACE_BLOB_SQL: &str = r#"
+    DELETE FROM workspace_blobs
+    WHERE workspace_id = ? AND blob_key = ?
+"#;
+
+const HARD_DELETE_NAMESPACE_BLOB_SQL: &str = r#"
+    DELETE FROM namespace_blobs
+    WHERE namespace = ? AND blob_key = ?
+"#;
+
+const SOFT_DELETE_WORKSPACE_BLOB_SQL: &str = r#"
+    UPDATE workspace_blobs
+    SET deleted_at = ?
+    WHERE workspace_id = ? AND blob_key = ?
+"#;
+
+const SOFT_DELETE_NAMESPACE_BLOB_SQL: &str = r#"
+    UPDATE namespace_blobs
+    SET deleted_at = ?
+    WHERE namespace = ? AND blob_key = ?
+"#;
+
+const RELEASE_DELETED_WORKSPACE_BLOBS_SQL: &str = r#"
+    DELETE FROM workspace_blobs
+    WHERE workspace_id = ? AND deleted_at IS NOT NULL
+"#;
+
+const RELEASE_DELETED_NAMESPACE_BLOBS_SQL: &str = r#"
+    DELETE FROM namespace_blobs
+    WHERE namespace = ? AND deleted_at IS NOT NULL
+"#;
+
+const LIST_WORKSPACE_BLOBS_SQL: &str = r#"
+    SELECT blob_key, content_type, content_length, last_modified, created_at
+    FROM workspace_blobs
+    WHERE workspace_id = ? AND deleted_at IS NULL
+    ORDER BY blob_key
+"#;
+
+const LIST_NAMESPACE_BLOBS_SQL: &str = r#"
+    SELECT blob_key, content_type, content_length, last_modified, created_at
+    FROM namespace_blobs
+    WHERE namespace = ? AND deleted_at IS NULL
+    ORDER BY blob_key
+"#;
+
+const TOTAL_SIZE_WORKSPACE_BLOBS_SQL: &str = r#"
+    SELECT COALESCE(SUM(content_length), 0) AS total
+    FROM workspace_blobs
+    WHERE workspace_id = ? AND deleted_at IS NULL
+"#;
+
+const TOTAL_SIZE_NAMESPACE_BLOBS_SQL: &str = r#"
+    SELECT COALESCE(SUM(content_length), 0) AS total
+    FROM namespace_blobs
+    WHERE namespace = ? AND deleted_at IS NULL
+"#;
 
 #[cfg(test)]
 mod tests {
@@ -410,7 +542,7 @@ mod tests {
     use barffine_core::{blob::BlobDescriptor, config::AppConfig, db::Database};
     use tempfile::TempDir;
 
-    use crate::utils::db::run_migrations;
+    use crate::{user::avatar::AVATAR_STORAGE_NAMESPACE, utils::db::run_migrations};
 
     async fn create_sqlite_store() -> (TempDir, Database, SqliteBlobStorage) {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
@@ -513,5 +645,30 @@ mod tests {
             .await
             .expect("list blobs after purge");
         assert!(listed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_blob_storage_supports_namespace_storage() {
+        let (_dir, _db, store) = create_sqlite_store().await;
+        let descriptor = BlobDescriptor::new(AVATAR_STORAGE_NAMESPACE, "avatar.bin");
+        let mut metadata = BlobMetadata::default();
+        metadata.content_type = Some("image/png".into());
+
+        let bytes = b"avatar-bytes".to_vec();
+        store
+            .put(&descriptor, &bytes, metadata.clone())
+            .await
+            .expect("store namespace blob");
+
+        let download = store
+            .get(&descriptor, false)
+            .await
+            .expect("fetch namespace blob")
+            .expect("blob exists");
+        assert_eq!(download.bytes.unwrap(), bytes);
+        assert_eq!(
+            download.metadata.unwrap().content_type,
+            metadata.content_type
+        );
     }
 }
