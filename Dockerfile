@@ -1,8 +1,10 @@
 # syntax=docker/dockerfile:1.6
-# Edition 2024 requires the nightly toolchain until stabilized; allow overrides via ARG.
-ARG RUST_VERSION=nightly
+# Edition 2024 requires nightly Rust today; install it atop a stable base image.
+ARG RUST_VERSION=1.81
+ARG RUST_TOOLCHAIN=nightly
 
 FROM rust:${RUST_VERSION}-bookworm AS builder
+ARG RUST_TOOLCHAIN
 
 WORKDIR /app
 
@@ -15,6 +17,9 @@ RUN apt-get update \
         libssl-dev \
         libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*
+
+RUN rustup toolchain install "${RUST_TOOLCHAIN}" \
+    && rustup default "${RUST_TOOLCHAIN}"
 
 COPY . .
 
