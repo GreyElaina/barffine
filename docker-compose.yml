@@ -1,0 +1,35 @@
+services:
+  barffine:
+    container_name: barffine
+    image: barffine:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        RUST_VERSION: "1.81"
+    command: ["serve"]
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      BARFFINE_BASE_URL: http://localhost:8081
+      BARFFINE_PUBLIC_BASE_URL: http://localhost:8081
+      RUST_LOG: warn
+    volumes:
+      - barffine-data:/app/data
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:8081/health || exit 1",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  barffine-data:
+    driver: local

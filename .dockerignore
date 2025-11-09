@@ -1,0 +1,11 @@
+target
+.git
+.gitignore
+.github
+.idea
+.vscode
+data
+interop-tests
+server/flamegraph.svg
+**/*.sqlite*
+*.env
