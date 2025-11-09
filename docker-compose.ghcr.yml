@@ -8,7 +8,6 @@ services:
       - .env
     environment:
       BARFFINE_BASE_URL: ${BARFFINE_BASE_URL:-http://localhost:8081}
-      BARFFINE_PUBLIC_BASE_URL: ${BARFFINE_PUBLIC_BASE_URL:-http://localhost:8081}
       RUST_LOG: ${RUST_LOG:-warn}
     volumes:
       - barffine-data:/app/data

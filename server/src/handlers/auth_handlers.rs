@@ -578,10 +578,6 @@ mod tests {
             Json(SignInRequest {
                 email: "user@example.com".into(),
                 password: None,
-                callback_url: None,
-                client_nonce: None,
-                redirect_uri: None,
-                provider: None,
             }),
         )
         .await
@@ -607,10 +603,6 @@ mod tests {
             Json(SignInRequest {
                 email: user.email.clone(),
                 password: Some("secret".into()),
-                callback_url: None,
-                client_nonce: None,
-                redirect_uri: None,
-                provider: None,
             }),
         )
         .await

@@ -64,19 +64,11 @@ pub(crate) struct CreateSessionRequest {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+// AFFiNE 客户端可能会额外携带 callbackUrl / client_nonce 等字段，serde 会自动忽略未声明字段。
 pub(crate) struct SignInRequest {
     pub(crate) email: String,
     #[serde(default)]
     pub(crate) password: Option<String>,
-    #[serde(default)]
-    pub(crate) callback_url: Option<String>,
-    #[serde(default)]
-    pub(crate) client_nonce: Option<String>,
-    #[serde(default)]
-    pub(crate) redirect_uri: Option<String>,
-    #[serde(default)]
-    pub(crate) provider: Option<String>,
 }
 
 #[derive(Deserialize)]
