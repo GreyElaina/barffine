@@ -11,6 +11,7 @@ use anyhow::{Context, anyhow};
 use futures_util::FutureExt;
 use moka::{future::Cache, notification::RemovalCause};
 use serde_json::Value as JsonValue;
+use snap::raw::{Decoder as SnapDecoder, Encoder as SnapEncoder};
 use tokio::{sync::Mutex, time::sleep};
 use tracing::{debug, warn};
 use y_octo::{Doc as YoctoDoc, StateVector as YoctoStateVector};
@@ -25,6 +26,7 @@ use crate::socket::rooms::SpaceType;
 pub type DocCacheResult<T> = anyhow::Result<T>;
 
 const RATE_EPSILON: f64 = 1e-6;
+const COMPRESS_THRESHOLD: f64 = 0.95;
 
 #[derive(Clone, Debug)]
 pub struct DocCacheMetrics {
@@ -141,9 +143,21 @@ struct DocHandle {
     adaptive: DocAdaptiveState,
 }
 
+#[derive(Clone)]
+struct SnapshotEntry {
+    bytes: Vec<u8>,
+    encoding: SnapshotEncoding,
+}
+
+#[derive(Clone, Copy)]
+enum SnapshotEncoding {
+    Plain,
+    Compressed,
+}
+
 struct DocState {
     doc: YoctoDoc,
-    snapshot: Vec<u8>,
+    snapshot: SnapshotEntry,
     state_vector: YoctoStateVector,
     timestamp: i64,
     pending: VecDeque<Vec<u8>>,
@@ -156,6 +170,40 @@ struct DocStats {
     last_update_ms: i64,
     ema_rate_per_sec: f64,
     ema_update_bytes: f64,
+}
+
+impl SnapshotEntry {
+    fn new(bytes: Vec<u8>, mode: SnapshotStorageMode) -> DocCacheResult<Self> {
+        let (bytes, encoding) = match mode {
+            SnapshotStorageMode::Plain => (bytes, SnapshotEncoding::Plain),
+            SnapshotStorageMode::Compressed => {
+                let compressed = compress_snapshot(&bytes)?;
+                // Only use compressed if it saves at least 5% space
+                if compressed.len() < (bytes.len() as f64 * COMPRESS_THRESHOLD) as usize {
+                    (compressed, SnapshotEncoding::Compressed)
+                } else {
+                    (bytes, SnapshotEncoding::Plain)
+                }
+            }
+        };
+        Ok(Self { bytes, encoding })
+    }
+
+    fn replace(&mut self, bytes: Vec<u8>, mode: SnapshotStorageMode) -> DocCacheResult<()> {
+        *self = SnapshotEntry::new(bytes, mode)?;
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn to_plain_vec(&self) -> DocCacheResult<Vec<u8>> {
+        match self.encoding {
+            SnapshotEncoding::Plain => Ok(self.bytes.clone()),
+            SnapshotEncoding::Compressed => decompress_snapshot(&self.bytes),
+        }
+    }
 }
 
 pub struct DocCacheApplyResult {
@@ -174,6 +222,7 @@ pub struct DocCacheConfig {
     pub adaptive_force_flush_ratio: f64,
     pub adaptive_force_flush_bytes: usize,
     pub adaptive_max_flush_interval: Duration,
+    pub snapshot_mode: SnapshotStorageMode,
 }
 
 #[derive(Clone)]
@@ -185,6 +234,18 @@ pub struct DocCacheAdaptiveConfig {
     pub min_pending_bytes: usize,
     pub max_pending_bytes: usize,
     pub ema_alpha: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotStorageMode {
+    Plain,
+    Compressed,
+}
+
+impl Default for SnapshotStorageMode {
+    fn default() -> Self {
+        Self::Compressed
+    }
 }
 
 impl Default for DocCacheConfig {
@@ -199,6 +260,7 @@ impl Default for DocCacheConfig {
             adaptive_force_flush_ratio: 0.85,
             adaptive_force_flush_bytes: 256 * 1024,
             adaptive_max_flush_interval: Duration::from_secs(1),
+            snapshot_mode: SnapshotStorageMode::default(),
         }
     }
 }
@@ -281,6 +343,11 @@ impl DocCacheBuilder {
 
     pub fn with_adaptive_max_flush_interval(mut self, interval: Duration) -> Self {
         self.config.adaptive_max_flush_interval = interval;
+        self
+    }
+
+    pub fn with_snapshot_mode(mut self, mode: SnapshotStorageMode) -> Self {
+        self.config.snapshot_mode = mode;
         self
     }
 
@@ -367,7 +434,7 @@ impl DocCache {
         handle.touch_access();
 
         let state = handle.inner.lock().await;
-        Ok((state.snapshot.clone(), state.timestamp))
+        Ok((state.snapshot.to_plain_vec()?, state.timestamp))
     }
 
     pub async fn apply_updates(
@@ -389,6 +456,7 @@ impl DocCache {
 
         let mut state = handle.inner.lock().await;
         let prev_snapshot = state.snapshot.clone();
+        let prev_snapshot_plain = prev_snapshot.to_plain_vec()?;
         let prev_state_vector = state.state_vector.clone();
         let prev_pending_bytes = state.pending_bytes;
         let prev_pending_len = state.pending.len();
@@ -416,7 +484,7 @@ impl DocCache {
                     state.pending.pop_back();
                 }
                 self.metrics.observe_pending_bytes(state.pending_bytes);
-                state.doc = YoctoDoc::try_from_binary_v1(&prev_snapshot)
+                state.doc = YoctoDoc::try_from_binary_v1(&prev_snapshot_plain)
                     .context("restore document snapshot after failed encode")?;
                 state.snapshot = prev_snapshot;
                 state.state_vector = prev_state_vector;
@@ -427,7 +495,9 @@ impl DocCache {
         };
         let timestamp = extract_doc_updated_at(&state.doc, &handle.descriptor.doc_id)
             .unwrap_or_else(current_time_millis);
-        state.snapshot = snapshot.clone();
+        state
+            .snapshot
+            .replace(snapshot.clone(), self.config.snapshot_mode)?;
         state.timestamp = timestamp;
         state.last_editor_id = editor_id.map(str::to_owned);
         let now_ms = current_time_millis();
@@ -473,6 +543,8 @@ impl DocCache {
             );
         }
 
+        self.maybe_evict_idle(space_type, space_id, doc_id, &handle)
+            .await;
         Ok(result)
     }
 
@@ -587,6 +659,26 @@ impl DocCache {
     fn key(space_type: SpaceType, space_id: &str, doc_id: &str) -> String {
         format!("{}:{}:{}", space_type.as_str(), space_id, doc_id)
     }
+
+    /// Immediately evict cache entries that have no active sessions and no pending updates.
+    ///
+    /// `apply_doc_updates` always calls this after it flushes or schedules a flush so that handles
+    /// that are no longer in use do not sit around until the periodic reaper runs. This keeps the
+    /// cache bounded during bursty update workloads: once a document has no sessions and nothing
+    /// buffered (`is_instant_evictable`), we can safely drop it right away instead of burning
+    /// memory for the default idle timeout.
+    async fn maybe_evict_idle(
+        &self,
+        space_type: SpaceType,
+        space_id: &str,
+        doc_id: &str,
+        handle: &Arc<DocHandle>,
+    ) {
+        if handle.is_instant_evictable() {
+            let key = Self::key(space_type, space_id, doc_id);
+            self.cache.invalidate(&key).await;
+        }
+    }
 }
 
 impl DocHandle {
@@ -629,7 +721,7 @@ impl DocHandle {
             }
         };
 
-        let (doc, snapshot) = if snapshot.is_empty() {
+        let (doc, raw_snapshot) = if snapshot.is_empty() {
             (YoctoDoc::new(), snapshot)
         } else {
             (
@@ -639,8 +731,9 @@ impl DocHandle {
             )
         };
         let state_vector = doc.get_state_vector();
+        let snapshot_entry = SnapshotEntry::new(raw_snapshot, config.snapshot_mode)?;
         let pending = VecDeque::new();
-        let estimated_bytes = snapshot.len();
+        let estimated_bytes = snapshot_entry.len();
         let now = current_time_millis();
         let adaptive_pending = config
             .adaptive
@@ -658,7 +751,7 @@ impl DocHandle {
             descriptor,
             inner: Mutex::new(DocState {
                 doc,
-                snapshot,
+                snapshot: snapshot_entry,
                 state_vector,
                 timestamp,
                 pending,
@@ -695,12 +788,29 @@ impl DocHandle {
     }
 
     fn is_idle(&self, now_ms: i64, idle_after_ms: i64) -> bool {
+        if !self.adaptive.has_active_sessions() {
+            if let Ok(state) = self.inner.try_lock() {
+                return state.pending.is_empty();
+            }
+        }
+
         self.adaptive.is_idle(now_ms, idle_after_ms)
             && self
                 .inner
                 .try_lock()
                 .map(|state| state.pending.is_empty())
                 .unwrap_or(false)
+    }
+
+    fn is_instant_evictable(&self) -> bool {
+        if self.adaptive.has_active_sessions() {
+            return false;
+        }
+
+        self.inner
+            .try_lock()
+            .map(|state| state.pending.is_empty())
+            .unwrap_or(false)
     }
 
     fn increment_sessions(&self) {
@@ -948,6 +1058,10 @@ impl DocAdaptiveState {
         now_ms - last >= idle_after_ms
     }
 
+    fn has_active_sessions(&self) -> bool {
+        self.active_sessions.load(Ordering::Relaxed) > 0
+    }
+
     fn increment_sessions(&self) {
         self.active_sessions.fetch_add(1, Ordering::Relaxed);
     }
@@ -1116,10 +1230,49 @@ fn duration_to_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)).max(1u128) as u64
 }
 
+fn compress_snapshot(bytes: &[u8]) -> DocCacheResult<Vec<u8>> {
+    let mut encoder = SnapEncoder::new();
+    encoder
+        .compress_vec(bytes)
+        .context("compress document snapshot with Snappy")
+}
+
+fn decompress_snapshot(bytes: &[u8]) -> DocCacheResult<Vec<u8>> {
+    let mut decoder = SnapDecoder::new();
+    decoder
+        .decompress_vec(bytes)
+        .context("decompress document snapshot with Snappy")
+}
+
 #[cfg(test)]
 impl DocCache {
     pub async fn debug_entry_count(&self) -> u64 {
         self.cache.run_pending_tasks().await;
         self.cache.entry_count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_entry_plain_roundtrip() {
+        let src = vec![1u8, 2, 3, 4, 5];
+        let entry = SnapshotEntry::new(src.clone(), SnapshotStorageMode::Plain).unwrap();
+        assert_eq!(entry.len(), src.len());
+        assert!(matches!(entry.encoding, SnapshotEncoding::Plain));
+        let decoded = entry.to_plain_vec().unwrap();
+        assert_eq!(decoded, src);
+    }
+
+    #[test]
+    fn snapshot_entry_compressed_roundtrip() {
+        let src = vec![42u8; 16 * 1024];
+        let entry = SnapshotEntry::new(src.clone(), SnapshotStorageMode::Compressed).unwrap();
+        assert!(entry.len() <= src.len());
+        assert!(matches!(entry.encoding, SnapshotEncoding::Compressed));
+        let decoded = entry.to_plain_vec().unwrap();
+        assert_eq!(decoded, src);
     }
 }

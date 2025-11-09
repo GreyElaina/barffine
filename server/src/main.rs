@@ -159,7 +159,7 @@ fn init_observability() -> Option<logfire::ShutdownGuard> {
         init_tracing_fallback();
         return None;
     }
-    
+
     let mut builder = logfire::configure()
         .send_to_logfire(SendToLogfire::IfTokenPresent)
         .with_service_name("barffine-server")

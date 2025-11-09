@@ -426,16 +426,13 @@ mod tests {
 
     #[test]
     fn merge_cookies_combines_segments() {
-        let merged =
-            SocketAuthMiddleware::merge_cookies(Some("foo=bar"), Some("zip=zap")).unwrap();
+        let merged = SocketAuthMiddleware::merge_cookies(Some("foo=bar"), Some("zip=zap")).unwrap();
         assert_eq!(merged, "foo=bar; zip=zap");
 
-        let carry_first =
-            SocketAuthMiddleware::merge_cookies(Some("foo=bar"), Some("")).unwrap();
+        let carry_first = SocketAuthMiddleware::merge_cookies(Some("foo=bar"), Some("")).unwrap();
         assert_eq!(carry_first, "foo=bar");
 
-        let carry_second =
-            SocketAuthMiddleware::merge_cookies(None, Some("zip=zap")).unwrap();
+        let carry_second = SocketAuthMiddleware::merge_cookies(None, Some("zip=zap")).unwrap();
         assert_eq!(carry_second, "zip=zap");
 
         assert!(
@@ -447,15 +444,15 @@ mod tests {
     #[test]
     fn build_header_map_merges_new_sources() {
         let mut headers = HeaderMap::new();
-        headers.insert(HeaderName::from_static("x-test"), HeaderValue::from_static("value"));
+        headers.insert(
+            HeaderName::from_static("x-test"),
+            HeaderValue::from_static("value"),
+        );
         headers.insert(COOKIE, HeaderValue::from_static("stale=1"));
 
-        let merged = SocketAuthMiddleware::build_header_map(
-            &headers,
-            Some("fresh=2"),
-            Some("doc-token"),
-        )
-        .expect("header map");
+        let merged =
+            SocketAuthMiddleware::build_header_map(&headers, Some("fresh=2"), Some("doc-token"))
+                .expect("header map");
 
         assert_eq!(merged.get("x-test").unwrap(), "value");
         assert_eq!(merged.get(COOKIE).unwrap(), "fresh=2");
@@ -509,12 +506,9 @@ mod tests {
 
     #[test]
     fn format_error_includes_request_id() {
-        let json_text = SocketAuthMiddleware::format_error(
-            AppError::bad_request("nope"),
-            Some("req-42"),
-        );
-        let json_value: serde_json::Value =
-            serde_json::from_str(&json_text).expect("valid json");
+        let json_text =
+            SocketAuthMiddleware::format_error(AppError::bad_request("nope"), Some("req-42"));
+        let json_value: serde_json::Value = serde_json::from_str(&json_text).expect("valid json");
         assert_eq!(json_value["status"], 400);
         assert_eq!(json_value["code"], "BAD_REQUEST");
         assert_eq!(json_value["message"], "nope");
@@ -523,10 +517,7 @@ mod tests {
 
     #[test]
     fn extract_session_token_prefers_affine_cookie() {
-        let header = format!(
-            "foo=bar; {}=session-123; baz=qux",
-            SESSION_COOKIE_NAME
-        );
+        let header = format!("foo=bar; {}=session-123; baz=qux", SESSION_COOKIE_NAME);
         assert_eq!(
             extract_session_token_from_cookie(&header),
             Some("session-123".to_string())

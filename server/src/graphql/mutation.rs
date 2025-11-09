@@ -933,9 +933,12 @@ impl MutationRoot {
         let content_type = upload_data.content_type;
         let bytes = upload_data.bytes;
 
-        let sanitized = sanitize_attachment_filename(&filename);
-        let unique = Uuid::new_v4().to_string();
-        let key = format!("{unique}-{sanitized}");
+        if filename.trim().is_empty() {
+            return Err(map_app_error(AppError::bad_request(
+                "blob filename must not be empty",
+            )));
+        }
+        let key = filename;
 
         let mut metadata = BlobMetadata::default();
         metadata.content_type = content_type.filter(|value| !value.is_empty());

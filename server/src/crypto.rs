@@ -6,7 +6,7 @@ use p256::ecdsa::signature::{Signer, Verifier};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p256::elliptic_curve::rand_core::OsRng;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
-use tracing::{warn};
+use tracing::warn;
 
 static GENERATED_KEY_NOTICE: Lazy<()> = Lazy::new(|| {
     warn!("No BARFFINE_CRYPTO_PRIVATE_KEY provided. Generated a transient key for doc RPC tokens.");

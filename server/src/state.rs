@@ -36,7 +36,7 @@ use barffine_core::{
 };
 
 use crate::{
-    blob_store::InMemoryBlobStorage,
+    blob_store::SqliteBlobStorage,
     crypto::DocTokenSigner,
     doc::{
         cache::{DocCache, DocCacheBuilder, DocCacheConfig},
@@ -637,7 +637,7 @@ pub fn build_state_with_config(database: &Database, config: StateBuildConfig) ->
     let workspace_embedding_ignored_docs = Arc::new(DashMap::new());
     let copilot_sessions = Arc::new(DashMap::new());
     let comment_attachment_store = SqliteCommentAttachmentStore::new(database);
-    let blob_store: Arc<dyn BlobStorage> = Arc::new(InMemoryBlobStorage::default());
+    let blob_store: Arc<dyn BlobStorage> = Arc::new(SqliteBlobStorage::new(database));
     let doc_token_signer = Arc::new(DocTokenSigner::new());
     let server_path = detect_server_path();
     let base_url = compute_base_url(server_path.as_deref());

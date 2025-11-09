@@ -50,6 +50,7 @@ axum-otel-metrics.workspace = true
 fastrand.workspace = true
 moka.workspace = true
 pprof = { version = "0.15", features = ["flamegraph", "protobuf"] }
+snap = "1.1"
 tempfile = "3"
 
 [dev-dependencies]
