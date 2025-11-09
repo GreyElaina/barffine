@@ -52,5 +52,10 @@ moka.workspace = true
 pprof = { version = "0.15", features = ["flamegraph", "protobuf"] }
 snap = "1.1"
 tempfile = "3"
+reqwest.workspace = true
+serde_urlencoded.workspace = true
+url.workspace = true
+semver.workspace = true
+jsonwebtoken.workspace = true
 
 [dev-dependencies]

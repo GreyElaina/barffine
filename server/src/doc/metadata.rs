@@ -1,8 +1,8 @@
 use barffine_core::doc_store::DocumentMetadata;
 
-use crate::{AppError, AppState, utils::paths::public_doc_share_path};
+use crate::{AppError, AppState};
 
-use super::{access, mode::DocPublishMode};
+use super::{access, mode::DocPublishMode, paths::public_doc_share_path};
 
 pub fn public_share_url(metadata: &DocumentMetadata) -> Option<String> {
     if metadata.public {

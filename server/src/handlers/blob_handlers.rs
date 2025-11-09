@@ -16,12 +16,10 @@ use crate::{
     handlers::headers::{
         HEADER_USER_ID, HEADER_WORKSPACE_ID, HEADER_WORKSPACE_ROLE, permission_header_value,
     },
+    http::{append_set_cookie_headers, http_date_from_datetime},
     state::AppState,
     types::{BlobDownloadQuery, PresignedUrlResponse, WorkspaceAccess},
-    utils::{
-        attachments::apply_attachment_headers,
-        http::{append_set_cookie_headers, http_date_from_datetime},
-    },
+    utils::attachments::apply_attachment_headers,
 };
 
 pub(crate) async fn get_workspace_blob_handler(

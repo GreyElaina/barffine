@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use crate::graphql::FeatureTypeEnum;
 
 #[derive(Enum, Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-#[graphql(name = "ServerFeature")]
+#[graphql(name = "ServerFeature", rename_items = "PascalCase")]
 pub enum ServerFeatureEnum {
     Captcha,
     Comment,
@@ -12,6 +12,7 @@ pub enum ServerFeatureEnum {
     CopilotEmbedding,
     Indexer,
     LocalWorkspace,
+    #[graphql(name = "OAuth")]
     OAuth,
     Payment,
 }
@@ -53,7 +54,7 @@ impl ServerDeploymentTypeEnum {
 }
 
 #[derive(Enum, Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-#[graphql(name = "OAuthProviderType")]
+#[graphql(name = "OAuthProviderType", rename_items = "PascalCase")]
 pub enum OAuthProviderTypeEnum {
     Apple,
     GitHub,

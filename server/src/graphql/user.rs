@@ -15,7 +15,7 @@ use barffine_core::{
 };
 
 use crate::{
-    AppError, AppState, utils::users::display_name_for_user, workspace::service::WorkspaceService,
+    AppError, AppState, user::helpers::display_name_for_user, workspace::service::WorkspaceService,
 };
 
 use super::types::user::{UserMembershipType, UserShareTokenType, UserType};

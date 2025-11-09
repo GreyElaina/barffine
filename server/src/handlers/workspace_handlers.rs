@@ -11,9 +11,9 @@ use axum::{
 
 use crate::{
     error::AppError,
+    http::append_set_cookie_headers,
     state::AppState,
     types::{CreateWorkspaceRequest, CreateWorkspaceResponse, WorkspaceContentResponse},
-    utils::http::append_set_cookie_headers,
     workspace::service::{
         AccessTokenContext, AccessTokenVerification, WorkspaceCreationParams, WorkspaceService,
     },

@@ -8,6 +8,7 @@ use crate::{
     auth::authenticate_with_password,
     comment::notifications::{notify_comment_creation, notify_comment_reply},
     doc::{
+        channels::comment_attachment_blob_key,
         metadata as doc_metadata,
         mode::DocPublishMode,
         roles as doc_roles,
@@ -19,10 +20,8 @@ use crate::{
         MAX_AVATAR_UPLOAD_BYTES, avatar_descriptor, avatar_url, parse_avatar_key_from_url,
         sniff_mime as sniff_avatar_mime,
     },
-    utils::{
-        attachments::sanitize_attachment_filename, channels::comment_attachment_blob_key,
-        users::is_valid_email,
-    },
+    user::helpers::is_valid_email,
+    utils::attachments::sanitize_attachment_filename,
     workspace::{
         invites::{self as workspace_invites, InviteLinkLookup},
         members::{self as workspace_members, MemberAcceptance},

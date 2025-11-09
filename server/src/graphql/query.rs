@@ -5,6 +5,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 use barffine_core::feature::FeatureNamespace;
 
+use super::context::ClientVersion;
+use crate::oauth::OAuthProviderKind;
 use crate::{
     AppError, AppState,
     doc::{history, sync::workspace_snapshot_or_not_found},
@@ -13,6 +15,7 @@ use crate::{
         service::WorkspaceService,
     },
 };
+use semver::Version;
 
 use super::workspace::{
     ContextWorkspaceEmbeddingStatus, InvitationType, InvitationWorkspaceType, Permission,
@@ -47,6 +50,14 @@ impl QueryRoot {
             features = default_server_features();
         }
 
+        if state.oauth.has_providers()
+            && !features
+                .iter()
+                .any(|feature| matches!(feature, ServerFeatureEnum::OAuth))
+        {
+            features.push(ServerFeatureEnum::OAuth);
+        }
+
         let allow_guest_demo_workspace =
             allow_guest_demo_workspace_override().unwrap_or_else(|| {
                 features
@@ -58,7 +69,7 @@ impl QueryRoot {
             password: password_limits_from_env(),
         };
 
-        let oauth_providers = oauth_providers_from_env();
+        let oauth_providers = oauth_providers_for_request(ctx, state);
         let available_user_features: Vec<FeatureTypeEnum> = Vec::new();
 
         Ok(ServerConfigObject::new(
@@ -762,19 +773,56 @@ fn password_limits_from_env() -> PasswordLimitsObject {
     }
 }
 
-fn oauth_providers_from_env() -> Vec<OAuthProviderTypeEnum> {
-    env::var("BARFFINE_OAUTH_PROVIDERS")
-        .ok()
-        .map(|raw| {
-            parse_list(&raw, |token| {
-                if token.is_empty() {
-                    None
-                } else {
-                    OAuthProviderTypeEnum::from_str(token)
-                }
-            })
+fn oauth_providers_for_request(ctx: &Context<'_>, state: &AppState) -> Vec<OAuthProviderTypeEnum> {
+    let providers = state.oauth.providers();
+    let client_version = ctx.data_opt::<ClientVersion>().and_then(|cv| cv.parsed());
+    filter_oauth_providers(providers, client_version)
+}
+
+fn map_oauth_provider(kind: OAuthProviderKind) -> OAuthProviderTypeEnum {
+    match kind {
+        OAuthProviderKind::Apple => OAuthProviderTypeEnum::Apple,
+        OAuthProviderKind::GitHub => OAuthProviderTypeEnum::GitHub,
+        OAuthProviderKind::Google => OAuthProviderTypeEnum::Google,
+        OAuthProviderKind::Oidc => OAuthProviderTypeEnum::Oidc,
+    }
+}
+
+fn meets_min_version(version: &Version, major: u64, minor: u64, patch: u64) -> bool {
+    if version.major > major {
+        return true;
+    }
+    if version.major < major {
+        return false;
+    }
+
+    if version.minor > minor {
+        return true;
+    }
+    if version.minor < minor {
+        return false;
+    }
+
+    version.patch >= patch
+}
+
+fn filter_oauth_providers(
+    providers: Vec<OAuthProviderKind>,
+    client_version: Option<&Version>,
+) -> Vec<OAuthProviderTypeEnum> {
+    providers
+        .into_iter()
+        .filter(|kind| {
+            if matches!(kind, OAuthProviderKind::Apple) {
+                client_version
+                    .filter(|version| meets_min_version(version, 0, 22, 0))
+                    .is_some()
+            } else {
+                true
+            }
         })
-        .unwrap_or_default()
+        .map(map_oauth_provider)
+        .collect()
 }
 
 fn parse_list<T, F>(raw: &str, mut parser: F) -> Vec<T>
@@ -803,6 +851,157 @@ fn parse_bool(value: &str) -> Option<bool> {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{graphql::build_schema, test_support::setup_state};
+    use async_graphql::Request;
+    use once_cell::sync::Lazy;
+    use tokio::sync::Mutex;
+
+    static ENV_GUARD: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    fn set_env_var(key: &str, value: &str) {
+        // Nightly build is configured with `unsafe_op_in_unsafe_fn`, so keep the unsafe scope tiny.
+        unsafe { std::env::set_var(key, value) };
+    }
+
+    fn remove_env_var(key: &str) {
+        unsafe { std::env::remove_var(key) };
+    }
+
+    struct ProviderEnv;
+
+    impl ProviderEnv {
+        fn new() -> Self {
+            set_env_var("BARFFINE_OAUTH_GOOGLE_CLIENT_ID", "google-client");
+            set_env_var("BARFFINE_OAUTH_GOOGLE_CLIENT_SECRET", "google-secret");
+            set_env_var("BARFFINE_OAUTH_APPLE_CLIENT_ID", "apple-client");
+            set_env_var("BARFFINE_OAUTH_APPLE_CLIENT_SECRET", "apple-secret");
+            Self
+        }
+    }
+
+    impl Drop for ProviderEnv {
+        fn drop(&mut self) {
+            for key in [
+                "BARFFINE_OAUTH_GOOGLE_CLIENT_ID",
+                "BARFFINE_OAUTH_GOOGLE_CLIENT_SECRET",
+                "BARFFINE_OAUTH_APPLE_CLIENT_ID",
+                "BARFFINE_OAUTH_APPLE_CLIENT_SECRET",
+            ] {
+                remove_env_var(key);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn server_config_filters_apple_by_client_version() {
+        let _guard = ENV_GUARD.lock().await;
+        let _env = ProviderEnv::new();
+        let (_tmp, _db, state) = setup_state().await;
+        let schema = build_schema(state.clone());
+
+        let request =
+            Request::new("query ServerConfig { serverConfig { features oauthProviders } }").data(
+                ClientVersion::new(Some(Version::parse("0.21.0").expect("parse version"))),
+            );
+
+        let older = schema.execute(request).await;
+        assert!(older.errors.is_empty(), "{:?}", older.errors);
+        let data = older.data.into_json().expect("json");
+        let providers = data["serverConfig"]["oauthProviders"]
+            .as_array()
+            .expect("providers array")
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(providers, vec!["Google"]);
+
+        let request =
+            Request::new("query ServerConfig { serverConfig { features oauthProviders } }").data(
+                ClientVersion::new(Some(Version::parse("0.22.0").expect("parse version"))),
+            );
+
+        let newer = schema.execute(request).await;
+        assert!(newer.errors.is_empty(), "{:?}", newer.errors);
+        let data = newer.data.into_json().expect("json");
+        let mut providers = data["serverConfig"]["oauthProviders"]
+            .as_array()
+            .expect("providers array")
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        providers.sort();
+        assert_eq!(providers, vec!["Apple", "Google"]);
+
+        let features = data["serverConfig"]["features"]
+            .as_array()
+            .expect("features array");
+        assert!(features.iter().any(|value| value.as_str() == Some("OAuth")));
+    }
+
+    #[test]
+    fn filter_oauth_providers_hides_apple_without_version() {
+        let providers = vec![OAuthProviderKind::Apple, OAuthProviderKind::Google];
+        let filtered = filter_oauth_providers(providers, None);
+        assert_eq!(filtered, vec![OAuthProviderTypeEnum::Google]);
+    }
+
+    #[test]
+    fn filter_oauth_providers_hides_apple_for_old_clients() {
+        let providers = vec![
+            OAuthProviderKind::Apple,
+            OAuthProviderKind::GitHub,
+            OAuthProviderKind::Google,
+        ];
+        let version = Version::parse("0.21.9").ok();
+        let filtered = filter_oauth_providers(providers, version.as_ref());
+        assert_eq!(
+            filtered,
+            vec![OAuthProviderTypeEnum::GitHub, OAuthProviderTypeEnum::Google]
+        );
+    }
+
+    #[test]
+    fn filter_oauth_providers_keeps_apple_for_supported_clients() {
+        let providers = vec![
+            OAuthProviderKind::Google,
+            OAuthProviderKind::Apple,
+            OAuthProviderKind::Oidc,
+        ];
+        let version = Version::parse("0.22.0").ok();
+        let filtered = filter_oauth_providers(providers, version.as_ref());
+        assert_eq!(
+            filtered,
+            vec![
+                OAuthProviderTypeEnum::Google,
+                OAuthProviderTypeEnum::Apple,
+                OAuthProviderTypeEnum::Oidc
+            ]
+        );
+    }
+
+    #[test]
+    fn meets_min_version_handles_major_minor_patch() {
+        let reference = Version::parse("0.22.0").unwrap();
+        assert!(meets_min_version(&reference, 0, 22, 0));
+        assert!(!meets_min_version(&reference, 0, 22, 1));
+        assert!(meets_min_version(
+            &Version::parse("1.0.0").unwrap(),
+            0,
+            22,
+            0
+        ));
+        assert!(!meets_min_version(
+            &Version::parse("0.21.9").unwrap(),
+            0,
+            22,
+            0
+        ));
     }
 }
 

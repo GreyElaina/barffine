@@ -2,19 +2,19 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{
-    Arc,
     atomic::{AtomicUsize, Ordering},
+    Arc,
 };
 
 use anyhow::Result as AnyResult;
-use dashmap::{DashMap, mapref::entry::Entry};
+use dashmap::{mapref::entry::Entry, DashMap};
 use once_cell::sync::OnceCell;
 use serde::Serialize;
 use socketioxide::SocketIo;
 use tokio::{
     spawn,
-    sync::{Mutex, broadcast},
-    time::{Duration, sleep},
+    sync::{broadcast, Mutex},
+    time::{sleep, Duration},
 };
 use tracing::{info, warn};
 
@@ -25,7 +25,7 @@ use barffine_core::{
     comment_store::SqliteCommentStore,
     db::Database,
     doc_roles::DocumentRoleStore,
-    doc_store::{DOC_UPDATE_LOG_LIMIT, DocumentStore},
+    doc_store::{DocumentStore, DOC_UPDATE_LOG_LIMIT},
     feature::{DeterministicFeatureStore, FeatureFlag, FeatureNamespace, FeatureSnapshot},
     notification_store::SqliteNotificationCenter,
     user::UserStore,
@@ -44,13 +44,14 @@ use crate::{
     },
     feature_service::FeatureService,
     graphql::copilot::CopilotSessionRecord,
-    socket::rooms::{RoomKind, SpaceType, space_room_name},
+    socket::rooms::{space_room_name, RoomKind, SpaceType},
     types::SessionUser,
     user::service::UserService,
     workspace::service::WorkspaceService,
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use serde_json::{Value as JsonValue, json};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use serde_json::{json, Value as JsonValue};
+use crate::oauth::OAuthService;
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceEmbeddingEvent {
@@ -89,6 +90,7 @@ pub struct AppState {
     pub socket_io: Arc<OnceCell<SocketIo>>,
     pub socket_metrics: Arc<SocketMetrics>,
     pub workspace_embedding_events: broadcast::Sender<WorkspaceEmbeddingEvent>,
+    pub oauth: Arc<OAuthService>,
 }
 
 #[derive(Clone, Default)]
@@ -641,6 +643,7 @@ pub fn build_state_with_config(database: &Database, config: StateBuildConfig) ->
     let doc_token_signer = Arc::new(DocTokenSigner::new());
     let server_path = detect_server_path();
     let base_url = compute_base_url(server_path.as_deref());
+    let oauth = Arc::new(OAuthService::new(&base_url));
     let socket_io = Arc::new(OnceCell::new());
     let socket_metrics = Arc::new(SocketMetrics::default());
     let (workspace_embedding_events, _) = broadcast::channel(64);
@@ -704,6 +707,7 @@ pub fn build_state_with_config(database: &Database, config: StateBuildConfig) ->
         socket_io,
         socket_metrics,
         workspace_embedding_events,
+        oauth,
     };
 
     spawn_background_tasks(&state);

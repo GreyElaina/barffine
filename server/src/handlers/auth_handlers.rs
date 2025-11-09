@@ -22,13 +22,14 @@ use crate::{
         clear_user_cookie, extract_cookie, extract_session_token,
     },
     error::AppError,
+    http::append_set_cookie_headers,
     state::{AppState, FeatureSnapshotPayload},
     types::{
         CreateAdminUserRequest, CreateSessionRequest, CreateSessionResponse, CreateUserResponse,
         DeleteSessionRequest, PreflightRequest, PreflightResponse, RefreshSessionRequest,
         SessionUser, SessionUserPayload, SessionUsersPayload, SignInRequest,
     },
-    utils::{http::append_set_cookie_headers, users::is_valid_email},
+    user::helpers::is_valid_email,
 };
 
 static CREATE_ADMIN_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();

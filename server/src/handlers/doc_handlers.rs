@@ -22,6 +22,7 @@ use y_octo::{Doc as YoctoDoc, StateVector as YoctoStateVector};
 use crate::{
     auth::{DocAccessIntent, RpcAccessRequirement, parse_history_timestamp, resolve_doc_access},
     doc::{
+        channels::{comment_attachment_blob_key, doc_channel_key},
         content::{parse_doc_content, parse_doc_markdown},
         history, metadata as doc_metadata,
         mode::DocPublishMode,
@@ -33,6 +34,7 @@ use crate::{
         HEADER_WORKSPACE_ROLE, doc_role_header_value, permission_header_value,
     },
     handlers::workspace_handlers::ensure_workspace_exists,
+    http::{append_set_cookie_headers, http_date_from_datetime},
     socket::rooms::SpaceType,
     state::{AppState, SyncEventKind},
     types::{
@@ -42,9 +44,7 @@ use crate::{
     },
     utils::{
         attachments::apply_attachment_headers,
-        channels::{comment_attachment_blob_key, doc_channel_key},
         crdt::{decode_state_vector, encode_state_vector},
-        http::{append_set_cookie_headers, http_date_from_datetime},
     },
     workspace::service::{AccessTokenContext, AccessTokenVerification},
 };
@@ -821,15 +821,16 @@ mod tests {
         AppState,
         auth::generate_password_hash,
         cookies::{SESSION_COOKIE_NAME, USER_COOKIE_NAME},
-        doc::content::{parse_doc_content, parse_doc_markdown},
+        doc::{
+            channels::comment_attachment_blob_key,
+            content::{parse_doc_content, parse_doc_markdown},
+            paths::public_doc_share_path,
+        },
         test_support::{
             fixture_snapshot, insert_document, persist_snapshot, seed_workspace, setup_state,
         },
         types::{DocContentQuery, PublishDocRequest},
-        utils::{
-            channels::comment_attachment_blob_key, crdt::encode_state_vector,
-            paths::public_doc_share_path,
-        },
+        utils::crdt::encode_state_vector,
     };
 
     fn session_cookie_value(session_id: &str, user_id: Option<&str>) -> HeaderValue {

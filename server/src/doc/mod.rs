@@ -1,9 +1,11 @@
 pub mod access;
 pub mod cache;
+pub mod channels;
 pub mod content;
 pub mod history;
 pub mod metadata;
 pub mod mode;
+pub mod paths;
 pub mod roles;
 pub mod service;
 pub mod sync;

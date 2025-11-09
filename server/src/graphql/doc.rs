@@ -26,7 +26,7 @@ use super::{
 use crate::{
     AppError, AppState,
     doc::{history::EncodedDocHistory, metadata, mode::DocPublishMode},
-    utils::users::{display_name_for_user, normalize_user_list_params},
+    user::helpers::{display_name_for_user, normalize_user_list_params},
 };
 
 use super::types::doc::DocType;

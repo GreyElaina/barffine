@@ -17,7 +17,7 @@ use crate::{
     AppError, AppState,
     comment::fetch as comment_fetch,
     doc::{history, metadata as doc_metadata},
-    utils::users::display_name_from_parts,
+    user::helpers::display_name_from_parts,
     workspace::{invites as workspace_invites, service::WorkspaceService},
 };
 

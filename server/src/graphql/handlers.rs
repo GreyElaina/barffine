@@ -21,7 +21,7 @@ use crate::{
     },
 };
 
-use super::{BarffineSchema, RequestUser};
+use super::{BarffineSchema, RequestUser, context::ClientVersion};
 
 pub async fn graphql_handler(
     Extension(schema): Extension<BarffineSchema>,
@@ -61,6 +61,12 @@ pub async fn graphql_handler(
             }
         }
     }
+
+    let client_version = headers
+        .get("x-affine-version")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|raw| semver::Version::parse(raw).ok());
+    request = request.data(ClientVersion::new(client_version));
 
     let operation_name = request
         .operation_name

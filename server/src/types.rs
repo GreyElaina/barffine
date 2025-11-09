@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::graphql::{DocRole, Permission};
 use crate::{
     doc::{history::EncodedDocHistory, metadata},
-    utils::users::display_name_for_user,
+    user::helpers::display_name_for_user,
 };
 // ========== Authentication Types ==========
 

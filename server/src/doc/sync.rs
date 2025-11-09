@@ -1,8 +1,8 @@
 use super::cache::DocCacheApplyResult;
 
 use crate::{
-    AppError, AppState, socket::rooms::SpaceType, state::SocketBroadcastMeta, types::SessionUser,
-    utils::channels::doc_channel_key,
+    AppError, AppState, doc::channels::doc_channel_key, socket::rooms::SpaceType,
+    state::SocketBroadcastMeta, types::SessionUser,
 };
 
 /// Controls whether the cache should be refreshed from storage before broadcasting a snapshot.

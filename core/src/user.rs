@@ -39,6 +39,39 @@ impl SessionRecord {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ConnectedAccountRecord {
+    pub id: String,
+    pub user_id: String,
+    pub provider: String,
+    pub provider_account_id: String,
+    pub scope: Option<String>,
+    pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
+    pub expires_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug)]
+pub struct NewConnectedAccount<'a> {
+    pub user_id: &'a str,
+    pub provider: &'a str,
+    pub provider_account_id: &'a str,
+    pub scope: Option<&'a str>,
+    pub access_token: Option<&'a str>,
+    pub refresh_token: Option<&'a str>,
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Debug)]
+pub struct ConnectedAccountTokens<'a> {
+    pub scope: Option<&'a str>,
+    pub access_token: Option<&'a str>,
+    pub refresh_token: Option<&'a str>,
+    pub expires_at: Option<i64>,
+}
+
 #[derive(Clone)]
 pub struct UserStore {
     pool: Pool<Sqlite>,
@@ -200,6 +233,96 @@ impl UserStore {
     pub async fn delete_sessions_by_user(&self, user_id: &str) -> Result<()> {
         sqlx::query("DELETE FROM sessions WHERE user_id = ?")
             .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_connected_account(
+        &self,
+        provider: &str,
+        provider_account_id: &str,
+    ) -> Result<Option<ConnectedAccountRecord>> {
+        let row = sqlx::query(
+            "SELECT id, user_id, provider, provider_account_id, scope, access_token, refresh_token, expires_at, created_at, updated_at \
+             FROM user_connected_accounts WHERE provider = ? AND provider_account_id = ?",
+        )
+        .bind(provider)
+        .bind(provider_account_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(Self::map_connected_account))
+    }
+
+    pub async fn create_connected_account(
+        &self,
+        input: NewConnectedAccount<'_>,
+    ) -> Result<ConnectedAccountRecord> {
+        let id = Uuid::new_v4().to_string();
+        let timestamp = Utc::now().timestamp();
+
+        sqlx::query(
+            "INSERT INTO user_connected_accounts \
+             (id, user_id, provider, provider_account_id, scope, access_token, refresh_token, expires_at, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(input.user_id)
+        .bind(input.provider)
+        .bind(input.provider_account_id)
+        .bind(input.scope)
+        .bind(input.access_token)
+        .bind(input.refresh_token)
+        .bind(input.expires_at)
+        .bind(timestamp)
+        .bind(timestamp)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(ConnectedAccountRecord {
+            id,
+            user_id: input.user_id.to_owned(),
+            provider: input.provider.to_owned(),
+            provider_account_id: input.provider_account_id.to_owned(),
+            scope: input.scope.map(|value| value.to_owned()),
+            access_token: input.access_token.map(|value| value.to_owned()),
+            refresh_token: input.refresh_token.map(|value| value.to_owned()),
+            expires_at: input.expires_at,
+            created_at: timestamp,
+            updated_at: timestamp,
+        })
+    }
+
+    pub async fn update_connected_account_tokens(
+        &self,
+        account_id: &str,
+        tokens: ConnectedAccountTokens<'_>,
+    ) -> Result<ConnectedAccountRecord> {
+        let timestamp = Utc::now().timestamp();
+
+        sqlx::query(
+            "UPDATE user_connected_accounts \
+             SET scope = ?, access_token = ?, refresh_token = ?, expires_at = ?, updated_at = ? \
+             WHERE id = ?",
+        )
+        .bind(tokens.scope)
+        .bind(tokens.access_token)
+        .bind(tokens.refresh_token)
+        .bind(tokens.expires_at)
+        .bind(timestamp)
+        .bind(account_id)
+        .execute(&self.pool)
+        .await?;
+
+        self.find_connected_account_by_id(account_id)
+            .await?
+            .ok_or_else(|| anyhow!("connected account not found"))
+    }
+
+    pub async fn delete_connected_account(&self, account_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM user_connected_accounts WHERE id = ?")
+            .bind(account_id)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -429,6 +552,36 @@ impl UserStore {
             created_at: row.get::<i64, _>("created_at"),
         }
     }
+
+    async fn find_connected_account_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<ConnectedAccountRecord>> {
+        let row = sqlx::query(
+            "SELECT id, user_id, provider, provider_account_id, scope, access_token, refresh_token, expires_at, created_at, updated_at \
+             FROM user_connected_accounts WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(Self::map_connected_account))
+    }
+
+    fn map_connected_account(row: SqliteRow) -> ConnectedAccountRecord {
+        ConnectedAccountRecord {
+            id: row.get("id"),
+            user_id: row.get("user_id"),
+            provider: row.get("provider"),
+            provider_account_id: row.get("provider_account_id"),
+            scope: row.get::<Option<String>, _>("scope"),
+            access_token: row.get::<Option<String>, _>("access_token"),
+            refresh_token: row.get::<Option<String>, _>("refresh_token"),
+            expires_at: row.get::<Option<i64>, _>("expires_at"),
+            created_at: row.get::<i64, _>("created_at"),
+            updated_at: row.get::<i64, _>("updated_at"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -595,6 +748,78 @@ mod tests {
         assert_eq!(second_page.len(), 1);
         assert!(second_page[0].created_at <= cursor.created_at);
         assert_ne!(second_page[0].id, cursor.id);
+
+        drop(store);
+        drop(database);
+        if let Err(err) = std::fs::remove_file(&db_path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(err.into());
+            }
+        }
+
+        for suffix in ["db-wal", "db-shm"] {
+            let sidecar = db_path.with_extension(suffix);
+            let _ = std::fs::remove_file(sidecar);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connected_account_lifecycle_roundtrips() -> anyhow::Result<()> {
+        let (database, db_path) = setup_database().await?;
+        let store = UserStore::new(&database);
+
+        let user = store
+            .create("oauth@example.com", "", Some("OAuth User"))
+            .await?;
+
+        let created = store
+            .create_connected_account(NewConnectedAccount {
+                user_id: &user.id,
+                provider: "github",
+                provider_account_id: "acct-1",
+                scope: Some("user"),
+                access_token: Some("token-1"),
+                refresh_token: None,
+                expires_at: Some(1_000),
+            })
+            .await?;
+
+        assert_eq!(created.provider, "github");
+        assert_eq!(created.provider_account_id, "acct-1");
+        assert_eq!(created.access_token.as_deref(), Some("token-1"));
+
+        let fetched = store
+            .get_connected_account("github", "acct-1")
+            .await?
+            .expect("connected account present");
+        assert_eq!(fetched.id, created.id);
+        assert_eq!(fetched.user_id, user.id);
+
+        let updated = store
+            .update_connected_account_tokens(
+                &created.id,
+                ConnectedAccountTokens {
+                    scope: None,
+                    access_token: Some("token-2"),
+                    refresh_token: Some("refresh-2"),
+                    expires_at: Some(2_000),
+                },
+            )
+            .await?;
+
+        assert_eq!(updated.access_token.as_deref(), Some("token-2"));
+        assert_eq!(updated.refresh_token.as_deref(), Some("refresh-2"));
+        assert_eq!(updated.expires_at, Some(2_000));
+
+        store.delete_connected_account(&created.id).await?;
+        assert!(
+            store
+                .get_connected_account("github", "acct-1")
+                .await?
+                .is_none()
+        );
 
         drop(store);
         drop(database);

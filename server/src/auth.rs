@@ -230,6 +230,10 @@ pub(crate) async fn authenticate_with_password(
         return Err(AppError::unauthorized("invalid credentials"));
     }
 
+    if user.password_hash.trim().is_empty() {
+        return Err(AppError::unauthorized("invalid credentials"));
+    }
+
     let parsed_hash =
         PasswordHash::new(&user.password_hash).map_err(|err| AppError::internal(err.into()))?;
 

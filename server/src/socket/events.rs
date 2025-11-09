@@ -15,7 +15,10 @@ use y_octo::{Doc as YoctoDoc, StateVector as YoctoStateVector};
 
 use crate::{
     auth::{DocAccessIntent, RpcAccessRequirement, resolve_doc_access, resolve_workspace_access},
-    doc::sync::{UpdateBroadcastContext, apply_doc_updates},
+    doc::{
+        channels::doc_channel_key,
+        sync::{UpdateBroadcastContext, apply_doc_updates},
+    },
     error::AppError,
     graphql::doc_permissions_for_role,
     socket::{
@@ -26,10 +29,7 @@ use crate::{
     },
     state::{AppState, DocSessionKey, SocketBroadcastMeta},
     types::RestDocAccess,
-    utils::{
-        channels::doc_channel_key,
-        crdt::{decode_state_vector, encode_state_vector},
-    },
+    utils::crdt::{decode_state_vector, encode_state_vector},
 };
 
 use tokio::sync::Mutex;

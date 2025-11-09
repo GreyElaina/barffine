@@ -48,6 +48,19 @@ Key variables:
 | `RUST_LOG` | `info` | Standard Rust log filter. |
 | `BARFFINE_TRACE_*` | unset | Control sampling behaviour for custom tracing (see `server/src/observability.rs`). |
 
+### OAuth providers
+
+Barffine now exposes the same `/api/oauth/*` endpoints and GraphQL metadata as the official AFFiNE backend. Each provider is enabled when both the client ID and secret are present (values are read from the process environment as well as `.env` via `dotenvy`):
+
+| Provider | Required variables | Optional variables |
+| --- | --- | --- |
+| Google | `BARFFINE_OAUTH_GOOGLE_CLIENT_ID`, `BARFFINE_OAUTH_GOOGLE_CLIENT_SECRET` | `BARFFINE_OAUTH_GOOGLE_SCOPE`, `BARFFINE_OAUTH_GOOGLE_PROMPT`, `BARFFINE_OAUTH_GOOGLE_ACCESS_TYPE` |
+| GitHub | `BARFFINE_OAUTH_GITHUB_CLIENT_ID`, `BARFFINE_OAUTH_GITHUB_CLIENT_SECRET` | `BARFFINE_OAUTH_GITHUB_SCOPE` |
+| Apple | `BARFFINE_OAUTH_APPLE_CLIENT_ID`, `BARFFINE_OAUTH_APPLE_CLIENT_SECRET` | — (redirect path automatically set to `/api/oauth/callback`) |
+| Generic OIDC | `BARFFINE_OAUTH_OIDC_CLIENT_ID`, `BARFFINE_OAUTH_OIDC_CLIENT_SECRET`, `BARFFINE_OAUTH_OIDC_ISSUER` | `BARFFINE_OAUTH_OIDC_SCOPE`, `BARFFINE_OAUTH_OIDC_CLAIM_ID`, `BARFFINE_OAUTH_OIDC_CLAIM_EMAIL`, `BARFFINE_OAUTH_OIDC_CLAIM_NAME` |
+
+Use `BARFFINE_ALLOW_OAUTH_SIGNUP` (defaults to `true`) to forbid new users from being created through OAuth flows while still allowing existing linked accounts to sign in.
+
 Example `.env`:
 
 ```dotenv

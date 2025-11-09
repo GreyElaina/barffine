@@ -13,17 +13,16 @@ use axum::{
 use crate::{
     auth::generate_password_hash,
     error::AppError,
+    http::{append_set_cookie_headers, http_date_from_datetime},
     state::AppState,
     types::{
         CreateUserRequest, CreateUserResponse, ListUsersQuery, ListUsersResponse, UserResponse,
     },
-    user::avatar::{avatar_descriptor, is_valid_avatar_key},
-    utils::{
-        attachments::apply_attachment_headers,
-        db::is_unique_violation,
-        http::{append_set_cookie_headers, http_date_from_datetime},
-        users::normalize_user_list_params,
+    user::{
+        avatar::{avatar_descriptor, is_valid_avatar_key},
+        helpers::normalize_user_list_params,
     },
+    utils::{attachments::apply_attachment_headers, db::is_unique_violation},
 };
 
 pub(crate) async fn create_user_handler(

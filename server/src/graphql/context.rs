@@ -23,3 +23,18 @@ impl RequestUser {
         self.session_id.as_deref()
     }
 }
+
+#[derive(Clone)]
+pub struct ClientVersion {
+    parsed: Option<semver::Version>,
+}
+
+impl ClientVersion {
+    pub fn new(parsed: Option<semver::Version>) -> Self {
+        Self { parsed }
+    }
+
+    pub fn parsed(&self) -> Option<&semver::Version> {
+        self.parsed.as_ref()
+    }
+}

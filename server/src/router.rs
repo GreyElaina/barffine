@@ -1,9 +1,9 @@
 // Router configuration
 
 use axum::{
-    Extension, Router,
-    http::Method,
-    routing::{get, post},
+    http::Method, routing::{get, post},
+    Extension,
+    Router,
 };
 use axum_otel_metrics::HttpMetricsLayerBuilder;
 use axum_tracing_opentelemetry::middleware::{OtelAxumLayer, OtelInResponseLayer};
@@ -22,6 +22,7 @@ use crate::{
     observability,
     state::AppState,
 };
+use crate::oauth::oauth_router;
 
 pub fn build_router(state: AppState) -> Router {
     let prefix = state.server_path.clone();
@@ -74,7 +75,7 @@ fn build_base_router(state: AppState) -> Router {
         .route("/api/auth/session", get(get_session_handler))
         .route("/api/auth/user", get(current_user_handler))
         .route("/api/auth/sign-out", get(sign_out_handler))
-        // .merge(oauth_router(state.clone()))
+        .merge(oauth_router())
         // Sessions
         .route(
             "/sessions",
