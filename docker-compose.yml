@@ -6,7 +6,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        RUST_VERSION: "1.81"
+        RUST_VERSION: "${RUST_VERSION:-nightly}"
     command: ["serve"]
     restart: unless-stopped
     env_file:

@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1.6
-ARG RUST_VERSION=1.81
+# Edition 2024 requires the nightly toolchain until stabilized; allow overrides via ARG.
+ARG RUST_VERSION=nightly
 
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
