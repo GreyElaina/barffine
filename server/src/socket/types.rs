@@ -1,12 +1,16 @@
 use std::fmt;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use dashmap::DashMap;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
+use std::sync::Arc;
+use tracing::Span;
 use uuid::Uuid;
 
 use crate::{
     error::{AppError, UserFriendlyPayload},
+    socket::rooms::SpaceType,
     types::{AuthenticatedRestSession, SessionUser},
 };
 
@@ -79,6 +83,39 @@ impl SocketRequestContext {
             .unwrap_or_else(|| format!("ws-{}", Uuid::new_v4().simple()));
 
         Self { request_id: id }
+    }
+}
+
+#[derive(Clone)]
+pub struct SocketSpanRegistry {
+    root_span: Span,
+    spaces: Arc<DashMap<(SpaceType, String), Span>>,
+}
+
+impl SocketSpanRegistry {
+    pub fn new(root_span: Span) -> Self {
+        Self {
+            root_span,
+            spaces: Arc::new(DashMap::new()),
+        }
+    }
+
+    pub fn root_span(&self) -> Span {
+        self.root_span.clone()
+    }
+
+    pub fn space_span(&self, space_type: SpaceType, space_id: &str) -> Option<Span> {
+        self.spaces
+            .get(&(space_type, space_id.to_string()))
+            .map(|span| span.clone())
+    }
+
+    pub fn insert_space_span(&self, space_type: SpaceType, space_id: &str, span: Span) {
+        self.spaces.insert((space_type, space_id.to_string()), span);
+    }
+
+    pub fn remove_space_span(&self, space_type: SpaceType, space_id: &str) {
+        self.spaces.remove(&(space_type, space_id.to_string()));
     }
 }
 

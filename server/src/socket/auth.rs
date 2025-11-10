@@ -16,7 +16,7 @@ use crate::{
     auth::authenticate_rest_request,
     cookies::{SESSION_COOKIE_NAME, USER_COOKIE_NAME},
     error::AppError,
-    socket::types::{SocketRequestContext, SocketUserContext},
+    socket::types::{SocketRequestContext, SocketSpanRegistry, SocketUserContext},
     state::AppState,
 };
 
@@ -218,12 +218,23 @@ where
                 effective_access_token,
                 authorization_header.clone(),
             ));
-
-            info!(
-                request_id = %request_context.request_id,
-                user_id = %auth.user.id,
-                "socket authenticated"
+            let socket_root_span = logfire::span!(
+                "socket connection",
+                socket_id = socket_ref.id.to_string(),
+                user_id = auth.user.id.as_str(),
+                request_id = request_context.request_id.as_str()
             );
+            socket_ref
+                .extensions
+                .insert(SocketSpanRegistry::new(socket_root_span.clone()));
+
+            socket_root_span.in_scope(|| {
+                info!(
+                    request_id = %request_context.request_id,
+                    user_id = %auth.user.id,
+                    "socket authenticated"
+                );
+            });
 
             state.socket_metrics.inc_connections();
 

@@ -8,7 +8,10 @@ use std::{
     time::Duration,
 };
 
-use axum::http::{HeaderValue, Request, Response, header::HeaderName};
+use axum::{
+    extract::MatchedPath,
+    http::{HeaderValue, Request, Response, header::HeaderName},
+};
 use once_cell::sync::OnceCell;
 use tower::{Layer, Service};
 use tower_http::trace::{MakeSpan, OnResponse};
@@ -101,25 +104,30 @@ impl<B> OnResponse<B> for ResponseLogger {
             Level::INFO
         };
 
+        span.record(
+            "http.response.status_code",
+            &field::display(status.as_u16()),
+        );
+
         match level {
             Level::ERROR => event!(
                 parent: span,
                 Level::ERROR,
-                status = status.as_u16(),
+                http.response.status_code = status.as_u16(),
                 latency_ms = latency.as_millis() as u64,
                 "request completed"
             ),
             Level::WARN => event!(
                 parent: span,
                 Level::WARN,
-                status = status.as_u16(),
+                http.response.status_code = status.as_u16(),
                 latency_ms = latency.as_millis() as u64,
                 "request completed"
             ),
             _ => event!(
                 parent: span,
-                Level::DEBUG,
-                status = status.as_u16(),
+                Level::INFO,
+                http.response.status_code = status.as_u16(),
                 latency_ms = latency.as_millis() as u64,
                 "request completed"
             ),
@@ -249,14 +257,34 @@ impl<B> MakeSpan<B> for HttpMakeSpan {
             .and_then(|ctx| ctx.client_version())
             .unwrap_or("unknown")
             .to_string();
+        let method = request.method().to_string();
+        let target = request
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| request.uri().to_string());
+        let matched_route = request
+            .extensions()
+            .get::<MatchedPath>()
+            .map(|mp| mp.as_str().to_string());
+        let route_for_title = matched_route.clone().unwrap_or_else(|| target.clone());
 
-        let span = tracing::span!(
-            Level::DEBUG,
-            "http.request",
-            method = %request.method(),
-            uri = %request.uri(),
-            request_id = %request_id,
-            client_version = %client_version,
+        let method_ref: &str = method.as_ref();
+        let route_ref: &str = route_for_title.as_ref();
+        let target_ref: &str = target.as_ref();
+        let request_id_ref: &str = request_id.as_ref();
+        let client_version_ref: &str = client_version.as_ref();
+
+        let span = logfire::span!(
+            "HTTP {method} {route}",
+            method = method_ref,
+            route = route_ref,
+            request_id = request_id_ref,
+            client_version = client_version_ref,
+            http.request.method = method_ref,
+            http.route = route_ref,
+            http.target = target_ref,
+            http.response.status_code = field::Empty,
             user_id = field::Empty,
             session_id = field::Empty
         );

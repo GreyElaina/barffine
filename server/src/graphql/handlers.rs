@@ -11,7 +11,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::time::Instant;
-use tracing::{debug, warn};
+use tracing::Instrument;
+use tracing::{info, warn};
 
 use crate::{
     AppState,
@@ -98,7 +99,7 @@ pub async fn graphql_handler(
         set_cookie_count = set_cookies.len() as i64
     );
 
-    debug!(
+    info!(
         operation = %operation_label,
         user_id = active_user.as_deref().unwrap_or("anonymous"),
         session_id = active_session.as_deref().unwrap_or(""),
@@ -107,10 +108,7 @@ pub async fn graphql_handler(
     );
 
     let start = Instant::now();
-    let execution = {
-        let _guard = graph_span.enter();
-        schema.execute(request).await
-    };
+    let execution = schema.execute(request).instrument(graph_span).await;
 
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -127,7 +125,7 @@ pub async fn graphql_handler(
         }
     }
 
-    debug!(
+    info!(
         operation = %operation_label,
         duration_ms = elapsed_ms,
         errors = has_errors,

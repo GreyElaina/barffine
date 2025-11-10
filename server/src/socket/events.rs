@@ -10,7 +10,8 @@ use socketioxide::{
     extract::{AckSender, Data, Extension, SocketRef, State},
     handler::ConnectHandler,
 };
-use tracing::{debug, info, warn};
+use tracing::Instrument;
+use tracing::{Span, debug, info, warn};
 use y_octo::{Doc as YoctoDoc, StateVector as YoctoStateVector};
 
 use crate::{
@@ -25,7 +26,7 @@ use crate::{
         ack::{ack_error, ack_ok},
         auth::SocketAuthMiddleware,
         rooms::{RoomKind, SpaceType, space_room_name},
-        types::{SocketRequestContext, SocketUserContext},
+        types::{SocketRequestContext, SocketSpanRegistry, SocketUserContext},
     },
     state::{AppState, DocSessionKey, SocketBroadcastMeta},
     types::RestDocAccess,
@@ -120,6 +121,10 @@ fn start_socket_span<'a>(
     doc_id: Option<&str>,
     request_id: Option<&str>,
 ) -> tracing::Span {
+    let registry = socket.extensions.get::<SocketSpanRegistry>();
+    let parent_span = space
+        .and_then(|(space_type, space_id)| ensure_space_span(socket, user, space_type, space_id))
+        .or_else(|| registry.map(|reg| reg.root_span()));
     let socket_id = socket.id.to_string();
     let user_id = user
         .map(|u| u.user_id.clone())
@@ -130,16 +135,55 @@ fn start_socket_span<'a>(
     let doc_id = doc_id.unwrap_or("").to_string();
     let request_id = request_id.unwrap_or("").to_string();
 
-    logfire::span!(
-        "socket {event}",
-        event = event,
-        socket_id = socket_id,
+    if let Some(parent) = parent_span {
+        logfire::span!(
+            parent: &parent,
+            "socket {event}",
+            event = event,
+            socket_id = socket_id,
+            user_id = user_id,
+            space_type = space_type,
+            space_id = space_id,
+            doc_id = doc_id,
+            request_id = request_id
+        )
+    } else {
+        logfire::span!(
+            "socket {event}",
+            event = event,
+            socket_id = socket_id,
+            user_id = user_id,
+            space_type = space_type,
+            space_id = space_id,
+            doc_id = doc_id,
+            request_id = request_id
+        )
+    }
+}
+
+fn ensure_space_span(
+    socket: &SocketRef,
+    user: Option<&SocketUserContext>,
+    space_type: SpaceType,
+    space_id: &str,
+) -> Option<Span> {
+    let registry = socket.extensions.get::<SocketSpanRegistry>()?;
+    if let Some(existing) = registry.space_span(space_type, space_id) {
+        return Some(existing);
+    }
+
+    let user_id = user.map(|u| u.user_id.as_str()).unwrap_or("anonymous");
+    let parent = registry.root_span();
+    let span = logfire::span!(
+        parent: &parent,
+        "socket space {space_id}",
+        socket_id = socket.id.to_string(),
         user_id = user_id,
-        space_type = space_type,
-        space_id = space_id,
-        doc_id = doc_id,
-        request_id = request_id
-    )
+        space_type = space_type.as_str(),
+        space_id = space_id
+    );
+    registry.insert_space_span(space_type, space_id, span.clone());
+    Some(span)
 }
 
 fn ensure_workspace_embedding_initialized(state: &AppState, workspace_id: &str) {
@@ -343,102 +387,106 @@ async fn handle_space_join(
         None,
         Some(request.request_id.as_str()),
     );
-    let _guard = span.enter();
 
-    let request_id_owned = request.request_id.clone();
-    let space_id_owned = payload.space_id.clone();
-    let space_type_label = payload.space_type.as_str().to_string();
-    let client_version = payload.client_version.clone();
+    async move {
+        let request_id_owned = request.request_id.clone();
+        let space_id_owned = payload.space_id.clone();
+        let space_type_label = payload.space_type.as_str().to_string();
+        let client_version = payload.client_version.clone();
 
-    info!(
-        request_id = %request_id_owned,
-        space_id = %space_id_owned,
-        space_type = %space_type_label,
-        "socket space:join received"
-    );
-
-    if payload.client_version.starts_with("0.1") {
-        ack_ok(
-            ack,
-            JoinSpaceResponse {
-                client_id: socket.id.to_string(),
-                success: false,
-            },
-        );
-        warn!(
+        info!(
             request_id = %request_id_owned,
-            client_version = %client_version,
-            "socket space:join blocked due to legacy client"
+            space_id = %space_id_owned,
+            space_type = %space_type_label,
+            "socket space:join received"
         );
-        return;
-    }
 
-    if let SpaceType::Workspace = payload.space_type {
-        let header_map = match user.header_map() {
-            Ok(map) => map,
-            Err(err) => {
+        if payload.client_version.starts_with("0.1") {
+            ack_ok(
+                ack,
+                JoinSpaceResponse {
+                    client_id: socket.id.to_string(),
+                    success: false,
+                },
+            );
+            warn!(
+                request_id = %request_id_owned,
+                client_version = %client_version,
+                "socket space:join blocked due to legacy client"
+            );
+            return;
+        }
+
+        if let SpaceType::Workspace = payload.space_type {
+            let header_map = match user.header_map() {
+                Ok(map) => map,
+                Err(err) => {
+                    warn!(
+                        request_id = %request_id_owned,
+                        error = %err,
+                        "socket space:join missing auth headers"
+                    );
+                    ack_error::<JoinSpaceResponse>(ack, err, Some(&request.request_id));
+                    return;
+                }
+            };
+
+            if let Err(err) = resolve_workspace_access(&state, &header_map, &payload.space_id).await
+            {
                 warn!(
                     request_id = %request_id_owned,
+                    space_id = %space_id_owned,
                     error = %err,
-                    "socket space:join missing auth headers"
+                    "socket space:join denied"
                 );
                 ack_error::<JoinSpaceResponse>(ack, err, Some(&request.request_id));
                 return;
             }
-        };
-
-        if let Err(err) = resolve_workspace_access(&state, &header_map, &payload.space_id).await {
+            ensure_workspace_embedding_initialized(&state, &payload.space_id);
+        } else if user.user_id != payload.space_id {
             warn!(
                 request_id = %request_id_owned,
-                space_id = %space_id_owned,
-                error = %err,
-                "socket space:join denied"
+                expected_user_id = %space_id_owned,
+                actual_user_id = %user.user_id,
+                "socket space:join denied for userspace mismatch"
             );
-            ack_error::<JoinSpaceResponse>(ack, err, Some(&request.request_id));
+            ack_error::<JoinSpaceResponse>(
+                ack,
+                AppError::space_access_denied(&payload.space_id),
+                Some(&request.request_id),
+            );
             return;
         }
-        ensure_workspace_embedding_initialized(&state, &payload.space_id);
-    } else if user.user_id != payload.space_id {
-        warn!(
-            request_id = %request_id_owned,
-            expected_user_id = %space_id_owned,
-            actual_user_id = %user.user_id,
-            "socket space:join denied for userspace mismatch"
-        );
-        ack_error::<JoinSpaceResponse>(
+
+        socket.join(space_room_name(
+            payload.space_type,
+            &payload.space_id,
+            RoomKind::Sync,
+        ));
+
+        socket.join(space_room_name(
+            payload.space_type,
+            &payload.space_id,
+            RoomKind::LegacySync,
+        ));
+
+        ack_ok(
             ack,
-            AppError::space_access_denied(&payload.space_id),
-            Some(&request.request_id),
+            JoinSpaceResponse {
+                client_id: socket.id.to_string(),
+                success: true,
+            },
         );
-        return;
+
+        info!(
+            request_id = %request_id_owned,
+            space_id = %space_id_owned,
+            space_type = %space_type_label,
+            "socket space:join success"
+        );
     }
-
-    socket.join(space_room_name(
-        payload.space_type,
-        &payload.space_id,
-        RoomKind::Sync,
-    ));
-
-    socket.join(space_room_name(
-        payload.space_type,
-        &payload.space_id,
-        RoomKind::LegacySync,
-    ));
-
-    ack_ok(
-        ack,
-        JoinSpaceResponse {
-            client_id: socket.id.to_string(),
-            success: true,
-        },
-    );
-
-    info!(
-        request_id = %request_id_owned,
-        space_id = %space_id_owned,
-        space_type = %space_type_label,
-        "socket space:join success"
-    );
+    .instrument(span)
+    .await;
 }
 
 #[derive(Debug, Deserialize)]
@@ -462,51 +510,58 @@ async fn handle_space_leave(
         None,
         None,
     );
-    let _guard = span.enter();
 
-    let space_id_owned = payload.space_id.clone();
-    let space_type_label = payload.space_type.as_str().to_string();
-    let socket_id = socket.id.to_string();
+    async move {
+        let space_id_owned = payload.space_id.clone();
+        let space_type_label = payload.space_type.as_str().to_string();
+        let socket_id = socket.id.to_string();
 
-    info!(
-        space_id = %space_id_owned,
-        space_type = %space_type_label,
-        "socket space:leave received"
-    );
+        info!(
+            space_id = %space_id_owned,
+            space_type = %space_type_label,
+            "socket space:leave received"
+        );
 
-    socket.leave(space_room_name(
-        payload.space_type,
-        &payload.space_id,
-        RoomKind::Sync,
-    ));
-    socket.leave(space_room_name(
-        payload.space_type,
-        &payload.space_id,
-        RoomKind::LegacySync,
-    ));
+        socket.leave(space_room_name(
+            payload.space_type,
+            &payload.space_id,
+            RoomKind::Sync,
+        ));
+        socket.leave(space_room_name(
+            payload.space_type,
+            &payload.space_id,
+            RoomKind::LegacySync,
+        ));
 
-    ack_ok(
-        ack,
-        JoinSpaceResponse {
-            client_id: socket.id.to_string(),
-            success: true,
-        },
-    );
+        ack_ok(
+            ack,
+            JoinSpaceResponse {
+                client_id: socket.id.to_string(),
+                success: true,
+            },
+        );
 
-    info!(
-        space_id = %space_id_owned,
-        space_type = %space_type_label,
-        "socket space:leave success"
-    );
+        info!(
+            space_id = %space_id_owned,
+            space_type = %space_type_label,
+            "socket space:leave success"
+        );
 
-    let stale_docs = state
-        .doc_sessions
-        .remove_by_space(&socket_id, payload.space_type, &payload.space_id)
-        .await;
+        let stale_docs = state
+            .doc_sessions
+            .remove_by_space(&socket_id, payload.space_type, &payload.space_id)
+            .await;
 
-    for key in stale_docs {
-        finalize_doc_session(&state, &key).await;
+        for key in stale_docs {
+            finalize_doc_session(&state, &key).await;
+        }
+
+        if let Some(registry) = socket.extensions.get::<SocketSpanRegistry>() {
+            registry.remove_space_span(payload.space_type, &payload.space_id);
+        }
     }
+    .instrument(span)
+    .await;
 }
 
 #[derive(Debug, Deserialize)]
@@ -544,211 +599,215 @@ async fn handle_space_load_doc(
         Some(payload.doc_id.as_str()),
         Some(request.request_id.as_str()),
     );
-    let _guard = span.enter();
 
-    let request_id_owned = request.request_id.clone();
-    let space_id_owned = payload.space_id.clone();
-    let doc_id_owned = payload.doc_id.clone();
-    let socket_id = socket.id.to_string();
+    async move {
+        let request_id_owned = request.request_id.clone();
+        let space_id_owned = payload.space_id.clone();
+        let doc_id_owned = payload.doc_id.clone();
+        let socket_id = socket.id.to_string();
 
-    info!(
-        request_id = %request_id_owned,
-        space_id = %space_id_owned,
-        doc_id = %doc_id_owned,
-        "socket space:load-doc received"
-    );
-
-    if let Err(err) = ensure_socket_joined_room(&socket, payload.space_type, &payload.space_id) {
-        warn!(
+        info!(
             request_id = %request_id_owned,
             space_id = %space_id_owned,
             doc_id = %doc_id_owned,
-            error = %err,
-            "socket space:load-doc denied (not in room)"
+            "socket space:load-doc received"
         );
-        ack_error::<LoadDocResponse>(ack, err, Some(&request.request_id));
-        return;
-    }
 
-    let (snapshot_bytes, timestamp) = match payload.space_type {
-        SpaceType::Workspace => {
-            if let Err(err) = resolve_doc_access_cached(
-                &state,
-                &doc_access_cache,
-                &user,
-                &payload.space_id,
-                &payload.doc_id,
-            )
-            .await
-            {
+        if let Err(err) = ensure_socket_joined_room(&socket, payload.space_type, &payload.space_id)
+        {
+            warn!(
+                request_id = %request_id_owned,
+                space_id = %space_id_owned,
+                doc_id = %doc_id_owned,
+                error = %err,
+                "socket space:load-doc denied (not in room)"
+            );
+            ack_error::<LoadDocResponse>(ack, err, Some(&request.request_id));
+            return;
+        }
+
+        let (snapshot_bytes, timestamp) = match payload.space_type {
+            SpaceType::Workspace => {
+                if let Err(err) = resolve_doc_access_cached(
+                    &state,
+                    &doc_access_cache,
+                    &user,
+                    &payload.space_id,
+                    &payload.doc_id,
+                )
+                .await
+                {
+                    warn!(
+                        request_id = %request_id_owned,
+                        space_id = %space_id_owned,
+                        doc_id = %doc_id_owned,
+                        error = %err,
+                        "socket space:load-doc failed doc access check"
+                    );
+                    ack_error::<LoadDocResponse>(ack, err, Some(&request.request_id));
+                    return;
+                }
+
+                match state
+                    .doc_cache
+                    .clone()
+                    .snapshot(SpaceType::Workspace, &payload.space_id, &payload.doc_id)
+                    .await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        ack_error::<LoadDocResponse>(
+                            ack,
+                            AppError::from_anyhow(err),
+                            Some(&request.request_id),
+                        );
+                        return;
+                    }
+                }
+            }
+            SpaceType::Userspace => {
+                if let Err(err) = ensure_userspace_owner(&user, &payload.space_id) {
+                    ack_error::<LoadDocResponse>(ack, err, Some(&request.request_id));
+                    return;
+                }
+
+                match state
+                    .doc_cache
+                    .clone()
+                    .snapshot(SpaceType::Userspace, &payload.space_id, &payload.doc_id)
+                    .await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        ack_error::<LoadDocResponse>(
+                            ack,
+                            AppError::from_anyhow(err),
+                            Some(&request.request_id),
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+
+        let doc = match YoctoDoc::try_from_binary_v1(&snapshot_bytes) {
+            Ok(doc) => doc,
+            Err(err) => {
                 warn!(
                     request_id = %request_id_owned,
                     space_id = %space_id_owned,
                     doc_id = %doc_id_owned,
                     error = %err,
-                    "socket space:load-doc failed doc access check"
-                );
-                ack_error::<LoadDocResponse>(ack, err, Some(&request.request_id));
-                return;
-            }
-
-            match state
-                .doc_cache
-                .clone()
-                .snapshot(SpaceType::Workspace, &payload.space_id, &payload.doc_id)
-                .await
-            {
-                Ok(snapshot) => snapshot,
-                Err(err) => {
-                    ack_error::<LoadDocResponse>(
-                        ack,
-                        AppError::from_anyhow(err),
-                        Some(&request.request_id),
-                    );
-                    return;
-                }
-            }
-        }
-        SpaceType::Userspace => {
-            if let Err(err) = ensure_userspace_owner(&user, &payload.space_id) {
-                ack_error::<LoadDocResponse>(ack, err, Some(&request.request_id));
-                return;
-            }
-
-            match state
-                .doc_cache
-                .clone()
-                .snapshot(SpaceType::Userspace, &payload.space_id, &payload.doc_id)
-                .await
-            {
-                Ok(snapshot) => snapshot,
-                Err(err) => {
-                    ack_error::<LoadDocResponse>(
-                        ack,
-                        AppError::from_anyhow(err),
-                        Some(&request.request_id),
-                    );
-                    return;
-                }
-            }
-        }
-    };
-
-    let doc = match YoctoDoc::try_from_binary_v1(&snapshot_bytes) {
-        Ok(doc) => doc,
-        Err(err) => {
-            warn!(
-                request_id = %request_id_owned,
-                space_id = %space_id_owned,
-                doc_id = %doc_id_owned,
-                error = %err,
-                "socket space:load-doc failed to decode snapshot"
-            );
-            ack_error::<LoadDocResponse>(
-                ack,
-                AppError::from_anyhow(err.into()),
-                Some(&request.request_id),
-            );
-            return;
-        }
-    };
-
-    let state_vector = match payload.state_vector {
-        Some(ref value) if !value.is_empty() => match BASE64.decode(value.as_bytes()) {
-            Ok(bytes) => match decode_state_vector(&bytes) {
-                Ok(vector) => vector,
-                Err(err) => {
-                    warn!(
-                        request_id = %request_id_owned,
-                        error = %err,
-                        "socket space:load-doc invalid state vector"
-                    );
-                    ack_error::<LoadDocResponse>(ack, err, Some(&request.request_id));
-                    return;
-                }
-            },
-            Err(_) => {
-                warn!(
-                    request_id = %request_id_owned,
-                    "socket space:load-doc failed to decode state vector base64"
+                    "socket space:load-doc failed to decode snapshot"
                 );
                 ack_error::<LoadDocResponse>(
                     ack,
-                    AppError::bad_request("invalid state vector"),
+                    AppError::from_anyhow(err.into()),
                     Some(&request.request_id),
                 );
                 return;
             }
-        },
-        _ => YoctoStateVector::default(),
-    };
+        };
 
-    let missing_bytes = match doc.encode_state_as_update_v1(&state_vector) {
-        Ok(data) => data,
-        Err(err) => {
-            warn!(
-                request_id = %request_id_owned,
-                error = %err,
-                "socket space:load-doc failed to compute diff"
-            );
-            ack_error::<LoadDocResponse>(
-                ack,
-                AppError::from_anyhow(err.into()),
-                Some(&request.request_id),
-            );
-            return;
-        }
-    };
+        let state_vector = match payload.state_vector {
+            Some(ref value) if !value.is_empty() => match BASE64.decode(value.as_bytes()) {
+                Ok(bytes) => match decode_state_vector(&bytes) {
+                    Ok(vector) => vector,
+                    Err(err) => {
+                        warn!(
+                            request_id = %request_id_owned,
+                            error = %err,
+                            "socket space:load-doc invalid state vector"
+                        );
+                        ack_error::<LoadDocResponse>(ack, err, Some(&request.request_id));
+                        return;
+                    }
+                },
+                Err(_) => {
+                    warn!(
+                        request_id = %request_id_owned,
+                        "socket space:load-doc failed to decode state vector base64"
+                    );
+                    ack_error::<LoadDocResponse>(
+                        ack,
+                        AppError::bad_request("invalid state vector"),
+                        Some(&request.request_id),
+                    );
+                    return;
+                }
+            },
+            _ => YoctoStateVector::default(),
+        };
 
-    let state_bytes = match encode_state_vector(&doc.get_state_vector()) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            warn!(
-                request_id = %request_id_owned,
-                error = %err,
-                "socket space:load-doc failed to encode state vector"
-            );
-            ack_error::<LoadDocResponse>(ack, err, Some(&request.request_id));
-            return;
-        }
-    };
+        let missing_bytes = match doc.encode_state_as_update_v1(&state_vector) {
+            Ok(data) => data,
+            Err(err) => {
+                warn!(
+                    request_id = %request_id_owned,
+                    error = %err,
+                    "socket space:load-doc failed to compute diff"
+                );
+                ack_error::<LoadDocResponse>(
+                    ack,
+                    AppError::from_anyhow(err.into()),
+                    Some(&request.request_id),
+                );
+                return;
+            }
+        };
 
-    let session_key = DocSessionKey::new(
-        payload.space_type,
-        space_id_owned.clone(),
-        doc_id_owned.clone(),
-    );
-    let first_session = state.doc_sessions.register(&socket_id, session_key).await;
-    if first_session {
-        if let Err(err) = state
-            .doc_cache
-            .open_session(payload.space_type, &space_id_owned, &doc_id_owned)
-            .await
-        {
-            warn!(
-                space_type = ?payload.space_type,
-                space_id = %space_id_owned,
-                doc_id = %doc_id_owned,
-                error = %err,
-                "failed to open doc cache session"
-            );
+        let state_bytes = match encode_state_vector(&doc.get_state_vector()) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!(
+                    request_id = %request_id_owned,
+                    error = %err,
+                    "socket space:load-doc failed to encode state vector"
+                );
+                ack_error::<LoadDocResponse>(ack, err, Some(&request.request_id));
+                return;
+            }
+        };
+
+        let session_key = DocSessionKey::new(
+            payload.space_type,
+            space_id_owned.clone(),
+            doc_id_owned.clone(),
+        );
+        let first_session = state.doc_sessions.register(&socket_id, session_key).await;
+        if first_session {
+            if let Err(err) = state
+                .doc_cache
+                .open_session(payload.space_type, &space_id_owned, &doc_id_owned)
+                .await
+            {
+                warn!(
+                    space_type = ?payload.space_type,
+                    space_id = %space_id_owned,
+                    doc_id = %doc_id_owned,
+                    error = %err,
+                    "failed to open doc cache session"
+                );
+            }
         }
+
+        ack_ok(
+            ack,
+            LoadDocResponse {
+                missing: BASE64.encode(missing_bytes),
+                state: BASE64.encode(state_bytes),
+                timestamp,
+            },
+        );
+        info!(
+            request_id = %request_id_owned,
+            space_id = %space_id_owned,
+            doc_id = %doc_id_owned,
+            "socket space:load-doc success"
+        );
     }
-
-    ack_ok(
-        ack,
-        LoadDocResponse {
-            missing: BASE64.encode(missing_bytes),
-            state: BASE64.encode(state_bytes),
-            timestamp,
-        },
-    );
-    info!(
-        request_id = %request_id_owned,
-        space_id = %space_id_owned,
-        doc_id = %doc_id_owned,
-        "socket space:load-doc success"
-    );
+    .instrument(span)
+    .await;
 }
 
 #[derive(Debug, Deserialize)]
@@ -807,151 +866,155 @@ async fn handle_space_push_doc_update(
         Some(payload.doc_id.as_str()),
         Some(request.request_id.as_str()),
     );
-    let _guard = span.enter();
 
-    debug!(
-        request_id = request.request_id.as_str(),
-        space_id = payload.space_id.as_str(),
-        doc_id = payload.doc_id.as_str(),
-        "socket push-doc-update received"
-    );
-
-    if let Err(err) = ensure_socket_joined_room(&socket, payload.space_type, &payload.space_id) {
-        warn!(
+    async move {
+        debug!(
             request_id = request.request_id.as_str(),
-            error = %err,
-            "socket push-doc-update denied (not in room)"
+            space_id = payload.space_id.as_str(),
+            doc_id = payload.doc_id.as_str(),
+            "socket push-doc-update received"
         );
-        ack_error::<PushDocUpdateResponse>(ack, err, Some(&request.request_id));
-        return;
-    }
 
-    let update_bytes = match BASE64.decode(payload.update.as_bytes()) {
-        Ok(bytes) => bytes,
-        Err(_) => {
+        if let Err(err) = ensure_socket_joined_room(&socket, payload.space_type, &payload.space_id)
+        {
             warn!(
                 request_id = request.request_id.as_str(),
-                "socket push-doc-update invalid update payload"
+                error = %err,
+                "socket push-doc-update denied (not in room)"
             );
-            ack_error::<PushDocUpdateResponse>(
-                ack,
-                AppError::bad_request("invalid update payload"),
-                Some(&request.request_id),
-            );
+            ack_error::<PushDocUpdateResponse>(ack, err, Some(&request.request_id));
             return;
         }
-    };
 
-    match payload.space_type {
-        SpaceType::Workspace => {
-            let mut access = match resolve_doc_access_cached(
-                &state,
-                &doc_access_cache,
-                &user,
-                &payload.space_id,
-                &payload.doc_id,
-            )
-            .await
-            {
-                Ok(access) => access,
-                Err(err) => {
-                    ack_error::<PushDocUpdateResponse>(ack, err, Some(&request.request_id));
-                    return;
-                }
-            };
-
-            if access.metadata.blocked {
+        let update_bytes = match BASE64.decode(payload.update.as_bytes()) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                warn!(
+                    request_id = request.request_id.as_str(),
+                    "socket push-doc-update invalid update payload"
+                );
                 ack_error::<PushDocUpdateResponse>(
                     ack,
-                    AppError::doc_update_blocked(&payload.space_id, &payload.doc_id),
+                    AppError::bad_request("invalid update payload"),
                     Some(&request.request_id),
                 );
                 return;
             }
+        };
 
-            if let Err(err) = ensure_doc_update_permission(&access) {
-                ack_error::<PushDocUpdateResponse>(ack, err, Some(&request.request_id));
-                return;
-            }
+        match payload.space_type {
+            SpaceType::Workspace => {
+                let mut access = match resolve_doc_access_cached(
+                    &state,
+                    &doc_access_cache,
+                    &user,
+                    &payload.space_id,
+                    &payload.doc_id,
+                )
+                .await
+                {
+                    Ok(access) => access,
+                    Err(err) => {
+                        ack_error::<PushDocUpdateResponse>(ack, err, Some(&request.request_id));
+                        return;
+                    }
+                };
 
-            let cache_result = match apply_doc_updates(
-                &state,
-                SpaceType::Workspace,
-                &payload.space_id,
-                &payload.doc_id,
-                vec![update_bytes.clone()],
-                UpdateBroadcastContext {
-                    editor_id: Some(user.user_id.as_str()),
-                    editor_user: Some(&user.user),
-                },
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(err) => {
+                if access.metadata.blocked {
+                    ack_error::<PushDocUpdateResponse>(
+                        ack,
+                        AppError::doc_update_blocked(&payload.space_id, &payload.doc_id),
+                        Some(&request.request_id),
+                    );
+                    return;
+                }
+
+                if let Err(err) = ensure_doc_update_permission(&access) {
                     ack_error::<PushDocUpdateResponse>(ack, err, Some(&request.request_id));
                     return;
                 }
-            };
 
-            access.metadata.updated_at = cache_result.timestamp;
-            doc_access_cache
-                .insert(&payload.space_id, &payload.doc_id, access)
+                let cache_result = match apply_doc_updates(
+                    &state,
+                    SpaceType::Workspace,
+                    &payload.space_id,
+                    &payload.doc_id,
+                    vec![update_bytes.clone()],
+                    UpdateBroadcastContext {
+                        editor_id: Some(user.user_id.as_str()),
+                        editor_user: Some(&user.user),
+                    },
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(err) => {
+                        ack_error::<PushDocUpdateResponse>(ack, err, Some(&request.request_id));
+                        return;
+                    }
+                };
+
+                access.metadata.updated_at = cache_result.timestamp;
+                doc_access_cache
+                    .insert(&payload.space_id, &payload.doc_id, access)
+                    .await;
+
+                let timestamp = Some(cache_result.timestamp);
+                emit_doc_update_events(
+                    &socket,
+                    payload.space_type,
+                    &payload.space_id,
+                    &payload.doc_id,
+                    &update_bytes,
+                    timestamp,
+                    &user,
+                )
                 .await;
-
-            let timestamp = Some(cache_result.timestamp);
-            emit_doc_update_events(
-                &socket,
-                payload.space_type,
-                &payload.space_id,
-                &payload.doc_id,
-                &update_bytes,
-                timestamp,
-                &user,
-            )
-            .await;
-            ack_doc_update(ack, timestamp);
-        }
-        SpaceType::Userspace => {
-            if let Err(err) = ensure_userspace_owner(&user, &payload.space_id) {
-                ack_error::<PushDocUpdateResponse>(ack, err, Some(&request.request_id));
-                return;
+                ack_doc_update(ack, timestamp);
             }
-
-            let cache_result = match apply_doc_updates(
-                &state,
-                SpaceType::Userspace,
-                &payload.space_id,
-                &payload.doc_id,
-                vec![update_bytes.clone()],
-                UpdateBroadcastContext {
-                    editor_id: Some(user.user_id.as_str()),
-                    editor_user: Some(&user.user),
-                },
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(err) => {
+            SpaceType::Userspace => {
+                if let Err(err) = ensure_userspace_owner(&user, &payload.space_id) {
                     ack_error::<PushDocUpdateResponse>(ack, err, Some(&request.request_id));
                     return;
                 }
-            };
 
-            let timestamp = Some(cache_result.timestamp);
-            emit_doc_update_events(
-                &socket,
-                payload.space_type,
-                &payload.space_id,
-                &payload.doc_id,
-                &update_bytes,
-                timestamp,
-                &user,
-            )
-            .await;
-            ack_doc_update(ack, timestamp);
+                let cache_result = match apply_doc_updates(
+                    &state,
+                    SpaceType::Userspace,
+                    &payload.space_id,
+                    &payload.doc_id,
+                    vec![update_bytes.clone()],
+                    UpdateBroadcastContext {
+                        editor_id: Some(user.user_id.as_str()),
+                        editor_user: Some(&user.user),
+                    },
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(err) => {
+                        ack_error::<PushDocUpdateResponse>(ack, err, Some(&request.request_id));
+                        return;
+                    }
+                };
+
+                let timestamp = Some(cache_result.timestamp);
+                emit_doc_update_events(
+                    &socket,
+                    payload.space_type,
+                    &payload.space_id,
+                    &payload.doc_id,
+                    &update_bytes,
+                    timestamp,
+                    &user,
+                )
+                .await;
+                ack_doc_update(ack, timestamp);
+            }
         }
     }
+    .instrument(span)
+    .await;
 }
 
 async fn handle_space_push_doc_updates(
@@ -963,6 +1026,15 @@ async fn handle_space_push_doc_updates(
     Extension(doc_access_cache): Extension<SocketDocAccessCache>,
     State(state): State<AppState>,
 ) {
+    let span = start_socket_span(
+        "space:push-doc-updates",
+        &socket,
+        Some(&user),
+        Some((payload.space_type, payload.space_id.as_str())),
+        Some(payload.doc_id.as_str()),
+        Some(request.request_id.as_str()),
+    );
+
     let PushDocUpdatesRequest {
         space_type,
         space_id,
@@ -970,253 +1042,257 @@ async fn handle_space_push_doc_updates(
         updates,
     } = payload;
 
-    if updates.is_empty() {
-        ack_error::<PushDocUpdateResponse>(
-            ack,
-            AppError::bad_request("updates payload must not be empty"),
-            Some(&request.request_id),
-        );
-        return;
-    }
+    async move {
+        if updates.is_empty() {
+            ack_error::<PushDocUpdateResponse>(
+                ack,
+                AppError::bad_request("updates payload must not be empty"),
+                Some(&request.request_id),
+            );
+            return;
+        }
 
-    if let Err(err) = ensure_socket_joined_room(&socket, space_type, &space_id) {
-        ack_error::<PushDocUpdateResponse>(ack, err, Some(&request.request_id));
-        return;
-    }
+        if let Err(err) = ensure_socket_joined_room(&socket, space_type, &space_id) {
+            ack_error::<PushDocUpdateResponse>(ack, err, Some(&request.request_id));
+            return;
+        }
 
-    let mut update_bytes = Vec::with_capacity(updates.len());
-    for encoded in &updates {
-        match BASE64.decode(encoded.as_bytes()) {
-            Ok(bytes) => update_bytes.push(bytes),
-            Err(_) => {
-                ack_error::<PushDocUpdateResponse>(
-                    ack,
-                    AppError::bad_request("invalid update payload"),
-                    Some(&request.request_id),
-                );
-                return;
+        let mut update_bytes = Vec::with_capacity(updates.len());
+        for encoded in &updates {
+            match BASE64.decode(encoded.as_bytes()) {
+                Ok(bytes) => update_bytes.push(bytes),
+                Err(_) => {
+                    ack_error::<PushDocUpdateResponse>(
+                        ack,
+                        AppError::bad_request("invalid update payload"),
+                        Some(&request.request_id),
+                    );
+                    return;
+                }
             }
         }
-    }
 
-    match space_type {
-        SpaceType::Workspace => {
-            let mut access = match resolve_doc_access_cached(
-                &state,
-                &doc_access_cache,
-                &user,
-                &space_id,
-                &doc_id,
-            )
-            .await
-            {
-                Ok(access) => access,
-                Err(err) => {
+        match space_type {
+            SpaceType::Workspace => {
+                let mut access = match resolve_doc_access_cached(
+                    &state,
+                    &doc_access_cache,
+                    &user,
+                    &space_id,
+                    &doc_id,
+                )
+                .await
+                {
+                    Ok(access) => access,
+                    Err(err) => {
+                        ack_error::<PushDocUpdateResponse>(ack, err, Some(&request.request_id));
+                        return;
+                    }
+                };
+
+                if access.metadata.blocked {
+                    ack_error::<PushDocUpdateResponse>(
+                        ack,
+                        AppError::doc_update_blocked(&space_id, &doc_id),
+                        Some(&request.request_id),
+                    );
+                    return;
+                }
+
+                if let Err(err) = ensure_doc_update_permission(&access) {
                     ack_error::<PushDocUpdateResponse>(ack, err, Some(&request.request_id));
                     return;
                 }
-            };
 
-            if access.metadata.blocked {
-                ack_error::<PushDocUpdateResponse>(
-                    ack,
-                    AppError::doc_update_blocked(&space_id, &doc_id),
-                    Some(&request.request_id),
+                let cache_result = match state
+                    .doc_cache
+                    .clone()
+                    .apply_updates(
+                        SpaceType::Workspace,
+                        &space_id,
+                        &doc_id,
+                        update_bytes.clone(),
+                        Some(user.user_id.as_str()),
+                    )
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(err) => {
+                        ack_error::<PushDocUpdateResponse>(
+                            ack,
+                            AppError::from_anyhow(err),
+                            Some(&request.request_id),
+                        );
+                        return;
+                    }
+                };
+
+                access.metadata.updated_at = cache_result.timestamp;
+                doc_access_cache.insert(&space_id, &doc_id, access).await;
+
+                let timestamp = Some(cache_result.timestamp);
+                let channel_key = doc_channel_key(&space_id, &doc_id);
+                state.sync_hub.publish_updates(
+                    &channel_key,
+                    &update_bytes,
+                    Some(SocketBroadcastMeta::new(
+                        space_type,
+                        space_id.clone(),
+                        doc_id.clone(),
+                        Some(user.user_id.clone()),
+                        Some(user.user.clone()),
+                        timestamp,
+                    )),
                 );
-                return;
-            }
+                state
+                    .sync_hub
+                    .publish_snapshot(&channel_key, cache_result.snapshot.clone());
 
-            if let Err(err) = ensure_doc_update_permission(&access) {
-                ack_error::<PushDocUpdateResponse>(ack, err, Some(&request.request_id));
-                return;
-            }
+                let sync_room = space_room_name(space_type, &space_id, RoomKind::Sync);
+                for encoded in &updates {
+                    let mut payload_json = json!({
+                        "spaceType": space_type,
+                        "spaceId": space_id,
+                        "docId": doc_id,
+                        "update": encoded,
+                        "timestamp": timestamp,
+                    });
+                    attach_editor_metadata(&mut payload_json, &user);
 
-            let cache_result = match state
-                .doc_cache
-                .clone()
-                .apply_updates(
-                    SpaceType::Workspace,
-                    &space_id,
-                    &doc_id,
-                    update_bytes.clone(),
-                    Some(user.user_id.as_str()),
-                )
-                .await
-            {
-                Ok(result) => result,
-                Err(err) => {
-                    ack_error::<PushDocUpdateResponse>(
-                        ack,
-                        AppError::from_anyhow(err),
-                        Some(&request.request_id),
-                    );
-                    return;
+                    if let Err(err) = socket
+                        .broadcast()
+                        .to(sync_room.clone())
+                        .emit("space:broadcast-doc-update", &payload_json)
+                        .await
+                    {
+                        warn!(?err, "failed to emit broadcast update");
+                    }
                 }
-            };
 
-            access.metadata.updated_at = cache_result.timestamp;
-            doc_access_cache.insert(&space_id, &doc_id, access).await;
-
-            let timestamp = Some(cache_result.timestamp);
-            let channel_key = doc_channel_key(&space_id, &doc_id);
-            state.sync_hub.publish_updates(
-                &channel_key,
-                &update_bytes,
-                Some(SocketBroadcastMeta::new(
-                    space_type,
-                    space_id.clone(),
-                    doc_id.clone(),
-                    Some(user.user_id.clone()),
-                    Some(user.user.clone()),
-                    timestamp,
-                )),
-            );
-            state
-                .sync_hub
-                .publish_snapshot(&channel_key, cache_result.snapshot.clone());
-
-            let sync_room = space_room_name(space_type, &space_id, RoomKind::Sync);
-            for encoded in &updates {
-                let mut payload_json = json!({
+                let mut legacy_payload = json!({
                     "spaceType": space_type,
                     "spaceId": space_id,
                     "docId": doc_id,
-                    "update": encoded,
+                    "updates": updates,
                     "timestamp": timestamp,
                 });
-                attach_editor_metadata(&mut payload_json, &user);
+                attach_editor_metadata(&mut legacy_payload, &user);
 
                 if let Err(err) = socket
                     .broadcast()
-                    .to(sync_room.clone())
-                    .emit("space:broadcast-doc-update", &payload_json)
+                    .to(space_room_name(space_type, &space_id, RoomKind::LegacySync))
+                    .emit("space:broadcast-doc-updates", &legacy_payload)
                     .await
                 {
-                    warn!(?err, "failed to emit broadcast update");
+                    info!(?err, "failed to emit legacy doc update");
                 }
+
+                ack_ok(
+                    ack,
+                    PushDocUpdateResponse {
+                        accepted: true,
+                        timestamp,
+                    },
+                );
             }
-
-            let mut legacy_payload = json!({
-                "spaceType": space_type,
-                "spaceId": space_id,
-                "docId": doc_id,
-                "updates": updates,
-                "timestamp": timestamp,
-            });
-            attach_editor_metadata(&mut legacy_payload, &user);
-
-            if let Err(err) = socket
-                .broadcast()
-                .to(space_room_name(space_type, &space_id, RoomKind::LegacySync))
-                .emit("space:broadcast-doc-updates", &legacy_payload)
-                .await
-            {
-                info!(?err, "failed to emit legacy doc update");
-            }
-
-            ack_ok(
-                ack,
-                PushDocUpdateResponse {
-                    accepted: true,
-                    timestamp,
-                },
-            );
-        }
-        SpaceType::Userspace => {
-            if let Err(err) = ensure_userspace_owner(&user, &space_id) {
-                ack_error::<PushDocUpdateResponse>(ack, err, Some(&request.request_id));
-                return;
-            }
-
-            let cache_result = match state
-                .doc_cache
-                .clone()
-                .apply_updates(
-                    SpaceType::Userspace,
-                    &space_id,
-                    &doc_id,
-                    update_bytes.clone(),
-                    Some(user.user_id.as_str()),
-                )
-                .await
-            {
-                Ok(result) => result,
-                Err(err) => {
-                    ack_error::<PushDocUpdateResponse>(
-                        ack,
-                        AppError::from_anyhow(err),
-                        Some(&request.request_id),
-                    );
+            SpaceType::Userspace => {
+                if let Err(err) = ensure_userspace_owner(&user, &space_id) {
+                    ack_error::<PushDocUpdateResponse>(ack, err, Some(&request.request_id));
                     return;
                 }
-            };
 
-            let timestamp = Some(cache_result.timestamp);
-            let channel_key = doc_channel_key(&space_id, &doc_id);
-            state.sync_hub.publish_updates(
-                &channel_key,
-                &update_bytes,
-                Some(SocketBroadcastMeta::new(
-                    space_type,
-                    space_id.clone(),
-                    doc_id.clone(),
-                    Some(user.user_id.clone()),
-                    Some(user.user.clone()),
-                    timestamp,
-                )),
-            );
-            state
-                .sync_hub
-                .publish_snapshot(&channel_key, cache_result.snapshot.clone());
+                let cache_result = match state
+                    .doc_cache
+                    .clone()
+                    .apply_updates(
+                        SpaceType::Userspace,
+                        &space_id,
+                        &doc_id,
+                        update_bytes.clone(),
+                        Some(user.user_id.as_str()),
+                    )
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(err) => {
+                        ack_error::<PushDocUpdateResponse>(
+                            ack,
+                            AppError::from_anyhow(err),
+                            Some(&request.request_id),
+                        );
+                        return;
+                    }
+                };
 
-            let sync_room = space_room_name(space_type, &space_id, RoomKind::Sync);
-            for encoded in &updates {
-                let mut payload_json = json!({
+                let timestamp = Some(cache_result.timestamp);
+                let channel_key = doc_channel_key(&space_id, &doc_id);
+                state.sync_hub.publish_updates(
+                    &channel_key,
+                    &update_bytes,
+                    Some(SocketBroadcastMeta::new(
+                        space_type,
+                        space_id.clone(),
+                        doc_id.clone(),
+                        Some(user.user_id.clone()),
+                        Some(user.user.clone()),
+                        timestamp,
+                    )),
+                );
+                state
+                    .sync_hub
+                    .publish_snapshot(&channel_key, cache_result.snapshot.clone());
+
+                let sync_room = space_room_name(space_type, &space_id, RoomKind::Sync);
+                for encoded in &updates {
+                    let mut payload_json = json!({
+                        "spaceType": space_type,
+                        "spaceId": space_id,
+                        "docId": doc_id,
+                        "update": encoded,
+                        "timestamp": timestamp,
+                    });
+                    attach_editor_metadata(&mut payload_json, &user);
+
+                    if let Err(err) = socket
+                        .broadcast()
+                        .to(sync_room.clone())
+                        .emit("space:broadcast-doc-update", &payload_json)
+                        .await
+                    {
+                        warn!(?err, "failed to emit broadcast update");
+                    }
+                }
+
+                let mut legacy_payload = json!({
                     "spaceType": space_type,
                     "spaceId": space_id,
                     "docId": doc_id,
-                    "update": encoded,
+                    "updates": updates,
                     "timestamp": timestamp,
                 });
-                attach_editor_metadata(&mut payload_json, &user);
+                attach_editor_metadata(&mut legacy_payload, &user);
 
                 if let Err(err) = socket
                     .broadcast()
-                    .to(sync_room.clone())
-                    .emit("space:broadcast-doc-update", &payload_json)
+                    .to(space_room_name(space_type, &space_id, RoomKind::LegacySync))
+                    .emit("space:broadcast-doc-updates", &legacy_payload)
                     .await
                 {
-                    warn!(?err, "failed to emit broadcast update");
+                    info!(?err, "failed to emit legacy doc update");
                 }
+
+                ack_ok(
+                    ack,
+                    PushDocUpdateResponse {
+                        accepted: true,
+                        timestamp,
+                    },
+                );
             }
-
-            let mut legacy_payload = json!({
-                "spaceType": space_type,
-                "spaceId": space_id,
-                "docId": doc_id,
-                "updates": updates,
-                "timestamp": timestamp,
-            });
-            attach_editor_metadata(&mut legacy_payload, &user);
-
-            if let Err(err) = socket
-                .broadcast()
-                .to(space_room_name(space_type, &space_id, RoomKind::LegacySync))
-                .emit("space:broadcast-doc-updates", &legacy_payload)
-                .await
-            {
-                info!(?err, "failed to emit legacy doc update");
-            }
-
-            ack_ok(
-                ack,
-                PushDocUpdateResponse {
-                    accepted: true,
-                    timestamp,
-                },
-            );
         }
     }
+    .instrument(span)
+    .await;
 }
 
 async fn emit_doc_update_events(
@@ -1286,121 +1362,135 @@ async fn handle_space_delete_doc(
     Extension(doc_access_cache): Extension<SocketDocAccessCache>,
     State(state): State<AppState>,
 ) {
-    if let Err(err) = ensure_socket_joined_room(&socket, payload.space_type, &payload.space_id) {
-        ack_error::<DeleteDocResponse>(ack, err, Some(&request.request_id));
-        return;
-    }
+    let span = start_socket_span(
+        "space:delete-doc",
+        &socket,
+        Some(&user),
+        Some((payload.space_type, payload.space_id.as_str())),
+        Some(payload.doc_id.as_str()),
+        Some(request.request_id.as_str()),
+    );
 
-    match payload.space_type {
-        SpaceType::Workspace => {
-            let access = match resolve_doc_access_cached(
-                &state,
-                &doc_access_cache,
-                &user,
-                &payload.space_id,
-                &payload.doc_id,
-            )
-            .await
-            {
-                Ok(access) => access,
-                Err(err) => {
+    async move {
+        if let Err(err) = ensure_socket_joined_room(&socket, payload.space_type, &payload.space_id)
+        {
+            ack_error::<DeleteDocResponse>(ack, err, Some(&request.request_id));
+            return;
+        }
+
+        match payload.space_type {
+            SpaceType::Workspace => {
+                let access = match resolve_doc_access_cached(
+                    &state,
+                    &doc_access_cache,
+                    &user,
+                    &payload.space_id,
+                    &payload.doc_id,
+                )
+                .await
+                {
+                    Ok(access) => access,
+                    Err(err) => {
+                        ack_error::<DeleteDocResponse>(ack, err, Some(&request.request_id));
+                        return;
+                    }
+                };
+
+                if access.metadata.blocked {
+                    ack_error::<DeleteDocResponse>(
+                        ack,
+                        AppError::doc_update_blocked(&payload.space_id, &payload.doc_id),
+                        Some(&request.request_id),
+                    );
+                    return;
+                }
+
+                if let Err(err) = ensure_doc_delete_permission(&access) {
                     ack_error::<DeleteDocResponse>(ack, err, Some(&request.request_id));
                     return;
                 }
-            };
 
-            if access.metadata.blocked {
-                ack_error::<DeleteDocResponse>(
-                    ack,
-                    AppError::doc_update_blocked(&payload.space_id, &payload.doc_id),
-                    Some(&request.request_id),
-                );
-                return;
-            }
-
-            if let Err(err) = ensure_doc_delete_permission(&access) {
-                ack_error::<DeleteDocResponse>(ack, err, Some(&request.request_id));
-                return;
-            }
-
-            match state
-                .document_store
-                .delete_doc(&payload.space_id, &payload.doc_id)
-                .await
-            {
-                Ok(true) => {
-                    doc_access_cache
-                        .remove(&payload.space_id, &payload.doc_id)
-                        .await;
-                    state
-                        .doc_cache
-                        .clone()
-                        .invalidate(SpaceType::Workspace, &payload.space_id, &payload.doc_id)
-                        .await;
-                    state
-                        .doc_sessions
-                        .remove_doc(SpaceType::Workspace, &payload.space_id, &payload.doc_id)
-                        .await;
-                    state
-                        .sync_hub
-                        .remove_channel(&doc_channel_key(&payload.space_id, &payload.doc_id));
-                    ack_ok(ack, DeleteDocResponse { success: true });
+                match state
+                    .document_store
+                    .delete_doc(&payload.space_id, &payload.doc_id)
+                    .await
+                {
+                    Ok(true) => {
+                        doc_access_cache
+                            .remove(&payload.space_id, &payload.doc_id)
+                            .await;
+                        state
+                            .doc_cache
+                            .clone()
+                            .invalidate(SpaceType::Workspace, &payload.space_id, &payload.doc_id)
+                            .await;
+                        state
+                            .doc_sessions
+                            .remove_doc(SpaceType::Workspace, &payload.space_id, &payload.doc_id)
+                            .await;
+                        state
+                            .sync_hub
+                            .remove_channel(&doc_channel_key(&payload.space_id, &payload.doc_id));
+                        ack_ok(ack, DeleteDocResponse { success: true });
+                    }
+                    Ok(false) => {
+                        ack_error::<DeleteDocResponse>(
+                            ack,
+                            AppError::doc_not_found(&payload.space_id, &payload.doc_id),
+                            Some(&request.request_id),
+                        );
+                    }
+                    Err(err) => {
+                        ack_error::<DeleteDocResponse>(
+                            ack,
+                            AppError::from_anyhow(err),
+                            Some(&request.request_id),
+                        );
+                    }
                 }
-                Ok(false) => {
-                    ack_error::<DeleteDocResponse>(
+            }
+            SpaceType::Userspace => {
+                if let Err(err) = ensure_userspace_owner(&user, &payload.space_id) {
+                    ack_error::<DeleteDocResponse>(ack, err, Some(&request.request_id));
+                    return;
+                }
+
+                match state
+                    .user_doc_store
+                    .delete_doc(&payload.space_id, &payload.doc_id)
+                    .await
+                {
+                    Ok(true) => {
+                        state
+                            .doc_cache
+                            .clone()
+                            .invalidate(SpaceType::Userspace, &payload.space_id, &payload.doc_id)
+                            .await;
+                        state
+                            .doc_sessions
+                            .remove_doc(SpaceType::Userspace, &payload.space_id, &payload.doc_id)
+                            .await;
+                        state
+                            .sync_hub
+                            .remove_channel(&doc_channel_key(&payload.space_id, &payload.doc_id));
+                        ack_ok(ack, DeleteDocResponse { success: true });
+                    }
+                    Ok(false) => ack_error::<DeleteDocResponse>(
                         ack,
                         AppError::doc_not_found(&payload.space_id, &payload.doc_id),
                         Some(&request.request_id),
-                    );
-                }
-                Err(err) => {
-                    ack_error::<DeleteDocResponse>(
+                    ),
+                    Err(err) => ack_error::<DeleteDocResponse>(
                         ack,
                         AppError::from_anyhow(err),
                         Some(&request.request_id),
-                    );
+                    ),
                 }
-            }
-        }
-        SpaceType::Userspace => {
-            if let Err(err) = ensure_userspace_owner(&user, &payload.space_id) {
-                ack_error::<DeleteDocResponse>(ack, err, Some(&request.request_id));
-                return;
-            }
-
-            match state
-                .user_doc_store
-                .delete_doc(&payload.space_id, &payload.doc_id)
-                .await
-            {
-                Ok(true) => {
-                    state
-                        .doc_cache
-                        .clone()
-                        .invalidate(SpaceType::Userspace, &payload.space_id, &payload.doc_id)
-                        .await;
-                    state
-                        .doc_sessions
-                        .remove_doc(SpaceType::Userspace, &payload.space_id, &payload.doc_id)
-                        .await;
-                    state
-                        .sync_hub
-                        .remove_channel(&doc_channel_key(&payload.space_id, &payload.doc_id));
-                    ack_ok(ack, DeleteDocResponse { success: true });
-                }
-                Ok(false) => ack_error::<DeleteDocResponse>(
-                    ack,
-                    AppError::doc_not_found(&payload.space_id, &payload.doc_id),
-                    Some(&request.request_id),
-                ),
-                Err(err) => ack_error::<DeleteDocResponse>(
-                    ack,
-                    AppError::from_anyhow(err),
-                    Some(&request.request_id),
-                ),
             }
         }
     }
+    .instrument(span)
+    .await;
 }
 
 #[derive(Debug, Deserialize)]
@@ -1420,54 +1510,68 @@ async fn handle_space_load_doc_timestamps(
     Extension(request): Extension<SocketRequestContext>,
     State(state): State<AppState>,
 ) {
-    if let Err(err) = ensure_socket_joined_room(&socket, payload.space_type, &payload.space_id) {
-        ack_error::<HashMap<String, i64>>(ack, err, Some(&request.request_id));
-        return;
-    }
+    let span = start_socket_span(
+        "space:load-doc-timestamps",
+        &socket,
+        Some(&user),
+        Some((payload.space_type, payload.space_id.as_str())),
+        None,
+        Some(request.request_id.as_str()),
+    );
 
-    let timestamps_result: Result<HashMap<String, i64>, AppError> = match payload.space_type {
-        SpaceType::Workspace => {
-            async {
-                let header_map = user.header_map()?;
-                resolve_workspace_access(&state, &header_map, &payload.space_id).await?;
-                state
-                    .document_store
-                    .list_doc_timestamps(&payload.space_id, payload.timestamp)
-                    .await
-                    .map_err(AppError::from_anyhow)
-            }
-            .await
-        }
-        SpaceType::Userspace => {
-            async {
-                ensure_userspace_owner(&user, &payload.space_id)?;
-                state
-                    .user_doc_store
-                    .timestamps_since(&payload.space_id, payload.timestamp)
-                    .await
-                    .map_err(AppError::from_anyhow)
-            }
-            .await
-        }
-    };
-
-    let timestamps = match timestamps_result {
-        Ok(map) => map,
-        Err(err) => {
+    async move {
+        if let Err(err) = ensure_socket_joined_room(&socket, payload.space_type, &payload.space_id)
+        {
             ack_error::<HashMap<String, i64>>(ack, err, Some(&request.request_id));
             return;
         }
-    };
 
-    debug!(
-        space_type = ?payload.space_type,
-        space_id = %payload.space_id,
-        after = payload.timestamp,
-        count = timestamps.len(),
-        "socket load-doc-timestamps response"
-    );
+        let timestamps_result: Result<HashMap<String, i64>, AppError> = match payload.space_type {
+            SpaceType::Workspace => {
+                async {
+                    let header_map = user.header_map()?;
+                    resolve_workspace_access(&state, &header_map, &payload.space_id).await?;
+                    state
+                        .document_store
+                        .list_doc_timestamps(&payload.space_id, payload.timestamp)
+                        .await
+                        .map_err(AppError::from_anyhow)
+                }
+                .await
+            }
+            SpaceType::Userspace => {
+                async {
+                    ensure_userspace_owner(&user, &payload.space_id)?;
+                    state
+                        .user_doc_store
+                        .timestamps_since(&payload.space_id, payload.timestamp)
+                        .await
+                        .map_err(AppError::from_anyhow)
+                }
+                .await
+            }
+        };
 
-    ack_ok(ack, timestamps);
+        let timestamps = match timestamps_result {
+            Ok(map) => map,
+            Err(err) => {
+                ack_error::<HashMap<String, i64>>(ack, err, Some(&request.request_id));
+                return;
+            }
+        };
+
+        debug!(
+            space_type = ?payload.space_type,
+            space_id = %payload.space_id,
+            after = payload.timestamp,
+            count = timestamps.len(),
+            "socket load-doc-timestamps response"
+        );
+
+        ack_ok(ack, timestamps);
+    }
+    .instrument(span)
+    .await;
 }
 
 #[derive(Debug, Deserialize)]
@@ -1493,52 +1597,65 @@ async fn handle_space_join_awareness(
     Extension(request): Extension<SocketRequestContext>,
     State(state): State<AppState>,
 ) {
-    if let Err(err) =
-        ensure_socket_space_access(&state, &user, payload.space_type, &payload.space_id).await
-    {
-        ack_error::<AwarenessResponse>(ack, err, Some(&request.request_id));
-        return;
-    }
-
-    socket.join(space_room_name(
-        payload.space_type,
-        &payload.space_id,
-        RoomKind::Awareness {
-            doc_id: payload.doc_id.clone(),
-        },
-    ));
-
-    ack_ok(
-        ack,
-        AwarenessResponse {
-            client_id: socket.id.to_string(),
-            success: true,
-        },
+    let span = start_socket_span(
+        "space:join-awareness",
+        &socket,
+        Some(&user),
+        Some((payload.space_type, payload.space_id.as_str())),
+        Some(payload.doc_id.as_str()),
+        Some(request.request_id.as_str()),
     );
-    let doc_key = DocSessionKey::new(
-        payload.space_type,
-        payload.space_id.clone(),
-        payload.doc_id.clone(),
-    );
-    let first_session = state
-        .doc_sessions
-        .register(&socket.id.to_string(), doc_key)
-        .await;
-    if first_session {
-        if let Err(err) = state
-            .doc_cache
-            .open_session(payload.space_type, &payload.space_id, &payload.doc_id)
-            .await
+
+    async move {
+        if let Err(err) =
+            ensure_socket_space_access(&state, &user, payload.space_type, &payload.space_id).await
         {
-            warn!(
-                space_type = ?payload.space_type,
-                space_id = %payload.space_id,
-                doc_id = %payload.doc_id,
-                error = %err,
-                "failed to open doc cache session from awareness join",
-            );
+            ack_error::<AwarenessResponse>(ack, err, Some(&request.request_id));
+            return;
+        }
+
+        socket.join(space_room_name(
+            payload.space_type,
+            &payload.space_id,
+            RoomKind::Awareness {
+                doc_id: payload.doc_id.clone(),
+            },
+        ));
+
+        ack_ok(
+            ack,
+            AwarenessResponse {
+                client_id: socket.id.to_string(),
+                success: true,
+            },
+        );
+        let doc_key = DocSessionKey::new(
+            payload.space_type,
+            payload.space_id.clone(),
+            payload.doc_id.clone(),
+        );
+        let first_session = state
+            .doc_sessions
+            .register(&socket.id.to_string(), doc_key)
+            .await;
+        if first_session {
+            if let Err(err) = state
+                .doc_cache
+                .open_session(payload.space_type, &payload.space_id, &payload.doc_id)
+                .await
+            {
+                warn!(
+                    space_type = ?payload.space_type,
+                    space_id = %payload.space_id,
+                    doc_id = %payload.doc_id,
+                    error = %err,
+                    "failed to open doc cache session from awareness join",
+                );
+            }
         }
     }
+    .instrument(span)
+    .await;
 }
 
 async fn handle_space_leave_awareness(
@@ -1548,44 +1665,57 @@ async fn handle_space_leave_awareness(
     Extension(request): Extension<SocketRequestContext>,
     State(state): State<AppState>,
 ) {
-    if let Err(err) = ensure_socket_joined_awareness(
+    let span = start_socket_span(
+        "space:leave-awareness",
         &socket,
-        payload.space_type,
-        &payload.space_id,
-        &payload.doc_id,
-    ) {
-        ack_error::<AwarenessResponse>(ack, err, Some(&request.request_id));
-        return;
-    }
-
-    socket.leave(space_room_name(
-        payload.space_type,
-        &payload.space_id,
-        RoomKind::Awareness {
-            doc_id: payload.doc_id.clone(),
-        },
-    ));
-
-    ack_ok(
-        ack,
-        AwarenessResponse {
-            client_id: socket.id.to_string(),
-            success: true,
-        },
+        None,
+        Some((payload.space_type, payload.space_id.as_str())),
+        Some(payload.doc_id.as_str()),
+        Some(request.request_id.as_str()),
     );
 
-    if state
-        .doc_sessions
-        .remove_doc(payload.space_type, &payload.space_id, &payload.doc_id)
-        .await
-    {
-        let key = DocSessionKey::new(
+    async move {
+        if let Err(err) = ensure_socket_joined_awareness(
+            &socket,
             payload.space_type,
-            payload.space_id.clone(),
-            payload.doc_id.clone(),
+            &payload.space_id,
+            &payload.doc_id,
+        ) {
+            ack_error::<AwarenessResponse>(ack, err, Some(&request.request_id));
+            return;
+        }
+
+        socket.leave(space_room_name(
+            payload.space_type,
+            &payload.space_id,
+            RoomKind::Awareness {
+                doc_id: payload.doc_id.clone(),
+            },
+        ));
+
+        ack_ok(
+            ack,
+            AwarenessResponse {
+                client_id: socket.id.to_string(),
+                success: true,
+            },
         );
-        finalize_doc_session(&state, &key).await;
+
+        if state
+            .doc_sessions
+            .remove_doc(payload.space_type, &payload.space_id, &payload.doc_id)
+            .await
+        {
+            let key = DocSessionKey::new(
+                payload.space_type,
+                payload.space_id.clone(),
+                payload.doc_id.clone(),
+            );
+            finalize_doc_session(&state, &key).await;
+        }
     }
+    .instrument(span)
+    .await;
 }
 
 #[derive(Debug, Deserialize)]
@@ -1604,43 +1734,56 @@ async fn handle_space_update_awareness(
     Extension(request): Extension<SocketRequestContext>,
     State(state): State<AppState>,
 ) {
-    if let Err(err) = ensure_socket_joined_awareness(
+    let span = start_socket_span(
+        "space:update-awareness",
         &socket,
-        payload.space_type,
-        &payload.space_id,
-        &payload.doc_id,
-    ) {
-        ack_error::<serde_json::Value>(ack, err, Some(&request.request_id));
-        return;
-    }
-
-    state.socket_metrics.inc_awareness_messages();
-
-    let room = space_room_name(
-        payload.space_type,
-        &payload.space_id,
-        RoomKind::Awareness {
-            doc_id: payload.doc_id.clone(),
-        },
+        None,
+        Some((payload.space_type, payload.space_id.as_str())),
+        Some(payload.doc_id.as_str()),
+        Some(request.request_id.as_str()),
     );
 
-    let payload_json = serde_json::json!({
-        "spaceType": payload.space_type,
-        "spaceId": payload.space_id,
-        "docId": payload.doc_id,
-        "awarenessUpdate": payload.awareness_update,
-    });
+    async move {
+        if let Err(err) = ensure_socket_joined_awareness(
+            &socket,
+            payload.space_type,
+            &payload.space_id,
+            &payload.doc_id,
+        ) {
+            ack_error::<serde_json::Value>(ack, err, Some(&request.request_id));
+            return;
+        }
 
-    if let Err(err) = socket
-        .broadcast()
-        .to(room)
-        .emit("space:broadcast-awareness-update", &payload_json)
-        .await
-    {
-        warn!(?err, "failed to broadcast awareness update");
+        state.socket_metrics.inc_awareness_messages();
+
+        let room = space_room_name(
+            payload.space_type,
+            &payload.space_id,
+            RoomKind::Awareness {
+                doc_id: payload.doc_id.clone(),
+            },
+        );
+
+        let payload_json = serde_json::json!({
+            "spaceType": payload.space_type,
+            "spaceId": payload.space_id,
+            "docId": payload.doc_id,
+            "awarenessUpdate": payload.awareness_update,
+        });
+
+        if let Err(err) = socket
+            .broadcast()
+            .to(room)
+            .emit("space:broadcast-awareness-update", &payload_json)
+            .await
+        {
+            warn!(?err, "failed to broadcast awareness update");
+        }
+
+        ack_ok(ack, serde_json::json!({}));
     }
-
-    ack_ok(ack, serde_json::json!({}));
+    .instrument(span)
+    .await;
 }
 
 async fn handle_space_load_awarenesses(
@@ -1649,61 +1792,75 @@ async fn handle_space_load_awarenesses(
     ack: AckSender,
     Extension(request): Extension<SocketRequestContext>,
 ) {
-    if let Err(err) = ensure_socket_joined_awareness(
+    let span = start_socket_span(
+        "space:load-awarenesses",
         &socket,
-        payload.space_type,
-        &payload.space_id,
-        &payload.doc_id,
-    ) {
-        ack_error::<serde_json::Value>(ack, err, Some(&request.request_id));
-        return;
-    }
-
-    let room = space_room_name(
-        payload.space_type,
-        &payload.space_id,
-        RoomKind::Awareness {
-            doc_id: payload.doc_id.clone(),
-        },
+        None,
+        Some((payload.space_type, payload.space_id.as_str())),
+        Some(payload.doc_id.as_str()),
+        Some(request.request_id.as_str()),
     );
 
-    let message = serde_json::json!({
-        "spaceType": payload.space_type,
-        "spaceId": payload.space_id,
-        "docId": payload.doc_id,
-    });
+    async move {
+        if let Err(err) = ensure_socket_joined_awareness(
+            &socket,
+            payload.space_type,
+            &payload.space_id,
+            &payload.doc_id,
+        ) {
+            ack_error::<serde_json::Value>(ack, err, Some(&request.request_id));
+            return;
+        }
 
-    let broadcast_room = room.clone();
-    if let Err(err) = socket
-        .broadcast()
-        .to(broadcast_room.clone())
-        .emit("space:collect-awareness", &message)
-        .await
-    {
-        warn!(?err, "failed to request awareness collection");
-    }
+        let room = space_room_name(
+            payload.space_type,
+            &payload.space_id,
+            RoomKind::Awareness {
+                doc_id: payload.doc_id.clone(),
+            },
+        );
 
-    if matches!(payload.space_type, SpaceType::Workspace) {
+        let message = serde_json::json!({
+            "spaceType": payload.space_type,
+            "spaceId": payload.space_id,
+            "docId": payload.doc_id,
+        });
+
+        let broadcast_room = room.clone();
         if let Err(err) = socket
             .broadcast()
-            .to(broadcast_room)
-            .emit("new-client-awareness-init", &serde_json::json!({}))
+            .to(broadcast_room.clone())
+            .emit("space:collect-awareness", &message)
             .await
         {
-            info!(?err, "failed to emit legacy awareness init");
+            warn!(?err, "failed to request awareness collection");
         }
-    }
 
-    ack_ok(
-        ack,
-        serde_json::json!({
-            "clientId": socket.id.to_string()
-        }),
-    );
+        if matches!(payload.space_type, SpaceType::Workspace) {
+            if let Err(err) = socket
+                .broadcast()
+                .to(broadcast_room)
+                .emit("new-client-awareness-init", &serde_json::json!({}))
+                .await
+            {
+                info!(?err, "failed to emit legacy awareness init");
+            }
+        }
+
+        ack_ok(
+            ack,
+            serde_json::json!({
+                "clientId": socket.id.to_string()
+            }),
+        );
+    }
+    .instrument(span)
+    .await;
 }
 
 async fn handle_disconnect(socket: SocketRef, State(state): State<AppState>) {
     let socket_id = socket.id.to_string();
+    socket.extensions.remove::<SocketSpanRegistry>();
     let stale_docs = state.doc_sessions.remove_all(&socket_id).await;
     for key in stale_docs {
         finalize_doc_session(&state, &key).await;
