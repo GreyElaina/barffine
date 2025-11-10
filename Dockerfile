@@ -1,38 +1,49 @@
 # syntax=docker/dockerfile:1.6
-# Edition 2024 requires nightly Rust today; install it atop a stable base image.
 ARG RUST_VERSION=1.81
 ARG RUST_TOOLCHAIN=nightly
 
-FROM rust:${RUST_VERSION}-bookworm AS builder
+FROM rust:${RUST_VERSION}-alpine3.20 AS builder
 ARG RUST_TOOLCHAIN
+ARG TARGETARCH
 
 WORKDIR /app
 
-ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true \
+    PKG_CONFIG_ALLOW_CROSS=1
 
-RUN apt-get update \
-    && apt-get install --no-install-recommends -y \
-        build-essential \
-        pkg-config \
-        libssl-dev \
-        libsqlite3-dev \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache \
+        build-base \
+        git \
+        pkgconf \
+        sqlite-dev
 
 RUN rustup toolchain install "${RUST_TOOLCHAIN}" \
     && rustup default "${RUST_TOOLCHAIN}"
 
 COPY . .
 
-RUN cargo build --release --locked -p barffine-server
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+        arm64) target_triple="aarch64-unknown-linux-musl" ;; \
+        amd64|x86_64) target_triple="x86_64-unknown-linux-musl" ;; \
+        *) echo "unsupported TARGETARCH ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    rustup target add "${target_triple}"; \
+    cargo build --release --locked -p barffine-server --target "${target_triple}"; \
+    strip "target/${target_triple}/release/barffine-server"; \
+    cp "target/${target_triple}/release/barffine-server" /tmp/barffine-server
 
-FROM debian:bookworm-slim AS runtime
+FROM alpine:3.20 AS runtime-prep
 
-RUN apt-get update \
-    && apt-get install --no-install-recommends -y \
-        ca-certificates \
-        curl \
-        libsqlite3-0 \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S barffine \
+    && adduser -S -G barffine -u 10001 barffine \
+    && mkdir -p /app/data \
+    && chown -R barffine:barffine /app
+
+COPY --from=builder /tmp/barffine-server /usr/local/bin/barffine-server
+
+FROM scratch AS runtime
 
 ENV BARFFINE_DATABASE_PATH=/app/data/barffine.db \
     BARFFINE_BIND_ADDRESS=0.0.0.0:8081 \
@@ -41,19 +52,16 @@ ENV BARFFINE_DATABASE_PATH=/app/data/barffine.db \
 
 WORKDIR /app
 
-RUN useradd --create-home --uid 10001 barffine \
-    && mkdir -p /app/data \
-    && chown -R barffine:barffine /app
-
-COPY --from=builder /app/target/release/barffine-server /usr/local/bin/barffine-server
+COPY --from=runtime-prep /etc/passwd /etc/passwd
+COPY --from=runtime-prep /etc/group /etc/group
+COPY --from=runtime-prep /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=runtime-prep /usr/local/bin/barffine-server /usr/local/bin/barffine-server
+COPY --from=runtime-prep /app /app
 
 EXPOSE 8081
 VOLUME ["/app/data"]
 
 USER barffine
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8081/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/barffine-server"]
 CMD ["serve"]
