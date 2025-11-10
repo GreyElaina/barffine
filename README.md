@@ -18,6 +18,28 @@ Barffine is an [AFFiNE](https://github.com/toeverything/AFFiNE) compatible backe
    The command is idempotent; rerunning it rotates the password if the user already exists.
 5. Verify the instance with `curl http://127.0.0.1:8081/health` and point your AFFiNE client at the same base URL.
 
+## Docker deployment
+
+If you prefer containers over a local Rust toolchain, use the published image at `ghcr.io/greyelaina/barffine`:
+
+1. Pull the image (update the tag if you need a specific release):
+   ```shell
+   docker pull ghcr.io/greyelaina/barffine:latest
+   ```
+2. Prepare a `.env` file (see below) and a data directory on the host for the SQLite file, then start the container:
+   ```shell
+   docker run -d \
+     --name barffine \
+     -p 8081:8081 \
+     --env-file .env \
+     -v $(pwd)/data:/app/data \
+     ghcr.io/greyelaina/barffine:latest
+   ```
+   The example mounts `./data` so the SQLite database persists outside the container. Adjust the port mapping when reverse proxies or different hosts are involved.
+3. Use `docker logs -f barffine` to monitor startup and reuse the operational commands below via `docker exec barffine <command>` when needed.
+
+`docker-compose.ghcr.yml` mirrors these steps and can be used as a template for multi-container deployments.
+
 ## Operational commands
 | Command | Description |
 | --- | --- |
