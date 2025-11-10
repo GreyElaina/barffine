@@ -57,8 +57,8 @@ Key variables:
 | --- | --- | --- |
 | `BARFFINE_BIND_ADDRESS` | `127.0.0.1:8081` | Socket address for the HTTP listener. |
 | `BARFFINE_DATABASE_PATH` | `./data/barffine.db` | Path to the sqlite-only database. |
-| `BARFFINE_BASE_URL` / `BARFFINE_PUBLIC_BASE_URL` | Derived from host/port | Used to build absolute links returned to clients. Set both when exposing Barffine behind a proxy. |
-| `BARFFINE_SERVER_HOST` / `BARFFINE_SERVER_PORT` | `127.0.0.1` / `8081` | Populate compatibility metadata surfaced to AFFiNE clients. |
+| `BARFFINE_BASE_URL` | Derived from host/port | Used to build absolute links returned to clients. Set when exposing Barffine behind a proxy. |
+| `BARFFINE_SERVER_HOST` / `BARFFINE_SERVER_PORT` | `127.0.0.1` / `8081` | Populate compatibility metadata surfaced to AFFiNE clients / Proxy. |
 | `BARFFINE_SERVER_PATH` / `BARFFINE_SERVER_SUB_PATH` | unset | Mount the API under a prefix when sitting behind a reverse proxy. |
 | `AFFINE_VERSION`, `DEPLOYMENT_TYPE`, `SERVER_FLAVOR` | `0.25.0`, `selfhosted`, `allinone` | Advertise compatibility and deployment flavour in `/info`. |
 | `BARFFINE_SERVER_FEATURES` | empty | Comma or semicolon separated list enabling feature flags (e.g., `comment,indexer`). |
