@@ -49,4 +49,4 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde_urlencoded = "0.7"
 url = "2.5"
 semver = "1.0"
-jsonwebtoken = "10.2.0"
+jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
