@@ -1,7 +1,6 @@
 // Document handlers
 
 use anyhow::Error as AnyError;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::{
     Json,
     body::{Body, Bytes},
@@ -13,20 +12,16 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use barffine_core::blob::BlobDescriptor;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use serde::Deserialize;
-use tokio::sync::broadcast;
-use tracing::{error, warn};
 use y_octo::{Doc as YoctoDoc, StateVector as YoctoStateVector};
 
 use crate::{
     auth::{DocAccessIntent, RpcAccessRequirement, parse_history_timestamp, resolve_doc_access},
     doc::{
-        channels::{comment_attachment_blob_key, doc_channel_key},
+        channels::comment_attachment_blob_key,
         content::{parse_doc_content, parse_doc_markdown},
         history, metadata as doc_metadata,
         mode::DocPublishMode,
-        sync::{UpdateBroadcastContext, apply_doc_updates, workspace_snapshot_or_not_found},
+        sync::workspace_snapshot_or_not_found,
     },
     error::AppError,
     handlers::headers::{
@@ -35,8 +30,7 @@ use crate::{
     },
     handlers::workspace_handlers::ensure_workspace_exists,
     http::{append_set_cookie_headers, http_date_from_datetime},
-    socket::rooms::SpaceType,
-    state::{AppState, SyncEventKind},
+    state::AppState,
     types::{
         AuthenticatedRestSession, DocContentQuery, DocContentResponse, DocMarkdownResponse,
         DocumentHistoryItem, DocumentMetadataResponse, HistoryQuery, PublishDocRequest,
@@ -46,8 +40,28 @@ use crate::{
         attachments::apply_attachment_headers,
         crdt::{decode_state_vector, encode_state_vector},
     },
-    workspace::service::{AccessTokenContext, AccessTokenVerification},
 };
+
+#[cfg(feature = "legacy-doc-service")]
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+#[cfg(feature = "legacy-doc-service")]
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+#[cfg(feature = "legacy-doc-service")]
+use tokio::sync::broadcast;
+#[cfg(feature = "legacy-doc-service")]
+use crate::state::SyncEventKind;
+#[cfg(feature = "legacy-doc-service")]
+use crate::doc::channels::doc_channel_key;
+#[cfg(feature = "legacy-doc-service")]
+use crate::doc::sync::{UpdateBroadcastContext, apply_doc_updates};
+#[cfg(feature = "legacy-doc-service")]
+use crate::socket::rooms::SpaceType;
+#[cfg(feature = "legacy-doc-service")]
+use crate::workspace::service::{AccessTokenContext, AccessTokenVerification};
+#[cfg(feature = "legacy-doc-service")]
+use tracing::{error, warn};
+#[cfg(feature = "legacy-doc-service")]
+use serde::Deserialize;
 
 pub(crate) async fn get_doc_content_handler(
     Path((workspace_id, doc_id)): Path<(String, String)>,
@@ -58,6 +72,7 @@ pub(crate) async fn get_doc_content_handler(
     Ok(Json(response))
 }
 
+#[cfg(feature = "legacy-doc-service")]
 pub(crate) async fn get_rpc_doc_content_handler(
     Path((workspace_id, doc_id)): Path<(String, String)>,
     State(state): State<AppState>,
@@ -154,6 +169,7 @@ pub(crate) async fn get_doc_markdown_handler(
     Ok(Json(response))
 }
 
+#[cfg(feature = "legacy-doc-service")]
 pub(crate) async fn get_rpc_doc_markdown_handler(
     Path((workspace_id, doc_id)): Path<(String, String)>,
     State(state): State<AppState>,
@@ -182,6 +198,7 @@ pub(crate) async fn get_doc_diff_handler(
     .await
 }
 
+#[cfg(feature = "legacy-doc-service")]
 pub(crate) async fn get_rpc_doc_diff_handler(
     Path((workspace_id, doc_id)): Path<(String, String)>,
     State(state): State<AppState>,
@@ -216,6 +233,7 @@ pub(crate) async fn get_doc_binary_handler(
     .await
 }
 
+#[cfg(feature = "legacy-doc-service")]
 pub(crate) async fn get_rpc_doc_binary_handler(
     Path((workspace_id, doc_id)): Path<(String, String)>,
     State(state): State<AppState>,
@@ -478,6 +496,7 @@ async fn doc_diff_response(
     Ok(response)
 }
 
+#[cfg(feature = "legacy-doc-service")]
 fn require_rpc_doc_token(
     state: &AppState,
     headers: &HeaderMap,
@@ -597,6 +616,7 @@ where
     Ok(auth)
 }
 
+#[cfg(feature = "legacy-doc-service")]
 pub(crate) async fn doc_ws_handler(
     ws: WebSocketUpgrade,
     Path((workspace_id, doc_id)): Path<(String, String)>,
@@ -609,6 +629,7 @@ pub(crate) async fn doc_ws_handler(
     })
 }
 
+#[cfg(feature = "legacy-doc-service")]
 async fn handle_doc_websocket(
     mut socket: WebSocket,
     state: AppState,
@@ -750,6 +771,7 @@ pub(crate) async fn unpublish_doc_handler(
     Ok(response)
 }
 
+#[cfg(feature = "legacy-doc-service")]
 async fn process_incoming_ws_message(
     state: &AppState,
     workspace_id: &str,

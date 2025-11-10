@@ -71,6 +71,8 @@ pub(crate) async fn get_workspace_content_handler(
     Ok(Json(response))
 }
 
+#[allow(dead_code)]
+#[cfg(feature = "legacy-doc-service")]
 pub(crate) async fn get_rpc_workspace_content_handler(
     Path(workspace_id): Path<String>,
     State(workspaces): State<Arc<WorkspaceService>>,

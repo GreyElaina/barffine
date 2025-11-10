@@ -106,10 +106,6 @@ fn build_base_router(state: AppState) -> Router {
             get(get_workspace_content_handler),
         )
         .route(
-            "/rpc/workspaces/{workspace_id}/content",
-            get(get_rpc_workspace_content_handler),
-        )
-        .route(
             "/workspaces/{workspace_id}/blobs/{name}",
             get(get_workspace_blob_handler),
         )
@@ -127,20 +123,12 @@ fn build_base_router(state: AppState) -> Router {
             get(get_doc_binary_handler),
         )
         .route(
-            "/rpc/workspaces/{workspace_id}/docs/{doc_id}",
-            get(get_rpc_doc_binary_handler),
-        )
-        .route(
             "/workspaces/{workspace_id}/docs/{doc_id}/content",
             get(get_doc_content_handler),
         )
         .route(
             "/api/workspaces/{workspace_id}/docs/{doc_id}/content",
             get(get_doc_content_handler),
-        )
-        .route(
-            "/rpc/workspaces/{workspace_id}/docs/{doc_id}/content",
-            get(get_rpc_doc_content_handler),
         )
         .route(
             "/workspaces/{workspace_id}/docs/{doc_id}/markdown",
@@ -151,20 +139,12 @@ fn build_base_router(state: AppState) -> Router {
             get(get_doc_markdown_handler),
         )
         .route(
-            "/rpc/workspaces/{workspace_id}/docs/{doc_id}/markdown",
-            get(get_rpc_doc_markdown_handler),
-        )
-        .route(
             "/workspaces/{workspace_id}/docs/{doc_id}/diff",
             post(get_doc_diff_handler),
         )
         .route(
             "/api/workspaces/{workspace_id}/docs/{doc_id}/diff",
             post(get_doc_diff_handler),
-        )
-        .route(
-            "/rpc/workspaces/{workspace_id}/docs/{doc_id}/diff",
-            post(get_rpc_doc_diff_handler),
         )
         .route(
             "/workspaces/{workspace_id}/docs/{doc_id}/public",
@@ -191,14 +171,6 @@ fn build_base_router(state: AppState) -> Router {
             get(get_doc_history_snapshot_handler),
         )
         .route(
-            "/workspaces/{workspace_id}/docs/{doc_id}/ws",
-            get(doc_ws_handler),
-        )
-        .route(
-            "/api/workspaces/{workspace_id}/docs/{doc_id}/ws",
-            get(doc_ws_handler),
-        )
-        .route(
             "/workspaces/{workspace_id}/docs/{doc_id}/comment-attachments/{key}",
             get(get_comment_attachment_handler),
         )
@@ -213,6 +185,8 @@ fn build_base_router(state: AppState) -> Router {
                 .post(graphql::graphql_handler)
                 .options(graphql::graphql_options_handler),
         );
+
+    let router = add_legacy_doc_service_routes(router);
 
     let router = router
         .layer(socket_layer)
@@ -236,4 +210,42 @@ fn build_base_router(state: AppState) -> Router {
         .layer(Extension(schema))
         .layer(observability::request_context_layer())
         .with_state(state)
+}
+
+#[cfg(feature = "legacy-doc-service")]
+fn add_legacy_doc_service_routes(router: Router<AppState>) -> Router<AppState> {
+    router
+        .route(
+            "/rpc/workspaces/{workspace_id}/content",
+            get(get_rpc_workspace_content_handler),
+        )
+        .route(
+            "/rpc/workspaces/{workspace_id}/docs/{doc_id}",
+            get(get_rpc_doc_binary_handler),
+        )
+        .route(
+            "/rpc/workspaces/{workspace_id}/docs/{doc_id}/content",
+            get(get_rpc_doc_content_handler),
+        )
+        .route(
+            "/rpc/workspaces/{workspace_id}/docs/{doc_id}/markdown",
+            get(get_rpc_doc_markdown_handler),
+        )
+        .route(
+            "/rpc/workspaces/{workspace_id}/docs/{doc_id}/diff",
+            post(get_rpc_doc_diff_handler),
+        )
+        .route(
+            "/workspaces/{workspace_id}/docs/{doc_id}/ws",
+            get(doc_ws_handler),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/docs/{doc_id}/ws",
+            get(doc_ws_handler),
+        )
+}
+
+#[cfg(not(feature = "legacy-doc-service"))]
+fn add_legacy_doc_service_routes(router: Router<AppState>) -> Router<AppState> {
+    router
 }
