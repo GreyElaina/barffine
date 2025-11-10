@@ -5,6 +5,7 @@ mod cursors;
 mod doc;
 mod handlers;
 mod helpers;
+mod metrics;
 mod mutation;
 mod query;
 mod schema;

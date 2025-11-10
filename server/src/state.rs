@@ -2,19 +2,19 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 
 use anyhow::Result as AnyResult;
-use dashmap::{mapref::entry::Entry, DashMap};
+use dashmap::{DashMap, mapref::entry::Entry};
 use once_cell::sync::OnceCell;
 use serde::Serialize;
 use socketioxide::SocketIo;
 use tokio::{
     spawn,
-    sync::{broadcast, Mutex},
-    time::{sleep, Duration},
+    sync::{Mutex, broadcast},
+    time::{Duration, sleep},
 };
 use tracing::{info, warn};
 
@@ -25,7 +25,7 @@ use barffine_core::{
     comment_store::SqliteCommentStore,
     db::Database,
     doc_roles::DocumentRoleStore,
-    doc_store::{DocumentStore, DOC_UPDATE_LOG_LIMIT},
+    doc_store::{DOC_UPDATE_LOG_LIMIT, DocumentStore},
     feature::{DeterministicFeatureStore, FeatureFlag, FeatureNamespace, FeatureSnapshot},
     notification_store::SqliteNotificationCenter,
     user::UserStore,
@@ -35,6 +35,7 @@ use barffine_core::{
     workspace_feature_store::WorkspaceFeatureStore,
 };
 
+use crate::oauth::OAuthService;
 use crate::{
     blob_store::SqliteBlobStorage,
     crypto::DocTokenSigner,
@@ -44,14 +45,13 @@ use crate::{
     },
     feature_service::FeatureService,
     graphql::copilot::CopilotSessionRecord,
-    socket::rooms::{space_room_name, RoomKind, SpaceType},
+    socket::rooms::{RoomKind, SpaceType, space_room_name},
     types::SessionUser,
     user::service::UserService,
     workspace::service::WorkspaceService,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use serde_json::{json, Value as JsonValue};
-use crate::oauth::OAuthService;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use serde_json::{Value as JsonValue, json};
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceEmbeddingEvent {

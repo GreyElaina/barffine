@@ -1,13 +1,28 @@
-use std::{env, fmt, time::Duration};
+use std::{
+    env, fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Context as TaskContext, Poll},
+    time::Duration,
+};
 
-use axum::http::Response;
+use axum::http::{HeaderValue, Request, Response, header::HeaderName};
 use once_cell::sync::OnceCell;
-use tower_http::trace::OnResponse;
-use tracing::{Level, Span, event};
+use tower::{Layer, Service};
+use tower_http::trace::{MakeSpan, OnResponse};
+use tracing::{Level, Span, event, field};
+use tracing_subscriber::{
+    Registry,
+    registry::{LookupSpan, SpanRef},
+};
+use uuid::Uuid;
 
 type SharedSampling = &'static SamplingConfig;
 
 static SAMPLING_CONFIG: OnceCell<SamplingConfig> = OnceCell::new();
+static OTEL_LAYERS_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Initialise sampling configuration from environment, returning the shared config.
 pub(crate) fn init_sampling() -> SharedSampling {
@@ -103,13 +118,200 @@ impl<B> OnResponse<B> for ResponseLogger {
             ),
             _ => event!(
                 parent: span,
-                Level::INFO,
+                Level::DEBUG,
                 status = status.as_u16(),
                 latency_ms = latency.as_millis() as u64,
                 "request completed"
             ),
         }
     }
+}
+
+static REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
+const CLIENT_VERSION_HEADER: &str = "x-affine-version";
+
+#[derive(Clone, Debug)]
+pub struct RequestContext {
+    inner: Arc<RequestContextInner>,
+}
+
+#[derive(Debug)]
+struct RequestContextInner {
+    request_id: String,
+    client_version: Option<String>,
+}
+
+impl RequestContext {
+    fn new(request_id: String, client_version: Option<String>) -> Self {
+        Self {
+            inner: Arc::new(RequestContextInner {
+                request_id,
+                client_version,
+            }),
+        }
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.inner.request_id
+    }
+
+    pub fn client_version(&self) -> Option<&str> {
+        self.inner.client_version.as_deref()
+    }
+}
+
+pub fn request_context_layer() -> RequestContextLayer {
+    RequestContextLayer::default()
+}
+
+pub fn otel_layers_enabled() -> bool {
+    OTEL_LAYERS_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn set_otel_layers_enabled(enabled: bool) {
+    OTEL_LAYERS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+#[derive(Clone, Default)]
+pub struct RequestContextLayer;
+
+#[derive(Clone)]
+pub struct RequestContextMiddleware<S> {
+    inner: S,
+}
+
+impl<S> Layer<S> for RequestContextLayer {
+    type Service = RequestContextMiddleware<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RequestContextMiddleware { inner }
+    }
+}
+
+impl<S, B> Service<Request<B>> for RequestContextMiddleware<S>
+where
+    S: Service<Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut request: Request<B>) -> Self::Future {
+        let (request_id, missing_header) = request
+            .headers()
+            .get(&REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| (value.to_string(), false))
+            .unwrap_or_else(|| (Uuid::new_v4().to_string(), true));
+
+        if missing_header {
+            if let Ok(header_value) = HeaderValue::from_str(&request_id) {
+                request
+                    .headers_mut()
+                    .insert(REQUEST_ID_HEADER.clone(), header_value);
+            }
+        }
+
+        let client_version = request
+            .headers()
+            .get(CLIENT_VERSION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+
+        let context = RequestContext::new(request_id, client_version);
+        request.extensions_mut().insert(context);
+
+        self.inner.call(request)
+    }
+}
+
+pub fn http_make_span() -> HttpMakeSpan {
+    HttpMakeSpan
+}
+
+#[derive(Clone, Default)]
+pub struct HttpMakeSpan;
+
+impl<B> MakeSpan<B> for HttpMakeSpan {
+    fn make_span(&mut self, request: &Request<B>) -> Span {
+        let context = request.extensions().get::<RequestContext>().cloned();
+        let request_id = context
+            .as_ref()
+            .map(|ctx| ctx.request_id().to_owned())
+            .unwrap_or_else(|| "unknown".to_string());
+        let client_version = context
+            .as_ref()
+            .and_then(|ctx| ctx.client_version())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let span = tracing::span!(
+            Level::DEBUG,
+            "http.request",
+            method = %request.method(),
+            uri = %request.uri(),
+            request_id = %request_id,
+            client_version = %client_version,
+            user_id = field::Empty,
+            session_id = field::Empty
+        );
+
+        if let Some(ctx) = context {
+            with_request_span_ref(&span, |span_ref| {
+                span_ref.extensions_mut().insert(ctx.clone());
+            });
+        }
+
+        span
+    }
+}
+
+pub fn record_authenticated_identity(user_id: Option<&str>, session_id: Option<&str>) {
+    let span = Span::current();
+    if span.is_disabled() {
+        return;
+    }
+
+    if let Some(user_id) = user_id {
+        span.record("user_id", &field::display(user_id));
+    }
+
+    if let Some(session_id) = session_id {
+        span.record("session_id", &field::display(session_id));
+    }
+}
+
+pub fn current_request_context() -> Option<RequestContext> {
+    let span = Span::current();
+    if span.is_disabled() {
+        return None;
+    }
+
+    let mut captured = None;
+    with_request_span_ref(&span, |span_ref| {
+        if let Some(existing) = span_ref.extensions().get::<RequestContext>() {
+            captured = Some(existing.clone());
+        }
+    });
+    captured
+}
+
+fn with_request_span_ref<F>(span: &Span, mut apply: F)
+where
+    F: FnMut(SpanRef<'_, Registry>),
+{
+    span.with_subscriber(|(id, dispatch)| {
+        if let Some(registry) = dispatch.downcast_ref::<Registry>() {
+            if let Some(span_ref) = registry.span(id) {
+                apply(span_ref);
+            }
+        }
+    });
 }
 
 #[derive(Debug)]

@@ -1,18 +1,18 @@
 // Router configuration
 
 use axum::{
-    http::Method, routing::{get, post},
-    Extension,
-    Router,
+    Extension, Router,
+    http::Method,
+    routing::{get, post},
 };
 use axum_otel_metrics::HttpMetricsLayerBuilder;
 use axum_tracing_opentelemetry::middleware::{OtelAxumLayer, OtelInResponseLayer};
 use tower_http::{
     cors::{AllowHeaders, AllowOrigin, CorsLayer},
-    trace::{DefaultMakeSpan, TraceLayer},
+    trace::TraceLayer,
 };
-use tracing::Level;
 
+use crate::oauth::oauth_router;
 use crate::{
     graphql,
     handlers::{
@@ -22,7 +22,6 @@ use crate::{
     observability,
     state::AppState,
 };
-use crate::oauth::oauth_router;
 
 pub fn build_router(state: AppState) -> Router {
     let prefix = state.server_path.clone();
@@ -52,7 +51,7 @@ fn build_base_router(state: AppState) -> Router {
         .allow_headers(AllowHeaders::mirror_request())
         .allow_credentials(true);
 
-    Router::new()
+    let router = Router::new()
         // Health & Info
         .route("/", get(index_handler))
         .route("/health", get(health_handler))
@@ -213,17 +212,28 @@ fn build_base_router(state: AppState) -> Router {
             get(graphql::graphql_playground)
                 .post(graphql::graphql_handler)
                 .options(graphql::graphql_options_handler),
-        )
+        );
+
+    let router = router
         .layer(socket_layer)
         .layer(
             TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .make_span_with(observability::http_make_span())
                 .on_response(observability::response_logger()),
         )
         .layer(cors)
-        .layer(HttpMetricsLayerBuilder::new().build())
-        .layer(OtelInResponseLayer::default())
-        .layer(OtelAxumLayer::default().filter(observability::should_sample_path))
+        .layer(HttpMetricsLayerBuilder::new().build());
+
+    let router = if observability::otel_layers_enabled() {
+        router
+            .layer(OtelInResponseLayer::default())
+            .layer(OtelAxumLayer::default().filter(observability::should_sample_path))
+    } else {
+        router
+    };
+
+    router
         .layer(Extension(schema))
+        .layer(observability::request_context_layer())
         .with_state(state)
 }

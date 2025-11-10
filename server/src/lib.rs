@@ -10,8 +10,8 @@ pub mod feature_service;
 pub mod graphql;
 pub mod handlers;
 pub mod http;
-pub mod observability;
 pub mod oauth;
+pub mod observability;
 pub mod router;
 pub mod socket;
 pub mod state;
@@ -22,7 +22,7 @@ pub mod utils;
 pub mod workspace;
 
 pub use error::AppError;
-pub use state::{build_state, build_state_with_config, AppState, StateBuildConfig};
+pub use state::{AppState, StateBuildConfig, build_state, build_state_with_config};
 
 pub const DEFAULT_HISTORY_LIMIT: i64 = 20;
 pub const MAX_HISTORY_LIMIT: i64 = 100;

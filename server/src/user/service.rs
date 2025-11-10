@@ -9,6 +9,7 @@ use crate::{
         build_session_cookie, build_user_cookie, clear_session_cookie, clear_user_cookie,
         extract_session_token,
     },
+    observability,
     state::AppState,
     types::{AuthenticatedRestSession, SessionLookup, SessionUser},
 };
@@ -100,6 +101,8 @@ impl UserService {
         let mut set_cookies = Vec::with_capacity(2);
         set_cookies.push(build_session_cookie(&session.id, session.expires_at));
         set_cookies.push(build_user_cookie(&session.user_id, session.expires_at));
+
+        observability::record_authenticated_identity(Some(&user.id), Some(&session.id));
 
         Ok(AuthenticatedRestSession { user, set_cookies })
     }

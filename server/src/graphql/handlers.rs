@@ -11,7 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use crate::{
     AppState,
@@ -19,13 +19,15 @@ use crate::{
         build_session_cookie, build_user_cookie, clear_session_cookie, clear_user_cookie,
         extract_session_token,
     },
+    observability::{self, RequestContext},
 };
 
-use super::{BarffineSchema, RequestUser, context::ClientVersion};
+use super::{BarffineSchema, RequestUser, context::ClientVersion, metrics::GRAPHQL_METRICS};
 
 pub async fn graphql_handler(
     Extension(schema): Extension<BarffineSchema>,
     State(state): State<AppState>,
+    Extension(request_context): Extension<RequestContext>,
     headers: HeaderMap,
     req: GraphQLRequest,
 ) -> Response {
@@ -33,6 +35,8 @@ pub async fn graphql_handler(
     let mut set_cookies: Vec<String> = Vec::new();
     let mut active_user: Option<String> = None;
     let mut active_session: Option<String> = None;
+    let mut refreshed_session = false;
+    let mut cleared_cookies = false;
 
     if let Some(session_token) = extract_session_token(&headers) {
         match state.user_store.refresh_session(&session_token).await {
@@ -46,10 +50,12 @@ pub async fn graphql_handler(
 
                 set_cookies.push(build_session_cookie(&session.id, session.expires_at));
                 set_cookies.push(build_user_cookie(&session.user_id, session.expires_at));
+                refreshed_session = true;
             }
             Ok(None) => {
                 set_cookies.push(clear_session_cookie());
                 set_cookies.push(clear_user_cookie());
+                cleared_cookies = true;
             }
             Err(err) => {
                 warn!(
@@ -58,15 +64,19 @@ pub async fn graphql_handler(
                 );
                 set_cookies.push(clear_session_cookie());
                 set_cookies.push(clear_user_cookie());
+                cleared_cookies = true;
             }
         }
     }
 
-    let client_version = headers
-        .get("x-affine-version")
-        .and_then(|value| value.to_str().ok())
+    observability::record_authenticated_identity(active_user.as_deref(), active_session.as_deref());
+
+    let client_version = request_context
+        .client_version()
         .and_then(|raw| semver::Version::parse(raw).ok());
     request = request.data(ClientVersion::new(client_version));
+
+    let client_version_label = request_context.client_version().unwrap_or("unknown");
 
     let operation_name = request
         .operation_name
@@ -80,10 +90,15 @@ pub async fn graphql_handler(
         operation = operation_label,
         user_id = active_user.as_deref().unwrap_or("anonymous"),
         session_id = active_session.as_deref(),
-        has_session = active_session.is_some()
+        has_session = active_session.is_some(),
+        request_id = request_context.request_id(),
+        client_version = client_version_label,
+        refreshed_session = refreshed_session,
+        cleared_cookies = cleared_cookies,
+        set_cookie_count = set_cookies.len() as i64
     );
 
-    info!(
+    debug!(
         operation = %operation_label,
         user_id = active_user.as_deref().unwrap_or("anonymous"),
         session_id = active_session.as_deref().unwrap_or(""),
@@ -112,13 +127,22 @@ pub async fn graphql_handler(
         }
     }
 
-    info!(
+    debug!(
         operation = %operation_label,
         duration_ms = elapsed_ms,
         errors = has_errors,
         user_id = active_user.as_deref().unwrap_or("anonymous"),
         session_id = active_session.as_deref().unwrap_or(""),
         "graphql completed"
+    );
+
+    GRAPHQL_METRICS.observe(
+        operation_label,
+        elapsed_ms,
+        &request_context,
+        request_context.client_version(),
+        active_session.is_some(),
+        has_errors,
     );
 
     let mut response: Response = GraphQLResponse::from(execution).into_response();
@@ -206,7 +230,7 @@ mod tests {
     use super::*;
     use crate::{
         cookies::{SESSION_COOKIE_NAME, USER_COOKIE_NAME},
-        graphql,
+        graphql, observability,
         test_support::{seed_workspace, setup_state},
     };
     use axum::{
@@ -245,6 +269,7 @@ mod tests {
         let app = Router::new()
             .route("/graphql", post(graphql_handler))
             .layer(Extension(schema))
+            .layer(observability::request_context_layer())
             .with_state(state.clone());
 
         let body = json!({ "query": query }).to_string();
@@ -305,6 +330,7 @@ mod tests {
                     .options(graphql_options_handler),
             )
             .layer(Extension(schema))
+            .layer(observability::request_context_layer())
             .with_state(state);
 
         let request = Request::builder()

@@ -57,5 +57,6 @@ serde_urlencoded.workspace = true
 url.workspace = true
 semver.workspace = true
 jsonwebtoken.workspace = true
+opentelemetry.workspace = true
 
 [dev-dependencies]

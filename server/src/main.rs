@@ -152,10 +152,12 @@ fn init_observability() -> Option<logfire::ShutdownGuard> {
     // Check if LOGFIRE_TOKEN is empty/missing, if so, directly use fallback
     if let Ok(token) = std::env::var("LOGFIRE_TOKEN") {
         if token.trim().is_empty() {
+            observability::set_otel_layers_enabled(false);
             init_tracing_fallback();
             return None;
         }
     } else {
+        observability::set_otel_layers_enabled(false);
         init_tracing_fallback();
         return None;
     }
@@ -172,7 +174,10 @@ fn init_observability() -> Option<logfire::ShutdownGuard> {
     }
 
     match builder.finish() {
-        Ok(logfire) => Some(logfire.shutdown_guard()),
+        Ok(logfire) => {
+            observability::set_otel_layers_enabled(true);
+            Some(logfire.shutdown_guard())
+        }
         Err(error) => {
             eprintln!(
                 "failed to initialize logfire: {error:?}; falling back to tracing_subscriber"
@@ -182,12 +187,14 @@ fn init_observability() -> Option<logfire::ShutdownGuard> {
                 ?error,
                 "failed to initialize logfire; using tracing_subscriber fallback"
             );
+            observability::set_otel_layers_enabled(false);
             None
         }
     }
 }
 
 fn init_tracing_fallback() {
+    observability::set_otel_layers_enabled(false);
     if tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
