@@ -56,7 +56,7 @@ sysinfo = { version = "0.29", default-features = false }
 serde_with = "3.11"
 humantime-serde = "1.1"
 toml = "0.8"
-rocksdb = { version = "0.21.0", default-features = false, features = ["lz4"] }
+rocksdb = { version = "0.24.0", default-features = false, features = ["lz4"] }
 bincode = { version = "2.0.1", features = ["serde"] }
 yrs = "0.24.0"
 futures = "0.3"
