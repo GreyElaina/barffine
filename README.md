@@ -59,10 +59,8 @@ Key variables:
 | --- | --- | --- |
 | `BARFFINE_BIND_ADDRESS` | `127.0.0.1:8081` | Socket address for the HTTP listener. |
 | `BARFFINE_DATABASE_PATH` | `./data` | Directory that stores the SQLite metadata database (Barffine creates `barffine.db` inside) and co-locates RocksDB column families. Keep this pointing at a directory; file paths are best-effort supported for backward compatibility. |
-| `BARFFINE_DATABASE_BACKEND` | `sqlite` | Choose `sqlite`, `postgres`, or `libsql`. |
+| `BARFFINE_DATABASE_BACKEND` | `sqlite` | Choose `sqlite` or `postgres`. |
 | `BARFFINE_DATABASE_URL` | `postgres://user:pass@localhost:5432/barffine` | Required when `BARFFINE_DATABASE_BACKEND=postgres`; ignored otherwise. |
-| `BARFFINE_LIBSQL_URL` | unset | When `BARFFINE_DATABASE_BACKEND=libsql`, set this to a remote libsql endpoint (e.g. a Turso database or self-hosted `sqld`) to use remote storage instead of an embedded file. Leave unset to use a local libsql database at `BARFFINE_DATABASE_PATH`. |
-| `BARFFINE_LIBSQL_AUTH_TOKEN` | unset | Optional auth token used when connecting to `BARFFINE_LIBSQL_URL` (for Turso or protected `sqld` instances). |
 | `BARFFINE_DATABASE_MAX_CONNECTIONS` | `16` | Controls the metadata connection pool size. Increase for higher concurrency. |
 | `BARFFINE_DOC_DATA_BACKEND` | `sqlite` / `rocksdb` | Selects where doc updates, snapshots, notifications, and other large KV payloads live. |
 | `BARFFINE_DOC_DATA_PATH` | `./data/doc-kv` | Directory for RocksDB column families (used when `BARFFINE_DOC_DATA_BACKEND=rocksdb`). |
@@ -79,15 +77,6 @@ Key variables:
 | `LOGFIRE_TOKEN` | unset | Enables Logfire export; tracing falls back to `tracing_subscriber` when absent. |
 | `RUST_LOG` | `info` | Standard Rust log filter. |
 | `BARFFINE_TRACE_*` | unset | Control sampling behaviour for custom tracing (see `server/src/observability.rs`). |
-
-### Libsql remote / sqld
-
-When `BARFFINE_DATABASE_BACKEND=libsql`:
-
-- If `BARFFINE_LIBSQL_URL` is **unset**, Barffine uses an embedded libsql database file under `BARFFINE_DATABASE_PATH` (default: `./data/barffine.db`), similar to the default SQLite mode but backed by libsql.
-- If `BARFFINE_LIBSQL_URL` is **set**, Barffine connects to that remote libsql endpoint (for example a Turso database or a self-hosted `sqld` instance such as `libsql://127.0.0.1:8080` or `https://<db>-<org>.turso.io`) and automatically runs the bundled SQLite migrations against it on startup.
-
-In remote mode, the metadata schema is kept in sync with the SQLite/Postgres backends, and you can still choose where to store high-volume doc data via `BARFFINE_DOC_DATA_BACKEND` (`sqlite` or `rocksdb`).
 
 ### Example `.env`
 
@@ -119,7 +108,6 @@ By default (when `BARFFINE_NOTIFICATION_CENTER_BACKEND` is unset or set to `auto
 - Otherwise, Barffine picks a backend that matches the metadata database:
   - `DatabaseBackend::Sqlite` → `SqliteNotificationCenter`
   - `DatabaseBackend::Postgres` → `PostgresNotificationCenter`
-  - `DatabaseBackend::Libsql` → `LibsqlNotificationCenter`
 
 You can override this selection with `BARFFINE_NOTIFICATION_CENTER_BACKEND`:
 
@@ -127,7 +115,6 @@ You can override this selection with `BARFFINE_NOTIFICATION_CENTER_BACKEND`:
 - `rocksdb` / `rocks`: force `RocksNotificationCenter`. Requires `BARFFINE_DOC_DATA_BACKEND=rocksdb`, otherwise the server will fail to start.
 - `sqlite`: force `SqliteNotificationCenter`. Requires `BARFFINE_DATABASE_BACKEND=sqlite`.
 - `postgres` / `postgresql` / `pg`: force `PostgresNotificationCenter`. Requires `BARFFINE_DATABASE_BACKEND=postgres`.
-- `libsql`: force `LibsqlNotificationCenter`. Requires `BARFFINE_DATABASE_BACKEND=libsql` (local or remote).
 
 Unsupported values are ignored with a warning and Barffine falls back to the default backend. For most deployments, leaving this setting unset is recommended.
 
