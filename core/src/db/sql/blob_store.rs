@@ -28,7 +28,7 @@ fn workspace_scope(workspace_id: &str) -> BlobScope {
 /// SQL-backed blob store that keeps bytes in the same database as the rest of the app state.
 ///
 /// 该实现通过 [`BlobRepositoryRef`] 工作，因此可以复用到
-/// SQLite / Libsql / Postgres 等所有 SQL 数据库后端。
+/// SQLite / Postgres 等所有 SQL 数据库后端。
 pub struct SqlBlobStorage {
     blob_repo: BlobRepositoryRef,
 }

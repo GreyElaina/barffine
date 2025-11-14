@@ -146,11 +146,6 @@ async fn run_serve(config: AppConfig) -> anyhow::Result<()> {
         database_backend = ?config.database_backend,
         database_path = %config.database_path,
         database_max_connections = config.database_max_connections,
-        libsql_url = %config
-            .libsql_url
-            .as_deref()
-            .unwrap_or(""),
-        libsql_auth_token = config.libsql_auth_token.is_some(),
         doc_data_backend = ?config.doc_data_backend,
         doc_data_path = %config.doc_data_path,
         doc_store_backend = ?config.doc_store_backend,

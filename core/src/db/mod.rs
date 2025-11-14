@@ -1,16 +1,4 @@
 use std::{fs, fs::File, path::PathBuf, sync::Arc};
-
-use self::libsql::{
-    LibsqlPool, access_token_repo::LibsqlAccessTokenRepository, blob_repo::LibsqlBlobRepository,
-    comment_attachment_repo::LibsqlCommentAttachmentRepository,
-    comment_repo::LibsqlCommentRepository, create_local_pool, create_remote_pool,
-    doc_public_link_store::LibsqlDocPublicLinkStore, doc_repo::LibsqlDocRepository,
-    doc_role_repo::LibsqlDocRoleRepository, doc_update_log_store::LibsqlDocUpdateLogStore,
-    migrations::run_remote_migrations, user_doc_repo::LibsqlUserDocRepository,
-    user_repo::LibsqlUserRepository, user_settings_repo::LibsqlUserSettingsRepository,
-    workspace_feature_repo::LibsqlWorkspaceFeatureRepository,
-    workspace_repo::LibsqlWorkspaceRepository,
-};
 use self::postgres::{
     access_token_repo::PostgresAccessTokenRepository, blob_repo::PostgresBlobRepository,
     comment_attachment_repo::PostgresCommentAttachmentRepository,
@@ -62,7 +50,6 @@ pub mod comment_repo;
 pub mod doc_public_link_store;
 pub mod doc_repo;
 pub mod doc_role_repo;
-pub mod libsql;
 pub mod postgres;
 pub mod rocks;
 pub mod sql;
@@ -165,7 +152,6 @@ impl RepositoryRegistry {
 #[derive(Clone)]
 enum DatabasePool {
     Sqlite(sqlite_connection::SqlitePool),
-    Libsql(LibsqlPool),
     Postgres(postgres_connection::PostgresPool),
 }
 
@@ -186,7 +172,6 @@ impl Database {
     pub async fn connect(config: &AppConfig) -> Result<Self> {
         match config.database_backend {
             DatabaseBackend::Sqlite => Self::connect_sqlite(config).await,
-            DatabaseBackend::Libsql => Self::connect_libsql(config).await,
             DatabaseBackend::Postgres => Self::connect_postgres(config).await,
         }
     }
@@ -328,16 +313,7 @@ impl Database {
     pub fn pool(&self) -> &sqlite_connection::SqlitePool {
         match &self.pool {
             DatabasePool::Sqlite(pool) => pool,
-            DatabasePool::Libsql(_) => panic!("sqlite pool unavailable when backend is libsql"),
             DatabasePool::Postgres(_) => panic!("sqlite pool unavailable when backend is postgres"),
-        }
-    }
-
-    pub fn libsql_pool(&self) -> Option<&LibsqlPool> {
-        match &self.pool {
-            DatabasePool::Sqlite(_) => None,
-            DatabasePool::Libsql(pool) => Some(pool),
-            DatabasePool::Postgres(_) => None,
         }
     }
 
@@ -345,7 +321,6 @@ impl Database {
         match &self.pool {
             DatabasePool::Postgres(pool) => Some(pool),
             DatabasePool::Sqlite(_) => None,
-            DatabasePool::Libsql(_) => None,
         }
     }
 
@@ -396,146 +371,6 @@ impl Database {
             let cwd = std::env::current_dir().context("failed to obtain current directory")?;
             Ok(cwd.join(path))
         }
-    }
-
-    async fn connect_libsql(config: &AppConfig) -> Result<Self> {
-        let (data_dir, db_file) = Self::resolve_database_paths(&config.database_path)?;
-        fs::create_dir_all(&data_dir).with_context(|| {
-            format!(
-                "failed to create libsql database directory: {}",
-                data_dir.display()
-            )
-        })?;
-
-        let pool = if let Some(url) = &config.libsql_url {
-            let pool = create_remote_pool(
-                url,
-                config.libsql_auth_token.as_deref(),
-                config.database_max_connections,
-            )
-            .await?;
-            run_remote_migrations(pool.pool()).await?;
-            pool
-        } else {
-            if !db_file.exists() {
-                File::create(&db_file).with_context(|| {
-                    format!("failed to create database file: {}", db_file.display())
-                })?;
-            }
-            let sqlite_pool = sqlite_connection::create_pool(&db_file, 1).await?;
-            sqlite_connection::run_migrations(&sqlite_pool).await?;
-            drop(sqlite_pool);
-            create_local_pool(&db_file, config.database_max_connections).await?
-        };
-        let raw_pool = pool.pool().clone();
-
-        let doc_data: Option<Arc<RocksDocDataStore>> = match config.doc_data_backend {
-            DocDataBackend::Sqlite => None,
-            DocDataBackend::RocksDb => {
-                let kv_path = Self::resolve_db_path(&config.doc_data_path)?;
-                Some(Arc::new(RocksDocDataStore::open(&kv_path)?))
-            }
-        };
-
-        let doc_data_backend = doc_data
-            .clone()
-            .map(|store| store as Arc<dyn DocDataStoreBackend>);
-
-        let libsql_doc_logs = Arc::new(LibsqlDocUpdateLogStore::new(
-            raw_pool.clone(),
-            doc_data_backend.clone(),
-        ));
-        let doc_snapshots = Arc::new(DocSnapshotStore::new(doc_data_backend.clone()));
-
-        let (doc_update_logs, doc_repo, user_doc_repo): (
-            DocUpdateLogReaderRef,
-            DocRepositoryRef,
-            UserDocRepositoryRef,
-        ) = match config.doc_store_backend {
-            DocStoreBackend::Sql => {
-                let doc_update_logs: DocUpdateLogReaderRef = libsql_doc_logs.clone();
-                let doc_repo = Arc::new(LibsqlDocRepository::new(
-                    raw_pool.clone(),
-                    libsql_doc_logs.clone(),
-                    doc_snapshots.clone(),
-                )) as DocRepositoryRef;
-                let user_doc_repo = Arc::new(LibsqlUserDocRepository::new(
-                    raw_pool.clone(),
-                    libsql_doc_logs.clone(),
-                    doc_snapshots.clone(),
-                )) as UserDocRepositoryRef;
-                (doc_update_logs, doc_repo, user_doc_repo)
-            }
-            DocStoreBackend::RocksDb => {
-                let rocks_store = doc_data.clone().unwrap_or_else(|| {
-                    panic!(
-                        "DocStoreBackend::RocksDb requires DocDataBackend::RocksDb when using libsql"
-                    )
-                });
-                let rocks_doc_logs = Arc::new(
-                    crate::db::rocks::doc_update_log_store::RocksDocUpdateLogStore::new(
-                        rocks_store.clone(),
-                    ),
-                );
-                let links: DocPublicLinkStoreRef =
-                    Arc::new(LibsqlDocPublicLinkStore::new(pool.clone()));
-                let doc_update_logs: DocUpdateLogReaderRef = rocks_doc_logs.clone();
-                let doc_repo = Arc::new(crate::db::rocks::doc_repo::RocksDocRepository::new(
-                    rocks_store.clone(),
-                    rocks_doc_logs.clone(),
-                    links,
-                )) as DocRepositoryRef;
-                let user_doc_repo = Arc::new(
-                    crate::db::rocks::user_doc_repo::RocksUserDocRepository::new(
-                        rocks_store.clone(),
-                        rocks_doc_logs.clone(),
-                    ),
-                ) as UserDocRepositoryRef;
-                (doc_update_logs, doc_repo, user_doc_repo)
-            }
-        };
-        let workspace_repo =
-            Arc::new(LibsqlWorkspaceRepository::new(raw_pool.clone())) as WorkspaceRepositoryRef;
-        let user_repo = Arc::new(LibsqlUserRepository::new(raw_pool.clone())) as UserRepositoryRef;
-        let doc_role_repo =
-            Arc::new(LibsqlDocRoleRepository::new(raw_pool.clone())) as DocRoleRepositoryRef;
-        let comment_repo =
-            Arc::new(LibsqlCommentRepository::new(raw_pool.clone())) as CommentRepositoryRef;
-        let blob_repo = Arc::new(LibsqlBlobRepository::new(raw_pool.clone())) as BlobRepositoryRef;
-        let access_token_repo = Arc::new(LibsqlAccessTokenRepository::new(raw_pool.clone()))
-            as AccessTokenRepositoryRef;
-        let comment_attachment_repo =
-            Arc::new(LibsqlCommentAttachmentRepository::new(raw_pool.clone()))
-                as CommentAttachmentRepositoryRef;
-        let workspace_feature_repo =
-            Arc::new(LibsqlWorkspaceFeatureRepository::new(raw_pool.clone()))
-                as WorkspaceFeatureRepositoryRef;
-        let user_settings_repo = Arc::new(LibsqlUserSettingsRepository::new(raw_pool.clone()))
-            as UserSettingsRepositoryRef;
-
-        let repositories = Arc::new(RepositoryRegistry::new(
-            doc_repo,
-            workspace_repo,
-            user_repo,
-            doc_role_repo,
-            comment_repo,
-            blob_repo,
-            access_token_repo,
-            user_settings_repo,
-            comment_attachment_repo,
-            workspace_feature_repo,
-            user_doc_repo,
-        ));
-
-        Ok(Self {
-            pool: DatabasePool::Libsql(pool),
-            path: data_dir,
-            repositories,
-            doc_update_logs,
-            doc_data,
-            doc_snapshots,
-            backend: DatabaseBackend::Libsql,
-        })
     }
 
     async fn connect_postgres(config: &AppConfig) -> Result<Self> {

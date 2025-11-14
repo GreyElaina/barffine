@@ -26,7 +26,6 @@ use barffine_core::{
     config::{AppConfig, BlobStoreBackend, DatabaseBackend, DocStoreBackend},
     db::Database,
     db::{
-        libsql::notification_center::LibsqlNotificationCenter,
         postgres::notification_center::PostgresNotificationCenter,
         rocks::{blob_store::RocksBlobStorage, notification_center::RocksNotificationCenter},
         sql::blob_store::SqlBlobStorage,
@@ -727,20 +726,6 @@ fn create_notification_center(database: &Database) -> Arc<dyn NotificationCenter
         let backend = value.trim().to_ascii_lowercase();
         if !backend.is_empty() && backend != "auto" {
             match backend.as_str() {
-                "libsql" => match database.backend() {
-                    DatabaseBackend::Libsql => {
-                        info!(
-                            "using LibsqlNotificationCenter (BARFFINE_NOTIFICATION_CENTER_BACKEND={backend})"
-                        );
-                        return Arc::new(LibsqlNotificationCenter::new(database));
-                    }
-                    other => {
-                        panic!(
-                            "BARFFINE_NOTIFICATION_CENTER_BACKEND=libsql requires \
-                             BARFFINE_DATABASE_BACKEND=libsql (current backend: {other:?})"
-                        );
-                    }
-                },
                 "rocksdb" | "rocks" => {
                     if let Some(doc_data) = database.doc_data_store() {
                         info!(
@@ -796,7 +781,6 @@ fn create_notification_center(database: &Database) -> Arc<dyn NotificationCenter
         match database.backend() {
             DatabaseBackend::Sqlite => Arc::new(SqliteNotificationCenter::new(database)),
             DatabaseBackend::Postgres => Arc::new(PostgresNotificationCenter::new(database)),
-            DatabaseBackend::Libsql => Arc::new(LibsqlNotificationCenter::new(database)),
         }
     }
 }

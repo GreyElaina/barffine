@@ -21,10 +21,6 @@ pub struct AppConfig {
     pub database_backend: DatabaseBackend,
     #[serde(default = "default_database_max_connections")]
     pub database_max_connections: u32,
-    #[serde(default)]
-    pub libsql_url: Option<String>,
-    #[serde(default)]
-    pub libsql_auth_token: Option<String>,
     #[serde(default = "default_doc_data_path")]
     pub doc_data_path: String,
     #[serde(default = "DocDataBackend::default")]
@@ -50,8 +46,6 @@ impl Default for AppConfig {
             database_url: None,
             database_backend: DatabaseBackend::default(),
             database_max_connections: default_database_max_connections(),
-            libsql_url: None,
-            libsql_auth_token: None,
             doc_data_path: default_doc_data_path(),
             doc_data_backend: DocDataBackend::default(),
             doc_store_backend: DocStoreBackend::default(),
@@ -72,8 +66,6 @@ impl AppConfig {
     const DOC_STORE_BACKEND_ENV: &'static str = "BARFFINE_DOC_STORE_BACKEND";
     const BLOB_STORE_PATH_ENV: &'static str = "BARFFINE_BLOB_STORE_PATH";
     const BLOB_STORE_BACKEND_ENV: &'static str = "BARFFINE_BLOB_STORE_BACKEND";
-    const LIBSQL_URL_ENV: &'static str = "BARFFINE_LIBSQL_URL";
-    const LIBSQL_AUTH_TOKEN_ENV: &'static str = "BARFFINE_LIBSQL_AUTH_TOKEN";
 
     pub fn load() -> Result<Self> {
         let mut config = Self::default();
@@ -106,20 +98,6 @@ impl AppConfig {
                     Self::DATABASE_MAX_CONNECTIONS_ENV
                 )
             })?;
-        }
-
-        if let Ok(url) = env::var(Self::LIBSQL_URL_ENV) {
-            let trimmed = url.trim().to_owned();
-            if !trimmed.is_empty() {
-                config.libsql_url = Some(trimmed);
-            }
-        }
-
-        if let Ok(token) = env::var(Self::LIBSQL_AUTH_TOKEN_ENV) {
-            let trimmed = token.trim().to_owned();
-            if !trimmed.is_empty() {
-                config.libsql_auth_token = Some(trimmed);
-            }
         }
 
         let mut doc_data_overridden = false;
@@ -200,7 +178,6 @@ fn default_child_path_for_database(base: &str, child: &str) -> String {
 #[serde(rename_all = "lowercase")]
 pub enum DatabaseBackend {
     Sqlite,
-    Libsql,
     Postgres,
 }
 
@@ -245,7 +222,7 @@ impl FromStr for DocDataBackend {
 ///   (current behavior for all database backends).
 /// - `RocksDb` switches to a Rocks-backed doc store only when the
 ///   database backend is SQLite and `DocDataBackend::RocksDb` is
-///   configured; for Postgres/Libsql backends it is treated as an
+///   configured; for Postgres backends it is treated as an
 ///   alias for `Sql` in core, and only affects doc cache behavior
 ///   at the server layer.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -280,7 +257,6 @@ pub enum BlobStoreBackend {
     #[serde(
         rename = "sql",
         alias = "sqlite",
-        alias = "libsql",
         alias = "postgres",
         alias = "postgresql",
         alias = "pg"
@@ -301,7 +277,7 @@ impl FromStr for BlobStoreBackend {
 
     fn from_str(s: &str) -> Result<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "sql" | "sqlite" | "libsql" | "postgres" | "postgresql" | "pg" => {
+            "sql" | "sqlite" | "postgres" | "postgresql" | "pg" => {
                 Ok(BlobStoreBackend::Sql)
             }
             "rocks" | "rocksdb" => Ok(BlobStoreBackend::Rocks),
@@ -318,10 +294,9 @@ impl FromStr for DatabaseBackend {
     fn from_str(s: &str) -> Result<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "sqlite" => Ok(DatabaseBackend::Sqlite),
-            "libsql" => Ok(DatabaseBackend::Libsql),
             "postgres" | "postgresql" | "pg" => Ok(DatabaseBackend::Postgres),
             other => Err(anyhow::anyhow!(
-                "unsupported database backend '{other}' (expected 'sqlite', 'libsql', or 'postgres')"
+                "unsupported database backend '{other}' (expected 'sqlite' or 'postgres')"
             )),
         }
     }

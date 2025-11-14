@@ -169,11 +169,6 @@ async fn configure_backend_choice(config: &mut AppConfig, backend: DatabaseBacke
             set_sqlite_backend(config);
             true
         }
-        DatabaseBackend::Libsql => {
-            config.database_backend = DatabaseBackend::Libsql;
-            config.database_url = None;
-            true
-        }
         DatabaseBackend::Postgres => configure_postgres_backend(config).await,
     }
 }

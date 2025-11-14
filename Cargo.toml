@@ -58,7 +58,5 @@ humantime-serde = "1.1"
 toml = "0.8"
 rocksdb = { version = "0.21.0", default-features = false, features = ["lz4"] }
 bincode = { version = "2.0.1", features = ["serde"] }
-libsql = { version = "0.9.27", default-features = false, features = ["core", "remote", "tls"] }
-deadpool-libsql = { version = "0.1.0", default-features = false, features = ["rt_tokio_1", "core", "remote", "tls"] }
 yrs = "0.24.0"
 futures = "0.3"
