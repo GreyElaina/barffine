@@ -1,9 +1,8 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
-use sqlx::{Pool, Row, Sqlite};
 use uuid::Uuid;
 
-use crate::db::Database;
+use crate::db::{Database, access_token_repo::AccessTokenRepositoryRef};
 
 #[derive(Debug, Clone)]
 pub struct AccessTokenRecord {
@@ -17,60 +16,22 @@ pub struct AccessTokenRecord {
 
 #[derive(Clone)]
 pub struct AccessTokenStore {
-    pool: Pool<Sqlite>,
+    repo: AccessTokenRepositoryRef,
 }
 
 impl AccessTokenStore {
     pub fn new(database: &Database) -> Self {
         Self {
-            pool: database.pool().clone(),
+            repo: database.repositories().access_token_repo(),
         }
     }
 
     pub async fn list(&self, user_id: &str) -> Result<Vec<AccessTokenRecord>> {
-        let rows = sqlx::query(
-            "SELECT id, user_id, name, created_at, expires_at \
-             FROM access_tokens WHERE user_id = ? ORDER BY created_at DESC",
-        )
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await
-        .with_context(|| "failed to list access tokens".to_string())?;
-
-        Ok(rows
-            .into_iter()
-            .map(|row| AccessTokenRecord {
-                id: row.get("id"),
-                user_id: row.get("user_id"),
-                name: row.get("name"),
-                token: None,
-                created_at: row.get::<i64, _>("created_at"),
-                expires_at: row.get::<Option<i64>, _>("expires_at"),
-            })
-            .collect())
+        self.repo.list(user_id).await
     }
 
     pub async fn list_revealed(&self, user_id: &str) -> Result<Vec<AccessTokenRecord>> {
-        let rows = sqlx::query(
-            "SELECT id, user_id, name, token, created_at, expires_at \
-             FROM access_tokens WHERE user_id = ? ORDER BY created_at DESC",
-        )
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await
-        .with_context(|| "failed to list revealed access tokens".to_string())?;
-
-        Ok(rows
-            .into_iter()
-            .map(|row| AccessTokenRecord {
-                id: row.get("id"),
-                user_id: row.get("user_id"),
-                name: row.get("name"),
-                token: Some(row.get("token")),
-                created_at: row.get::<i64, _>("created_at"),
-                expires_at: row.get::<Option<i64>, _>("expires_at"),
-            })
-            .collect())
+        self.repo.list_revealed(user_id).await
     }
 
     pub async fn create(
@@ -83,19 +44,9 @@ impl AccessTokenStore {
         let token = generate_token();
         let created_at = Utc::now().timestamp();
 
-        sqlx::query(
-            "INSERT INTO access_tokens (id, user_id, name, token, created_at, expires_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(user_id)
-        .bind(name)
-        .bind(&token)
-        .bind(created_at)
-        .bind(expires_at)
-        .execute(&self.pool)
-        .await
-        .with_context(|| "failed to create access token".to_string())?;
+        self.repo
+            .insert(&id, user_id, name, &token, created_at, expires_at)
+            .await?;
 
         Ok(AccessTokenRecord {
             id,
@@ -108,37 +59,12 @@ impl AccessTokenStore {
     }
 
     pub async fn revoke(&self, id: &str, user_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM access_tokens WHERE id = ? AND user_id = ?")
-            .bind(id)
-            .bind(user_id)
-            .execute(&self.pool)
-            .await
-            .with_context(|| "failed to revoke access token".to_string())?;
-
-        Ok(())
+        self.repo.delete(id, user_id).await
     }
 
     pub async fn find_active_by_token(&self, token: &str) -> Result<Option<AccessTokenRecord>> {
         let now = Utc::now().timestamp();
-        let row = sqlx::query(
-            "SELECT id, user_id, name, token, created_at, expires_at \
-             FROM access_tokens \
-             WHERE token = ? AND (expires_at IS NULL OR expires_at > ?)",
-        )
-        .bind(token)
-        .bind(now)
-        .fetch_optional(&self.pool)
-        .await
-        .with_context(|| "failed to query access token".to_string())?;
-
-        Ok(row.map(|row| AccessTokenRecord {
-            id: row.get("id"),
-            user_id: row.get("user_id"),
-            name: row.get("name"),
-            token: Some(row.get("token")),
-            created_at: row.get::<i64, _>("created_at"),
-            expires_at: row.get::<Option<i64>, _>("expires_at"),
-        }))
+        self.repo.find_active_by_token(token, now).await
     }
 }
 

@@ -409,18 +409,17 @@ mod tests {
         },
     };
     use serde_json::Value as JsonValue;
-    use sqlx::query;
 
     use crate::{
         auth::generate_password_hash,
         cookies::{SESSION_COOKIE_NAME, USER_COOKIE_NAME},
-        test_support::setup_state,
+        testing::setup_state,
         types::{CreateAdminUserRequest, CreateSessionRequest, PreflightRequest, SignInRequest},
     };
 
     #[tokio::test]
     async fn create_session_sets_cookies() {
-        let (_temp_dir, _database, state) = setup_state().await;
+        let (_temp_dir, database, state) = setup_state().await;
         let password_hash = generate_password_hash("secret").expect("hash password");
         let user = state
             .user_store
@@ -978,7 +977,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_session_rejects_disabled_user() {
-        let (_temp_dir, database, state) = setup_state().await;
+        let (_temp_dir, _database, state) = setup_state().await;
         let password_hash = generate_password_hash("secret").expect("hash password");
         let user = state
             .user_store
@@ -986,9 +985,9 @@ mod tests {
             .await
             .expect("create user");
 
-        query("UPDATE users SET disabled = 1 WHERE id = ?")
-            .bind(&user.id)
-            .execute(database.pool())
+        state
+            .user_store
+            .set_disabled(&user.id, true)
             .await
             .expect("disable user");
 

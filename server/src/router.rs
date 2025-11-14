@@ -212,40 +212,6 @@ fn build_base_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-#[cfg(feature = "legacy-doc-service")]
-fn add_legacy_doc_service_routes(router: Router<AppState>) -> Router<AppState> {
-    router
-        .route(
-            "/rpc/workspaces/{workspace_id}/content",
-            get(get_rpc_workspace_content_handler),
-        )
-        .route(
-            "/rpc/workspaces/{workspace_id}/docs/{doc_id}",
-            get(get_rpc_doc_binary_handler),
-        )
-        .route(
-            "/rpc/workspaces/{workspace_id}/docs/{doc_id}/content",
-            get(get_rpc_doc_content_handler),
-        )
-        .route(
-            "/rpc/workspaces/{workspace_id}/docs/{doc_id}/markdown",
-            get(get_rpc_doc_markdown_handler),
-        )
-        .route(
-            "/rpc/workspaces/{workspace_id}/docs/{doc_id}/diff",
-            post(get_rpc_doc_diff_handler),
-        )
-        .route(
-            "/workspaces/{workspace_id}/docs/{doc_id}/ws",
-            get(doc_ws_handler),
-        )
-        .route(
-            "/api/workspaces/{workspace_id}/docs/{doc_id}/ws",
-            get(doc_ws_handler),
-        )
-}
-
-#[cfg(not(feature = "legacy-doc-service"))]
 fn add_legacy_doc_service_routes(router: Router<AppState>) -> Router<AppState> {
     router
 }

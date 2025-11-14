@@ -8,8 +8,11 @@ use std::{
 };
 
 use anyhow::{Context, anyhow};
+use async_trait::async_trait;
+use dashmap::DashMap;
 use futures_util::FutureExt;
 use moka::{future::Cache, notification::RemovalCause};
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use snap::raw::{Decoder as SnapDecoder, Encoder as SnapEncoder};
 use tokio::{sync::Mutex, time::sleep};
@@ -17,11 +20,15 @@ use tracing::{debug, warn};
 use y_octo::{Doc as YoctoDoc, StateVector as YoctoStateVector};
 
 use barffine_core::{
+    doc_data::DocDataBackend,
     doc_store::{DocumentSnapshot, DocumentStore},
     user_doc_store::UserDocStore,
 };
 
-use crate::socket::rooms::SpaceType;
+use crate::{
+    doc::content::{SnapshotMarkdown, SnapshotPageContent, parse_doc_content, parse_doc_markdown},
+    socket::rooms::SpaceType,
+};
 
 pub type DocCacheResult<T> = anyhow::Result<T>;
 
@@ -127,6 +134,17 @@ pub struct DocCache {
     userspace_store: UserDocStore,
     metrics: DocCacheMetrics,
     config: DocCacheConfig,
+    backend: Arc<dyn DocCacheBackend>,
+    mode: DocCacheMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocCacheMode {
+    /// Full in-memory caching with Moka (current behavior).
+    Cached,
+    /// Bypass mode: no in-memory caching; operations go directly
+    /// to the underlying stores.
+    Bypass,
 }
 
 #[derive(Clone)]
@@ -143,16 +161,106 @@ struct DocHandle {
     adaptive: DocAdaptiveState,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct SnapshotEntry {
     bytes: Vec<u8>,
     encoding: SnapshotEncoding,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 enum SnapshotEncoding {
     Plain,
     Compressed,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct DocCachePersistedState {
+    snapshot: Vec<u8>,
+    encoding: SnapshotEncoding,
+    timestamp: i64,
+    last_editor_id: Option<String>,
+}
+
+impl DocCachePersistedState {
+    fn from_state(state: &DocState) -> DocCacheResult<Self> {
+        Ok(Self {
+            snapshot: state.snapshot.bytes.clone(),
+            encoding: state.snapshot.encoding,
+            timestamp: state.timestamp,
+            last_editor_id: state.last_editor_id.clone(),
+        })
+    }
+}
+
+#[async_trait]
+trait DocCacheBackend: Send + Sync {
+    async fn load(&self, key: &str) -> DocCacheResult<Option<DocCachePersistedState>>;
+    async fn store(&self, key: &str, state: &DocCachePersistedState) -> DocCacheResult<()>;
+    async fn remove(&self, key: &str) -> DocCacheResult<()>;
+}
+
+#[derive(Default)]
+struct InMemoryDocCacheBackend {
+    entries: DashMap<String, DocCachePersistedState>,
+}
+
+#[async_trait]
+impl DocCacheBackend for InMemoryDocCacheBackend {
+    async fn load(&self, key: &str) -> DocCacheResult<Option<DocCachePersistedState>> {
+        Ok(self.entries.get(key).map(|v| v.clone()))
+    }
+
+    async fn store(&self, key: &str, state: &DocCachePersistedState) -> DocCacheResult<()> {
+        self.entries.insert(key.to_string(), state.clone());
+        Ok(())
+    }
+
+    async fn remove(&self, key: &str) -> DocCacheResult<()> {
+        self.entries.remove(key);
+        Ok(())
+    }
+}
+
+struct RocksDocCacheBackend {
+    store: Arc<dyn DocDataBackend>,
+}
+
+impl RocksDocCacheBackend {
+    fn new(store: Arc<dyn DocDataBackend>) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl DocCacheBackend for RocksDocCacheBackend {
+    async fn load(&self, key: &str) -> DocCacheResult<Option<DocCachePersistedState>> {
+        let bytes = self.store.get_cache_entry(key)?;
+        if let Some(bytes) = bytes {
+            let state: DocCachePersistedState =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                    .context("deserialize doc cache entry from rocksdb")?
+                    .0;
+            Ok(Some(state))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn store(&self, key: &str, state: &DocCachePersistedState) -> DocCacheResult<()> {
+        let bytes = bincode::serde::encode_to_vec(state, bincode::config::standard())
+            .context("serialize doc cache entry for rocksdb")?;
+        self.store
+            .put_cache_entry(key, &bytes)
+            .context("write doc cache entry to rocksdb")?;
+        Ok(())
+    }
+
+    async fn remove(&self, key: &str) -> DocCacheResult<()> {
+        self.store
+            .delete_cache_entry(key)
+            .context("delete doc cache entry from rocksdb")?;
+        Ok(())
+    }
 }
 
 struct DocState {
@@ -164,6 +272,9 @@ struct DocState {
     pending_bytes: usize,
     last_editor_id: Option<String>,
     stats: DocStats,
+    content_cache_partial: Option<SnapshotPageContent>,
+    content_cache_full: Option<SnapshotPageContent>,
+    markdown_cache: Option<SnapshotMarkdown>,
 }
 
 struct DocStats {
@@ -284,15 +395,23 @@ pub struct DocCacheBuilder {
     workspace_store: DocumentStore,
     userspace_store: UserDocStore,
     metrics: Option<DocCacheMetrics>,
+    backend: Option<Arc<dyn DocCacheBackend>>,
 }
 
 impl DocCacheBuilder {
-    pub fn new(workspace_store: DocumentStore, userspace_store: UserDocStore) -> Self {
+    pub fn new(
+        workspace_store: DocumentStore,
+        userspace_store: UserDocStore,
+        persistence_store: Option<Arc<dyn DocDataBackend>>,
+    ) -> Self {
         Self {
             config: DocCacheConfig::default(),
             workspace_store,
             userspace_store,
             metrics: None,
+            // Doc cache itself is always in-memory; RocksDB is used
+            // only for log payloads / snapshots via DocDataBackend.
+            backend: Some(Arc::new(InMemoryDocCacheBackend::default())),
         }
     }
 
@@ -356,6 +475,11 @@ impl DocCacheBuilder {
         self
     }
 
+    pub(crate) fn with_backend(mut self, backend: Arc<dyn DocCacheBackend>) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+
     pub fn build(self) -> DocCache {
         let metrics = self.metrics.unwrap_or_default();
         let workspace_store = self.workspace_store.clone();
@@ -363,6 +487,11 @@ impl DocCacheBuilder {
         let eviction_workspace = self.workspace_store.clone();
         let eviction_userspace = self.userspace_store.clone();
         let eviction_metrics = metrics.clone();
+
+        let backend: Arc<dyn DocCacheBackend> = self
+            .backend
+            .unwrap_or_else(|| Arc::new(InMemoryDocCacheBackend::default()));
+        let eviction_backend = backend.clone();
 
         let mut builder = Cache::builder()
             .max_capacity(self.config.max_capacity_bytes)
@@ -378,15 +507,17 @@ impl DocCacheBuilder {
 
         let cache = builder
             .async_eviction_listener(
-                move |_key: Arc<String>, handle: Arc<DocHandle>, cause: RemovalCause| {
+                move |key: Arc<String>, handle: Arc<DocHandle>, cause: RemovalCause| {
                     let workspace_store = eviction_workspace.clone();
                     let userspace_store = eviction_userspace.clone();
                     let metrics = eviction_metrics.clone();
+                    let backend = eviction_backend.clone();
                     async move {
-                        if let Err(err) = handle
+                        let flush_result = handle
                             .flush_if_needed(&workspace_store, &userspace_store, &metrics)
-                            .await
-                        {
+                            .await;
+
+                        if let Err(err) = flush_result {
                             metrics.record_flush_error();
                             warn!(
                                 space_type = ?handle.descriptor.space_type,
@@ -395,6 +526,20 @@ impl DocCacheBuilder {
                                 ?cause,
                                 error = %err,
                                 "failed to flush document on eviction",
+                            );
+                            // If we failed to flush, keep backend entry for safety.
+                            return;
+                        }
+
+                        if let Err(err) = backend.remove(key.as_str()).await {
+                            metrics.record_flush_error();
+                            warn!(
+                                space_type = ?handle.descriptor.space_type,
+                                space_id = %handle.descriptor.space_id,
+                                doc_id = %handle.descriptor.doc_id,
+                                ?cause,
+                                error = %err,
+                                "failed to remove persisted doc cache entry on eviction",
                             );
                         }
                     }
@@ -409,13 +554,34 @@ impl DocCacheBuilder {
             userspace_store,
             metrics,
             config: self.config,
+            backend,
+            mode: DocCacheMode::Cached,
+        }
+    }
+}
+
+impl DocCache {
+    /// Construct a doc cache in "bypass" mode: all operations go directly
+    /// to the underlying stores without using the Moka cache or the
+    /// in-memory backend for persistence.
+    pub fn new_bypass(workspace_store: DocumentStore, userspace_store: UserDocStore) -> Self {
+        let cache = Cache::builder().max_capacity(1).build();
+
+        DocCache {
+            cache,
+            workspace_store,
+            userspace_store,
+            metrics: DocCacheMetrics::default(),
+            config: DocCacheConfig::default(),
+            backend: Arc::new(InMemoryDocCacheBackend::default()),
+            mode: DocCacheMode::Bypass,
         }
     }
 }
 
 impl DocCache {
     pub fn new(workspace_store: DocumentStore, userspace_store: UserDocStore) -> Self {
-        DocCacheBuilder::new(workspace_store, userspace_store).build()
+        DocCacheBuilder::new(workspace_store, userspace_store, None).build()
     }
 
     pub fn metrics(&self) -> DocCacheMetrics {
@@ -428,6 +594,28 @@ impl DocCache {
         space_id: &str,
         doc_id: &str,
     ) -> DocCacheResult<(Vec<u8>, i64)> {
+        if let DocCacheMode::Bypass = self.mode {
+            return match space_type {
+                SpaceType::Workspace => {
+                    let snapshot = self
+                        .workspace_store
+                        .fetch_snapshot_with_timestamp(space_id, doc_id)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow!("workspace document not found: {}/{}", space_id, doc_id)
+                        })?;
+                    Ok((snapshot.snapshot, snapshot.updated_at))
+                }
+                SpaceType::Userspace => {
+                    let snapshot = self
+                        .userspace_store
+                        .ensure_doc_record(space_id, doc_id)
+                        .await?;
+                    Ok((snapshot.snapshot, snapshot.updated_at))
+                }
+            };
+        }
+
         let handle = self
             .get_or_insert_handle(space_type, space_id, doc_id)
             .await?;
@@ -435,6 +623,116 @@ impl DocCache {
 
         let state = handle.inner.lock().await;
         Ok((state.snapshot.to_plain_vec()?, state.timestamp))
+    }
+
+    pub(crate) async fn doc_content_view(
+        &self,
+        space_type: SpaceType,
+        space_id: &str,
+        doc_id: &str,
+        full_summary: bool,
+    ) -> DocCacheResult<SnapshotPageContent> {
+        if let DocCacheMode::Bypass = self.mode {
+            let (snapshot_bytes, _) = self.snapshot(space_type, space_id, doc_id).await?;
+            let parsed = parse_doc_content(&snapshot_bytes, full_summary).unwrap_or_else(|| {
+                SnapshotPageContent {
+                    title: String::new(),
+                    summary: String::new(),
+                }
+            });
+            return Ok(parsed);
+        }
+
+        let handle = self
+            .get_or_insert_handle(space_type, space_id, doc_id)
+            .await?;
+        handle.touch_access();
+        let mut state = handle.inner.lock().await;
+        if full_summary {
+            if let Some(entry) = state.content_cache_full.clone() {
+                return Ok(entry);
+            }
+        } else if let Some(entry) = state.content_cache_partial.clone() {
+            return Ok(entry);
+        }
+
+        let snapshot = state.snapshot.to_plain_vec()?;
+        let parsed =
+            parse_doc_content(&snapshot, full_summary).unwrap_or_else(|| SnapshotPageContent {
+                title: String::new(),
+                summary: String::new(),
+            });
+        if full_summary {
+            state.content_cache_full = Some(parsed.clone());
+        } else {
+            state.content_cache_partial = Some(parsed.clone());
+        }
+        Ok(parsed)
+    }
+
+    pub(crate) async fn doc_markdown_view(
+        &self,
+        space_type: SpaceType,
+        space_id: &str,
+        doc_id: &str,
+    ) -> DocCacheResult<SnapshotMarkdown> {
+        if let DocCacheMode::Bypass = self.mode {
+            let (snapshot_bytes, _) = self.snapshot(space_type, space_id, doc_id).await?;
+            let parsed =
+                parse_doc_markdown(space_id, &snapshot_bytes).unwrap_or_else(|| SnapshotMarkdown {
+                    title: String::new(),
+                    markdown: String::new(),
+                });
+            return Ok(parsed);
+        }
+
+        let handle = self
+            .get_or_insert_handle(space_type, space_id, doc_id)
+            .await?;
+        handle.touch_access();
+        let mut state = handle.inner.lock().await;
+        if let Some(cache) = state.markdown_cache.clone() {
+            return Ok(cache);
+        }
+
+        let snapshot = state.snapshot.to_plain_vec()?;
+        let parsed = parse_doc_markdown(space_id, &snapshot).unwrap_or_else(|| SnapshotMarkdown {
+            title: String::new(),
+            markdown: String::new(),
+        });
+        state.markdown_cache = Some(parsed.clone());
+        Ok(parsed)
+    }
+
+    pub(crate) async fn prime_snapshot(
+        &self,
+        space_type: SpaceType,
+        space_id: &str,
+        doc_id: &str,
+        snapshot: Vec<u8>,
+        timestamp: i64,
+    ) -> DocCacheResult<()> {
+        if let DocCacheMode::Bypass = self.mode {
+            // No-op in bypass mode; next snapshot call will read directly
+            // from the underlying store.
+            return Ok(());
+        }
+
+        let descriptor = DocDescriptor {
+            space_type,
+            space_id: space_id.to_owned(),
+            doc_id: doc_id.to_owned(),
+        };
+        let handle = Arc::new(DocHandle::from_snapshot_bytes(
+            descriptor,
+            snapshot,
+            timestamp,
+            &self.config,
+        )?);
+        let key = Self::key(space_type, space_id, doc_id);
+        self.persist_handle_state(&key, &handle).await?;
+        self.cache.insert(key, handle).await;
+        Ok(())
     }
 
     pub async fn apply_updates(
@@ -445,10 +743,63 @@ impl DocCache {
         updates: Vec<Vec<u8>>,
         editor_id: Option<&str>,
     ) -> DocCacheResult<DocCacheApplyResult> {
+        if let DocCacheMode::Bypass = self.mode {
+            if updates.is_empty() {
+                let (snapshot, ts) = self.snapshot(space_type, space_id, doc_id).await?;
+                return Ok(DocCacheApplyResult {
+                    snapshot,
+                    timestamp: ts,
+                });
+            }
+
+            let timestamp = chrono::Utc::now().timestamp_millis();
+
+            match space_type {
+                SpaceType::Workspace => {
+                    self.workspace_store
+                        .append_doc_updates(space_id, doc_id, &updates, editor_id, timestamp)
+                        .await?;
+
+                    let snap = self
+                        .workspace_store
+                        .fetch_snapshot_with_timestamp(space_id, doc_id)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "workspace document not found after updates: {}/{}",
+                                space_id,
+                                doc_id
+                            )
+                        })?;
+
+                    return Ok(DocCacheApplyResult {
+                        snapshot: snap.snapshot,
+                        timestamp: snap.updated_at,
+                    });
+                }
+                SpaceType::Userspace => {
+                    self.userspace_store
+                        .append_doc_updates(space_id, doc_id, &updates, editor_id, timestamp)
+                        .await?;
+
+                    let snap = self
+                        .userspace_store
+                        .ensure_doc_record(space_id, doc_id)
+                        .await?;
+
+                    return Ok(DocCacheApplyResult {
+                        snapshot: snap.snapshot,
+                        timestamp: snap.updated_at,
+                    });
+                }
+            }
+        }
+
         if updates.is_empty() {
             return Err(anyhow!("updates payload must not be empty"));
         }
 
+        let key = Self::key(space_type, space_id, doc_id);
         let handle = self
             .get_or_insert_handle(space_type, space_id, doc_id)
             .await?;
@@ -500,6 +851,9 @@ impl DocCache {
             .replace(snapshot.clone(), self.config.snapshot_mode)?;
         state.timestamp = timestamp;
         state.last_editor_id = editor_id.map(str::to_owned);
+        state.content_cache_partial = None;
+        state.content_cache_full = None;
+        state.markdown_cache = None;
         let now_ms = current_time_millis();
         if let Some(adaptive) = &self.config.adaptive {
             state
@@ -528,6 +882,7 @@ impl DocCache {
             timestamp,
         };
         drop(state);
+        self.persist_handle_state(&key, &handle).await?;
 
         if should_flush_now {
             handle
@@ -554,6 +909,10 @@ impl DocCache {
         space_id: &str,
         doc_id: &str,
     ) -> DocCacheResult<()> {
+        if let DocCacheMode::Bypass = self.mode {
+            // No per-session tracking in bypass mode.
+            return Ok(());
+        }
         let handle = self
             .get_or_insert_handle(space_type, space_id, doc_id)
             .await?;
@@ -562,6 +921,9 @@ impl DocCache {
     }
 
     pub async fn close_session(&self, space_type: SpaceType, space_id: &str, doc_id: &str) {
+        if let DocCacheMode::Bypass = self.mode {
+            return;
+        }
         let key = Self::key(space_type, space_id, doc_id);
         if let Some(handle) = self.cache.get(&key).await {
             if handle.decrement_sessions() {
@@ -584,6 +946,11 @@ impl DocCache {
     }
 
     pub async fn invalidate(&self, space_type: SpaceType, space_id: &str, doc_id: &str) {
+        if let DocCacheMode::Bypass = self.mode {
+            // Flush is done directly via apply_updates in bypass mode; invalidation
+            // just means subsequent reads will go to storage.
+            return;
+        }
         let key = Self::key(space_type, space_id, doc_id);
         if let Some(handle) = self.cache.get(&key).await {
             if let Err(err) = handle
@@ -600,9 +967,15 @@ impl DocCache {
             }
         }
         self.cache.invalidate(&key).await;
+        if let Err(err) = self.backend.remove(&key).await {
+            warn!(space_type = ?space_type, space_id, doc_id, error = %err, "failed to drop persisted doc cache entry");
+        }
     }
 
     pub async fn reap_idle_entries(&self, idle_after: Duration) {
+        if let DocCacheMode::Bypass = self.mode {
+            return;
+        }
         let idle_ms = idle_after.as_millis() as i64;
         if idle_ms <= 0 {
             return;
@@ -630,17 +1003,30 @@ impl DocCache {
         doc_id: &str,
     ) -> DocCacheResult<Arc<DocHandle>> {
         let key = Self::key(space_type, space_id, doc_id);
+        let descriptor = DocDescriptor {
+            space_type,
+            space_id: space_id.to_owned(),
+            doc_id: doc_id.to_owned(),
+        };
         if let Some(handle) = self.cache.get(&key).await {
             self.metrics.record_hit();
             return Ok(handle);
         }
 
         self.metrics.record_miss();
+        if let Some(persisted) = self.backend.load(&key).await? {
+            let handle = Arc::new(DocHandle::from_persisted_state(
+                descriptor.clone(),
+                persisted,
+                &self.config,
+            )?);
+            self.cache.insert(key, handle.clone()).await;
+            return Ok(handle);
+        }
+
         let handle = Arc::new(
             DocHandle::load_initial(
-                space_type,
-                space_id.to_owned(),
-                doc_id.to_owned(),
+                descriptor,
                 &self.workspace_store,
                 &self.userspace_store,
                 &self.config,
@@ -652,12 +1038,21 @@ impl DocCache {
             })?,
         );
 
+        self.persist_handle_state(&key, &handle).await?;
         self.cache.insert(key, handle.clone()).await;
         Ok(handle)
     }
 
     fn key(space_type: SpaceType, space_id: &str, doc_id: &str) -> String {
         format!("{}:{}:{}", space_type.as_str(), space_id, doc_id)
+    }
+
+    async fn persist_handle_state(&self, key: &str, handle: &Arc<DocHandle>) -> DocCacheResult<()> {
+        let persisted = {
+            let state = handle.inner.lock().await;
+            DocCachePersistedState::from_state(&state)?
+        };
+        self.backend.store(key, &persisted).await
     }
 
     /// Immediately evict cache entries that have no active sessions and no pending updates.
@@ -683,19 +1078,11 @@ impl DocCache {
 
 impl DocHandle {
     async fn load_initial(
-        space_type: SpaceType,
-        space_id: String,
-        doc_id: String,
+        descriptor: DocDescriptor,
         workspace_store: &DocumentStore,
         userspace_store: &UserDocStore,
         config: &DocCacheConfig,
     ) -> DocCacheResult<Self> {
-        let descriptor = DocDescriptor {
-            space_type,
-            space_id,
-            doc_id,
-        };
-
         let (snapshot, timestamp) = match descriptor.space_type {
             SpaceType::Workspace => {
                 let DocumentSnapshot {
@@ -721,17 +1108,52 @@ impl DocHandle {
             }
         };
 
-        let (doc, raw_snapshot) = if snapshot.is_empty() {
-            (YoctoDoc::new(), snapshot)
+        Self::from_snapshot_bytes(descriptor, snapshot, timestamp, config)
+    }
+
+    fn from_persisted_state(
+        descriptor: DocDescriptor,
+        persisted: DocCachePersistedState,
+        config: &DocCacheConfig,
+    ) -> DocCacheResult<Self> {
+        let snapshot_entry = SnapshotEntry {
+            bytes: persisted.snapshot,
+            encoding: persisted.encoding,
+        };
+        Self::from_snapshot_entry(
+            descriptor,
+            snapshot_entry,
+            persisted.timestamp,
+            persisted.last_editor_id,
+            config,
+        )
+    }
+
+    fn from_snapshot_bytes(
+        descriptor: DocDescriptor,
+        snapshot: Vec<u8>,
+        timestamp: i64,
+        config: &DocCacheConfig,
+    ) -> DocCacheResult<Self> {
+        let snapshot_entry = SnapshotEntry::new(snapshot, config.snapshot_mode)?;
+        Self::from_snapshot_entry(descriptor, snapshot_entry, timestamp, None, config)
+    }
+
+    fn from_snapshot_entry(
+        descriptor: DocDescriptor,
+        snapshot_entry: SnapshotEntry,
+        timestamp: i64,
+        last_editor_id: Option<String>,
+        config: &DocCacheConfig,
+    ) -> DocCacheResult<Self> {
+        let doc_bytes = snapshot_entry.to_plain_vec()?;
+        let doc = if doc_bytes.is_empty() {
+            YoctoDoc::new()
         } else {
-            (
-                YoctoDoc::try_from_binary_v1(&snapshot)
-                    .context("decode yocto snapshot for cache entry")?,
-                snapshot,
-            )
+            YoctoDoc::try_from_binary_v1(&doc_bytes)
+                .context("decode yocto snapshot for cache entry")?
         };
         let state_vector = doc.get_state_vector();
-        let snapshot_entry = SnapshotEntry::new(raw_snapshot, config.snapshot_mode)?;
         let pending = VecDeque::new();
         let estimated_bytes = snapshot_entry.len();
         let now = current_time_millis();
@@ -756,8 +1178,11 @@ impl DocHandle {
                 timestamp,
                 pending,
                 pending_bytes: 0,
-                last_editor_id: None,
+                last_editor_id,
                 stats: DocStats::new(now),
+                content_cache_partial: None,
+                content_cache_full: None,
+                markdown_cache: None,
             }),
             estimated_bytes: AtomicUsize::new(estimated_bytes),
             adaptive: DocAdaptiveState::default(),
@@ -872,6 +1297,39 @@ impl DocHandle {
 
         match persist_result {
             Ok(()) => {
+                // For workspace documents, use the in-memory snapshot to backfill
+                // missing metadata so that read paths (e.g. document listing) do
+                // not need to re-parse snapshots.
+                if let SpaceType::Workspace = descriptor.space_type {
+                    match state.snapshot.to_plain_vec() {
+                        Ok(snapshot_bytes) => {
+                            if let Err(err) = workspace_store
+                                .backfill_metadata_from_snapshot(
+                                    &descriptor.space_id,
+                                    &descriptor.doc_id,
+                                    &snapshot_bytes,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    workspace_id = %descriptor.space_id,
+                                    doc_id = %descriptor.doc_id,
+                                    error = %err,
+                                    "failed to backfill document metadata after cache flush",
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            warn!(
+                                workspace_id = %descriptor.space_id,
+                                doc_id = %descriptor.doc_id,
+                                error = %err,
+                                "failed to decode snapshot for metadata backfill after cache flush",
+                            );
+                        }
+                    }
+                }
+
                 state.pending.clear();
                 state.pending_bytes = 0;
                 metrics.observe_pending_bytes(0);

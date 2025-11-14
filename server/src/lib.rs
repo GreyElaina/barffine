@@ -12,10 +12,10 @@ pub mod handlers;
 pub mod http;
 pub mod oauth;
 pub mod observability;
+pub mod request_cache;
 pub mod router;
 pub mod socket;
 pub mod state;
-pub mod testing;
 pub mod types;
 pub mod user;
 pub mod utils;
@@ -28,4 +28,4 @@ pub const DEFAULT_HISTORY_LIMIT: i64 = 20;
 pub const MAX_HISTORY_LIMIT: i64 = 100;
 
 #[cfg(test)]
-pub mod test_support;
+pub mod testing;

@@ -153,7 +153,7 @@ mod tests {
 
     use crate::{
         cookies::SESSION_COOKIE_NAME,
-        test_support::{seed_workspace, setup_state},
+        testing::{seed_workspace, setup_state},
         types::BlobDownloadQuery,
     };
 

@@ -71,18 +71,6 @@ pub(crate) async fn get_workspace_content_handler(
     Ok(Json(response))
 }
 
-#[allow(dead_code)]
-#[cfg(feature = "legacy-doc-service")]
-pub(crate) async fn get_rpc_workspace_content_handler(
-    Path(workspace_id): Path<String>,
-    State(workspaces): State<Arc<WorkspaceService>>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, AppError> {
-    let response = workspace_content_response(&workspaces, &workspace_id, &headers, true).await?;
-
-    Ok(Json(response))
-}
-
 pub(crate) async fn ensure_workspace_exists(
     state: &AppState,
     workspace_id: &str,
@@ -131,7 +119,7 @@ mod tests {
         http::{HeaderMap, StatusCode},
     };
 
-    use crate::test_support::{seed_workspace, setup_state};
+    use crate::testing::{seed_workspace, setup_state};
 
     #[tokio::test]
     async fn get_workspace_content_handler_returns_workspace() {

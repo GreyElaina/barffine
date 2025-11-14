@@ -1,71 +1,28 @@
-use std::sync::Arc;
-
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::{Value as JsonValue, json};
-use sqlx::{Pool, Row, Sqlite};
 
 use crate::{
-    db::Database,
+    db::{
+        Database,
+        comment_repo::{CommentChangeRow, CommentRepositoryRef},
+    },
     notification::{
         CommentChangeAction, CommentChangeRecord, CommentRecord, CommentRecordWithCursor,
-        CommentReplyRecord, CommentStore, CommentVisibility,
+        CommentReplyRecord, CommentStore,
     },
 };
 
 #[derive(Clone)]
-pub struct SqliteCommentStore {
-    pool: Arc<Pool<Sqlite>>,
+pub struct RepositoryCommentStore {
+    comment_repo: CommentRepositoryRef,
 }
 
-impl SqliteCommentStore {
+impl RepositoryCommentStore {
     pub fn new(database: &Database) -> Self {
         Self {
-            pool: Arc::new(database.pool().clone()),
-        }
-    }
-
-    fn serialize_body(body: &str) -> String {
-        body.to_owned()
-    }
-
-    fn deserialize_body(body: &str) -> String {
-        body.to_owned()
-    }
-
-    fn serialize_metadata(metadata: &JsonValue) -> String {
-        serde_json::to_string(metadata).unwrap_or_else(|_| "null".to_string())
-    }
-
-    fn deserialize_metadata(value: &str) -> JsonValue {
-        serde_json::from_str(value).unwrap_or(JsonValue::Null)
-    }
-
-    fn map_comment(row: sqlx::sqlite::SqliteRow) -> CommentRecord {
-        CommentRecord {
-            id: row.get("id"),
-            workspace_id: row.get("workspace_id"),
-            doc_id: row.get("doc_id"),
-            author_id: row.get("author_id"),
-            body: Self::deserialize_body(row.get("body")),
-            visibility: CommentVisibility::Workspace,
-            metadata: Self::deserialize_metadata(row.get("metadata")),
-            resolved: row.get::<i64, _>("resolved") != 0,
-            created_at: DateTime::<Utc>::from_timestamp(row.get("created_at"), 0).unwrap(),
-            updated_at: DateTime::<Utc>::from_timestamp(row.get("updated_at"), 0).unwrap(),
-        }
-    }
-
-    fn map_reply(row: sqlx::sqlite::SqliteRow) -> CommentReplyRecord {
-        CommentReplyRecord {
-            id: row.get("id"),
-            comment_id: row.get("comment_id"),
-            author_id: row.get("author_id"),
-            body: Self::deserialize_body(row.get("body")),
-            metadata: Self::deserialize_metadata(row.get("metadata")),
-            created_at: DateTime::<Utc>::from_timestamp(row.get("created_at"), 0).unwrap(),
-            updated_at: DateTime::<Utc>::from_timestamp(row.get("updated_at"), 0).unwrap(),
+            comment_repo: database.repositories().comment_repo(),
         }
     }
 
@@ -101,161 +58,14 @@ impl SqliteCommentStore {
             "updatedAt": timestamp.to_rfc3339(),
         })
     }
-
-    fn action_to_str(action: CommentChangeAction) -> &'static str {
-        match action {
-            CommentChangeAction::Update => "update",
-            CommentChangeAction::Delete => "delete",
-        }
-    }
-
-    fn action_from_str(value: &str) -> CommentChangeAction {
-        match value {
-            "delete" => CommentChangeAction::Delete,
-            _ => CommentChangeAction::Update,
-        }
-    }
-
-    async fn insert_comment_change(
-        &self,
-        workspace_id: &str,
-        doc_id: &str,
-        comment_id: Option<&str>,
-        reply_id: Option<&str>,
-        action: CommentChangeAction,
-        payload: &JsonValue,
-        updated_at: DateTime<Utc>,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO doc_comment_changes (workspace_id, doc_id, comment_id, reply_id, action, payload, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(workspace_id)
-        .bind(doc_id)
-        .bind(comment_id)
-        .bind(reply_id)
-        .bind(Self::action_to_str(action))
-        .bind(serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string()))
-        .bind(updated_at.timestamp())
-        .execute(&*self.pool)
-        .await?;
-
-        Ok(())
-    }
 }
 
 #[async_trait]
-impl CommentStore for SqliteCommentStore {
+impl CommentStore for RepositoryCommentStore {
     async fn create(&self, comment: CommentRecord) -> Result<CommentRecord> {
-        sqlx::query(
-            "INSERT INTO doc_comments (id, workspace_id, doc_id, author_id, body, metadata, resolved, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&comment.id)
-        .bind(&comment.workspace_id)
-        .bind(&comment.doc_id)
-        .bind(&comment.author_id)
-        .bind(Self::serialize_body(&comment.body))
-        .bind(Self::serialize_metadata(&comment.metadata))
-        .bind(if comment.resolved { 1 } else { 0 })
-        .bind(comment.created_at.timestamp())
-        .bind(comment.updated_at.timestamp())
-        .execute(&*self.pool)
-        .await?;
-
-        self.insert_comment_change(
-            &comment.workspace_id,
-            &comment.doc_id,
-            Some(&comment.id),
-            None,
-            CommentChangeAction::Update,
-            &Self::comment_payload(&comment),
-            comment.updated_at,
-        )
-        .await?;
-
-        Ok(comment)
-    }
-
-    async fn find(&self, comment_id: &str) -> Result<Option<CommentRecord>> {
-        let row = sqlx::query(
-            "SELECT id, workspace_id, doc_id, author_id, body, metadata, resolved, created_at, updated_at FROM doc_comments WHERE id = ?",
-        )
-        .bind(comment_id)
-        .fetch_optional(&*self.pool)
-        .await?;
-
-        Ok(row.map(Self::map_comment))
-    }
-
-    async fn list_for_doc(&self, workspace_id: &str, doc_id: &str) -> Result<Vec<CommentRecord>> {
-        let rows = sqlx::query(
-            "SELECT id, workspace_id, doc_id, author_id, body, metadata, resolved, created_at, updated_at FROM doc_comments WHERE workspace_id = ? AND doc_id = ? ORDER BY created_at ASC",
-        )
-        .bind(workspace_id)
-        .bind(doc_id)
-        .fetch_all(&*self.pool)
-        .await?;
-
-        Ok(rows.into_iter().map(Self::map_comment).collect())
-    }
-
-    async fn update(&self, comment: CommentRecord) -> Result<CommentRecord> {
-        sqlx::query("UPDATE doc_comments SET body = ?, metadata = ?, updated_at = ? WHERE id = ?")
-            .bind(Self::serialize_body(&comment.body))
-            .bind(Self::serialize_metadata(&comment.metadata))
-            .bind(comment.updated_at.timestamp())
-            .bind(&comment.id)
-            .execute(&*self.pool)
-            .await?;
-
-        self.insert_comment_change(
-            &comment.workspace_id,
-            &comment.doc_id,
-            Some(&comment.id),
-            None,
-            CommentChangeAction::Update,
-            &Self::comment_payload(&comment),
-            comment.updated_at,
-        )
-        .await?;
-
-        Ok(comment)
-    }
-
-    async fn delete(&self, comment_id: &str) -> Result<()> {
-        let existing = self.find(comment_id).await?;
-        let timestamp = Utc::now();
-
-        sqlx::query("DELETE FROM doc_comments WHERE id = ?")
-            .bind(comment_id)
-            .execute(&*self.pool)
-            .await?;
-
-        if let Some(comment) = existing {
-            self.insert_comment_change(
-                &comment.workspace_id,
-                &comment.doc_id,
-                Some(&comment.id),
-                None,
-                CommentChangeAction::Delete,
-                &Self::deletion_payload(timestamp),
-                timestamp,
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    async fn resolve(&self, comment_id: &str, resolved: bool) -> Result<()> {
-        sqlx::query("UPDATE doc_comments SET resolved = ?, updated_at = ? WHERE id = ?")
-            .bind(if resolved { 1 } else { 0 })
-            .bind(Utc::now().timestamp())
-            .bind(comment_id)
-            .execute(&*self.pool)
-            .await?;
-
-        if let Some(comment) = self.find(comment_id).await? {
-            self.insert_comment_change(
+        self.comment_repo.insert_comment(&comment).await?;
+        self.comment_repo
+            .insert_comment_change(
                 &comment.workspace_id,
                 &comment.doc_id,
                 Some(&comment.id),
@@ -265,125 +75,153 @@ impl CommentStore for SqliteCommentStore {
                 comment.updated_at,
             )
             .await?;
+
+        Ok(comment)
+    }
+
+    async fn find(&self, comment_id: &str) -> Result<Option<CommentRecord>> {
+        self.comment_repo.fetch_comment(comment_id).await
+    }
+
+    async fn list_for_doc(&self, workspace_id: &str, doc_id: &str) -> Result<Vec<CommentRecord>> {
+        self.comment_repo.list_for_doc(workspace_id, doc_id).await
+    }
+
+    async fn count_for_doc(&self, workspace_id: &str, doc_id: &str) -> Result<i64> {
+        self.comment_repo.count_for_doc(workspace_id, doc_id).await
+    }
+
+    async fn update(&self, comment: CommentRecord) -> Result<CommentRecord> {
+        self.comment_repo.update_comment(&comment).await?;
+        self.comment_repo
+            .insert_comment_change(
+                &comment.workspace_id,
+                &comment.doc_id,
+                Some(&comment.id),
+                None,
+                CommentChangeAction::Update,
+                &Self::comment_payload(&comment),
+                comment.updated_at,
+            )
+            .await?;
+
+        Ok(comment)
+    }
+
+    async fn delete(&self, comment_id: &str) -> Result<()> {
+        let existing = self.comment_repo.fetch_comment(comment_id).await?;
+        let timestamp = Utc::now();
+
+        self.comment_repo.delete_comment(comment_id).await?;
+
+        if let Some(comment) = existing {
+            self.comment_repo
+                .insert_comment_change(
+                    &comment.workspace_id,
+                    &comment.doc_id,
+                    Some(&comment.id),
+                    None,
+                    CommentChangeAction::Delete,
+                    &Self::deletion_payload(timestamp),
+                    timestamp,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn resolve(&self, comment_id: &str, resolved: bool) -> Result<()> {
+        let updated_at = Utc::now();
+        self.comment_repo
+            .set_comment_resolved(comment_id, resolved, updated_at)
+            .await?;
+
+        if let Some(comment) = self.comment_repo.fetch_comment(comment_id).await? {
+            self.comment_repo
+                .insert_comment_change(
+                    &comment.workspace_id,
+                    &comment.doc_id,
+                    Some(&comment.id),
+                    None,
+                    CommentChangeAction::Update,
+                    &Self::comment_payload(&comment),
+                    comment.updated_at,
+                )
+                .await?;
         }
         Ok(())
     }
 
     async fn create_reply(&self, reply: CommentReplyRecord) -> Result<CommentReplyRecord> {
-        sqlx::query(
-            "INSERT INTO doc_comment_replies (id, comment_id, author_id, body, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&reply.id)
-        .bind(&reply.comment_id)
-        .bind(&reply.author_id)
-        .bind(Self::serialize_body(&reply.body))
-        .bind(Self::serialize_metadata(&reply.metadata))
-        .bind(reply.created_at.timestamp())
-        .bind(reply.updated_at.timestamp())
-        .execute(&*self.pool)
-        .await?;
+        self.comment_repo.insert_reply(&reply).await?;
 
-        if let Some(parent) = self.find(&reply.comment_id).await? {
-            self.insert_comment_change(
-                &parent.workspace_id,
-                &parent.doc_id,
-                Some(&parent.id),
-                Some(&reply.id),
-                CommentChangeAction::Update,
-                &Self::reply_payload(&reply),
-                reply.updated_at,
-            )
-            .await?;
+        if let Some(parent) = self.comment_repo.fetch_comment(&reply.comment_id).await? {
+            self.comment_repo
+                .insert_comment_change(
+                    &parent.workspace_id,
+                    &parent.doc_id,
+                    Some(&parent.id),
+                    Some(&reply.id),
+                    CommentChangeAction::Update,
+                    &Self::reply_payload(&reply),
+                    reply.updated_at,
+                )
+                .await?;
         }
 
         Ok(reply)
     }
 
     async fn find_reply(&self, reply_id: &str) -> Result<Option<CommentReplyRecord>> {
-        let row = sqlx::query(
-            "SELECT id, comment_id, author_id, body, metadata, created_at, updated_at FROM doc_comment_replies WHERE id = ?",
-        )
-        .bind(reply_id)
-        .fetch_optional(&*self.pool)
-        .await?;
-
-        Ok(row.map(Self::map_reply))
+        self.comment_repo.fetch_reply(reply_id).await
     }
 
     async fn list_replies(&self, comment_id: &str) -> Result<Vec<CommentReplyRecord>> {
-        let rows = sqlx::query(
-            "SELECT id, comment_id, author_id, body, metadata, created_at, updated_at FROM doc_comment_replies WHERE comment_id = ? ORDER BY created_at ASC",
-        )
-        .bind(comment_id)
-        .fetch_all(&*self.pool)
-        .await?;
-
-        Ok(rows.into_iter().map(Self::map_reply).collect())
+        self.comment_repo.list_replies(comment_id).await
     }
 
     async fn update_reply(&self, reply: CommentReplyRecord) -> Result<CommentReplyRecord> {
-        sqlx::query(
-            "UPDATE doc_comment_replies SET body = ?, metadata = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(Self::serialize_body(&reply.body))
-        .bind(Self::serialize_metadata(&reply.metadata))
-        .bind(reply.updated_at.timestamp())
-        .bind(&reply.id)
-        .execute(&*self.pool)
-        .await?;
+        self.comment_repo.update_reply(&reply).await?;
 
-        if let Some(parent) = self.find(&reply.comment_id).await? {
-            self.insert_comment_change(
-                &parent.workspace_id,
-                &parent.doc_id,
-                Some(&parent.id),
-                Some(&reply.id),
-                CommentChangeAction::Update,
-                &Self::reply_payload(&reply),
-                reply.updated_at,
-            )
-            .await?;
+        if let Some(parent) = self.comment_repo.fetch_comment(&reply.comment_id).await? {
+            self.comment_repo
+                .insert_comment_change(
+                    &parent.workspace_id,
+                    &parent.doc_id,
+                    Some(&parent.id),
+                    Some(&reply.id),
+                    CommentChangeAction::Update,
+                    &Self::reply_payload(&reply),
+                    reply.updated_at,
+                )
+                .await?;
         }
 
         Ok(reply)
     }
 
     async fn delete_reply(&self, reply_id: &str) -> Result<()> {
-        let existing = self.find_reply(reply_id).await?;
+        let existing = self.comment_repo.fetch_reply(reply_id).await?;
         let timestamp = Utc::now();
 
-        sqlx::query("DELETE FROM doc_comment_replies WHERE id = ?")
-            .bind(reply_id)
-            .execute(&*self.pool)
-            .await?;
+        self.comment_repo.delete_reply(reply_id).await?;
 
         if let Some(reply) = existing {
-            if let Some(parent) = self.find(&reply.comment_id).await? {
-                self.insert_comment_change(
-                    &parent.workspace_id,
-                    &parent.doc_id,
-                    Some(&parent.id),
-                    Some(&reply.id),
-                    CommentChangeAction::Delete,
-                    &Self::deletion_payload(timestamp),
-                    timestamp,
-                )
-                .await?;
+            if let Some(parent) = self.comment_repo.fetch_comment(&reply.comment_id).await? {
+                self.comment_repo
+                    .insert_comment_change(
+                        &parent.workspace_id,
+                        &parent.doc_id,
+                        Some(&parent.id),
+                        Some(&reply.id),
+                        CommentChangeAction::Delete,
+                        &Self::deletion_payload(timestamp),
+                        timestamp,
+                    )
+                    .await?;
             }
         }
         Ok(())
-    }
-
-    async fn count_for_doc(&self, workspace_id: &str, doc_id: &str) -> Result<i64> {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM doc_comments WHERE workspace_id = ? AND doc_id = ?",
-        )
-        .bind(workspace_id)
-        .bind(doc_id)
-        .fetch_one(&*self.pool)
-        .await?;
-
-        Ok(count)
     }
 
     async fn list_comments_paginated(
@@ -394,46 +232,9 @@ impl CommentStore for SqliteCommentStore {
         after_sid: Option<i64>,
     ) -> Result<Vec<CommentRecordWithCursor>> {
         let limit = limit.max(1);
-        let rows = if let Some(after) = after_sid {
-            sqlx::query(
-                "SELECT rowid AS sid, id, workspace_id, doc_id, author_id, body, metadata, resolved, created_at, updated_at
-                 FROM doc_comments
-                 WHERE workspace_id = ?
-                   AND doc_id = ?
-                   AND rowid < ?
-                 ORDER BY sid DESC
-                 LIMIT ?",
-            )
-            .bind(workspace_id)
-            .bind(doc_id)
-            .bind(after)
-            .bind(limit)
-            .fetch_all(&*self.pool)
-            .await?
-        } else {
-            sqlx::query(
-                "SELECT rowid AS sid, id, workspace_id, doc_id, author_id, body, metadata, resolved, created_at, updated_at
-                 FROM doc_comments
-                 WHERE workspace_id = ?
-                   AND doc_id = ?
-                 ORDER BY sid DESC
-                 LIMIT ?",
-            )
-            .bind(workspace_id)
-            .bind(doc_id)
-            .bind(limit)
-            .fetch_all(&*self.pool)
-            .await?
-        };
-
-        Ok(rows
-            .into_iter()
-            .map(|row| {
-                let sid = row.get::<i64, _>("sid");
-                let record = Self::map_comment(row);
-                CommentRecordWithCursor { record, sid }
-            })
-            .collect())
+        self.comment_repo
+            .list_comments_paginated(workspace_id, doc_id, limit, after_sid)
+            .await
     }
 
     async fn list_comment_changes(
@@ -442,72 +243,92 @@ impl CommentStore for SqliteCommentStore {
         doc_id: &str,
         after_comment_ts: Option<i64>,
         after_reply_ts: Option<i64>,
+        after_comment_change_id: Option<i64>,
+        after_reply_change_id: Option<i64>,
         limit: i64,
     ) -> Result<Vec<CommentChangeRecord>> {
         let limit = limit.max(1);
-        let baseline = after_comment_ts
+        let baseline_ts = after_comment_ts
             .into_iter()
             .chain(after_reply_ts.into_iter())
-            .min()
-            .unwrap_or(0);
+            .min();
+        let baseline = baseline_ts.unwrap_or(0);
+
+        let baseline_row_id = baseline_ts.and_then(|ts| {
+            if after_comment_ts == Some(ts) {
+                after_comment_change_id
+            } else if after_reply_ts == Some(ts) {
+                after_reply_change_id
+            } else {
+                None
+            }
+        });
 
         let fetch_limit = limit.saturating_mul(3);
 
-        let rows = sqlx::query(
-            "SELECT id, comment_id, reply_id, action, payload, updated_at
-             FROM doc_comment_changes
-             WHERE workspace_id = ?
-               AND doc_id = ?
-               AND updated_at > ?
-             ORDER BY updated_at ASC, id ASC
-             LIMIT ?",
-        )
-        .bind(workspace_id)
-        .bind(doc_id)
-        .bind(baseline)
-        .bind(fetch_limit)
-        .fetch_all(&*self.pool)
-        .await?;
+        let rows = self
+            .comment_repo
+            .list_comment_changes(workspace_id, doc_id, baseline, baseline_row_id, fetch_limit)
+            .await?;
 
         let mut changes = Vec::new();
         for row in rows {
-            let updated_at = DateTime::<Utc>::from_timestamp(row.get("updated_at"), 0).unwrap();
-            let comment_id: Option<String> = row
-                .try_get::<Option<String>, _>("comment_id")
-                .unwrap_or(None);
-            let reply_id: Option<String> =
-                row.try_get::<Option<String>, _>("reply_id").unwrap_or(None);
+            let CommentChangeRow {
+                row_id,
+                comment_id,
+                reply_id,
+                action,
+                payload,
+                updated_at,
+            } = row;
 
-            let item_id = reply_id.clone().or_else(|| comment_id.clone());
+            let item_id = reply_id.clone().or(comment_id.clone());
             let Some(item_id) = item_id else {
                 continue;
             };
 
+            let updated_ts = updated_at.timestamp();
             let is_reply = reply_id.is_some();
             if is_reply {
                 if let Some(ts) = after_reply_ts {
-                    if updated_at.timestamp() <= ts {
+                    if updated_ts < ts {
                         continue;
+                    }
+                    if updated_ts == ts {
+                        if let Some(last_id) = after_reply_change_id {
+                            if row_id <= last_id {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
                     }
                 }
             } else if let Some(ts) = after_comment_ts {
-                if updated_at.timestamp() <= ts {
+                if updated_ts < ts {
                     continue;
+                }
+                if updated_ts == ts {
+                    if let Some(last_id) = after_comment_change_id {
+                        if row_id <= last_id {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
                 }
             }
 
-            let payload_raw: String = row.get("payload");
-            let payload = serde_json::from_str(&payload_raw).unwrap_or(JsonValue::Null);
-            let action: String = row.get("action");
-
             changes.push(CommentChangeRecord {
-                action: Self::action_from_str(&action),
+                action,
                 id: item_id,
-                comment_id,
+                comment_id: comment_id.clone(),
                 workspace_id: workspace_id.to_string(),
                 doc_id: doc_id.to_string(),
-                item: payload,
+                item: payload.clone(),
                 updated_at,
+                change_row_id: row_id,
+                is_reply,
             });
 
             if changes.len() as i64 >= limit {

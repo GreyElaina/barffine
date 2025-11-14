@@ -1207,7 +1207,7 @@ mod tests {
 
     use crate::{
         graphql::{self, RequestUser},
-        test_support::{insert_document, seed_workspace, setup_state},
+        testing::{insert_document, seed_workspace, setup_state},
     };
 
     #[tokio::test]

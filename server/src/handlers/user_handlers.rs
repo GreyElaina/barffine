@@ -211,7 +211,7 @@ mod tests {
     use crate::{
         auth::generate_password_hash,
         cookies::{SESSION_COOKIE_NAME, USER_COOKIE_NAME},
-        test_support::setup_state,
+        testing::setup_state,
         types::{ListUsersQuery, ListUsersResponse, UserResponse},
     };
 

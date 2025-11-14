@@ -30,8 +30,8 @@ use super::{
         WorkspaceUserGraph, decode_doc_cursor, encode_doc_cursor, ensure_doc_owner_role,
     },
     helpers::{
-        doc_permissions_for_user, ensure_document_exists, format_bytes, format_history_period,
-        map_anyhow, map_app_error, require_doc_permission, require_request_user,
+        doc_permissions_for_user_with_metadata, format_bytes, format_history_period, map_anyhow,
+        map_app_error, require_doc_permission_with_workspace_metadata, require_request_user,
         require_workspace_permission, timestamp_to_datetime, workspace_permission_for_user,
     },
     types::{
@@ -660,7 +660,7 @@ impl WorkspaceType {
             let request_user = ctx.data_opt::<RequestUser>().cloned();
             if !Self::doc_is_visible_to_request(
                 state,
-                &self.record.id,
+                &self.record,
                 &metadata,
                 request_user.as_ref(),
             )
@@ -696,7 +696,7 @@ impl WorkspaceType {
 
         ensure_doc_owner_role(state, &self.record.id, doc_id_str).await?;
 
-        if !Self::doc_is_visible_to_request(state, &self.record.id, &metadata, Some(&request_user))
+        if !Self::doc_is_visible_to_request(state, &self.record, &metadata, Some(&request_user))
             .await?
         {
             return Err(map_app_error(AppError::forbidden(DOC_READ_FORBIDDEN)));
@@ -717,17 +717,19 @@ impl WorkspaceType {
         let cursor = after.as_deref().map(decode_comment_cursor).transpose()?;
         let after_sid = cursor.as_ref().and_then(|value| value.sid);
 
-        require_doc_permission(
+        let state = ctx.data::<AppState>()?;
+        let metadata = doc_metadata::fetch_required(state, self.record.id.as_str(), doc_id_str)
+            .await
+            .map_err(map_app_error)?;
+
+        require_doc_permission_with_workspace_metadata(
             ctx,
-            &self.record.id,
-            doc_id_str,
+            &self.record,
+            &metadata,
             |perms: &DocPermissions| perms.can_read_comments(),
             "Doc.Comments.Read permission required",
         )
         .await?;
-
-        let state = ctx.data::<AppState>()?;
-        ensure_document_exists(state, self.record.id.as_str(), doc_id_str).await?;
 
         let fetch_limit = if cursor.is_some() || offset == 0 {
             limit
@@ -835,17 +837,19 @@ impl WorkspaceType {
 
         let cursor = after.as_deref().map(decode_comment_cursor).transpose()?;
 
-        require_doc_permission(
+        let state = ctx.data::<AppState>()?;
+        let metadata = doc_metadata::fetch_required(state, self.record.id.as_str(), doc_id_str)
+            .await
+            .map_err(map_app_error)?;
+
+        require_doc_permission_with_workspace_metadata(
             ctx,
-            &self.record.id,
-            doc_id_str,
+            &self.record,
+            &metadata,
             |perms: &DocPermissions| perms.can_read_comments(),
             "Doc.Comments.Read permission required",
         )
         .await?;
-
-        let state = ctx.data::<AppState>()?;
-        ensure_document_exists(state, self.record.id.as_str(), doc_id_str).await?;
 
         let mut end_cursor_payload = cursor.unwrap_or_default();
 
@@ -857,10 +861,20 @@ impl WorkspaceType {
             .reply_updated_at
             .as_ref()
             .map(|value| value.timestamp());
+        let comment_change_cursor = end_cursor_payload.comment_change_id;
+        let reply_change_cursor = end_cursor_payload.reply_change_id;
 
         let mut changes: Vec<CommentChangeRecord> = state
             .comment_store
-            .list_comment_changes(&self.record.id, doc_id_str, comment_ts, reply_ts, limit)
+            .list_comment_changes(
+                &self.record.id,
+                doc_id_str,
+                comment_ts,
+                reply_ts,
+                comment_change_cursor,
+                reply_change_cursor,
+                limit,
+            )
             .await
             .map_err(map_anyhow)?;
 
@@ -910,16 +924,29 @@ impl WorkspaceType {
         }
 
         for change in &changes {
-            match change {
-                CommentChangeRecord {
-                    comment_id: Some(_),
-                    ..
-                } => {
-                    end_cursor_payload.reply_updated_at = Some(change.updated_at);
-                }
-                _ => {
-                    end_cursor_payload.comment_updated_at = Some(change.updated_at);
-                }
+            if change.is_reply {
+                end_cursor_payload.reply_updated_at = Some(change.updated_at);
+                end_cursor_payload.reply_change_id = Some(change.change_row_id);
+            } else {
+                end_cursor_payload.comment_updated_at = Some(change.updated_at);
+                end_cursor_payload.comment_change_id = Some(change.change_row_id);
+            }
+        }
+
+        // If caller provided a baseline timestamp but no change-id, we may miss
+        // events that occur within the same second due to second-level precision
+        // in storage. To avoid dropping legitimate new events on the boundary,
+        // carry a minimal change id when returning the cursor with no edges.
+        if changes.is_empty() {
+            if end_cursor_payload.reply_updated_at.is_some()
+                && end_cursor_payload.reply_change_id.is_none()
+            {
+                end_cursor_payload.reply_change_id = Some(0);
+            }
+            if end_cursor_payload.comment_updated_at.is_some()
+                && end_cursor_payload.comment_change_id.is_none()
+            {
+                end_cursor_payload.comment_change_id = Some(0);
             }
         }
 
@@ -1052,13 +1079,8 @@ impl WorkspaceType {
             .map_err(map_app_error)?;
 
         let request_user = ctx.data_opt::<RequestUser>().cloned();
-        if !Self::doc_is_visible_to_request(
-            state,
-            &self.record.id,
-            &metadata,
-            request_user.as_ref(),
-        )
-        .await?
+        if !Self::doc_is_visible_to_request(state, &self.record, &metadata, request_user.as_ref())
+            .await?
         {
             return Err(map_app_error(AppError::forbidden(DOC_READ_FORBIDDEN)));
         }
@@ -1095,32 +1117,71 @@ impl WorkspaceType {
         &self,
         ctx: &Context<'_>,
         docs: Vec<DocumentMetadata>,
-    ) -> GraphQLResult<Vec<DocumentMetadata>> {
-        let request_user = ctx.data_opt::<RequestUser>().cloned();
+    ) -> GraphQLResult<(Vec<DocumentMetadata>, HashMap<String, DocPermissions>)> {
         let state = ctx.data::<AppState>()?;
+        let request_user = ctx.data_opt::<RequestUser>().cloned();
 
-        let mut visible = Vec::with_capacity(docs.len());
-        for doc in docs {
-            if Self::doc_is_visible_to_request(state, &self.record.id, &doc, request_user.as_ref())
-                .await?
-            {
-                visible.push(doc);
+        if let Some(request_user) = request_user.as_ref() {
+            let mut visible = Vec::with_capacity(docs.len());
+            let mut permissions = HashMap::new();
+            for doc in docs {
+                let perms = doc_permissions_for_user_with_metadata(
+                    state,
+                    &self.record,
+                    &doc,
+                    &request_user.user_id,
+                )
+                .await
+                .map_err(map_app_error)?;
+
+                let is_visible = if let Some(perms) = perms {
+                    if perms.can_read_doc() {
+                        permissions.insert(doc.id.clone(), perms.clone());
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    doc.public
+                };
+
+                if is_visible {
+                    visible.push(doc);
+                }
             }
+            Ok((visible, permissions))
+        } else {
+            Ok((
+                docs.into_iter().filter(|doc| doc.public).collect(),
+                HashMap::new(),
+            ))
         }
-
-        Ok(visible)
     }
 
     async fn doc_is_visible_to_request(
         state: &AppState,
-        workspace_id: &str,
+        workspace: &WorkspaceRecord,
+        metadata: &DocumentMetadata,
+        request_user: Option<&RequestUser>,
+    ) -> GraphQLResult<bool> {
+        Self::doc_is_visible_with_metadata(state, workspace, metadata, request_user).await
+    }
+
+    async fn doc_is_visible_with_metadata(
+        state: &AppState,
+        workspace: &WorkspaceRecord,
         metadata: &DocumentMetadata,
         request_user: Option<&RequestUser>,
     ) -> GraphQLResult<bool> {
         if let Some(request_user) = request_user {
-            if let Some(perms) =
-                doc_permissions_for_user(state, workspace_id, &metadata.id, &request_user.user_id)
-                    .await?
+            if let Some(perms) = doc_permissions_for_user_with_metadata(
+                state,
+                workspace,
+                metadata,
+                &request_user.user_id,
+            )
+            .await
+            .map_err(map_app_error)?
             {
                 return Ok(perms.can_read_doc());
             }
@@ -1168,7 +1229,7 @@ impl WorkspaceType {
         offset: i64,
         total_count: i64,
     ) -> GraphQLResult<PaginatedDocType> {
-        let mut filtered = self.filter_visible_doc_metadata(ctx, docs).await?;
+        let (mut filtered, permissions_cache) = self.filter_visible_doc_metadata(ctx, docs).await?;
 
         let has_next_page = (filtered.len() as i64) > limit;
         if has_next_page {
@@ -1177,9 +1238,16 @@ impl WorkspaceType {
 
         let edges: Vec<DocTypeEdge> = filtered
             .into_iter()
-            .map(|metadata| DocTypeEdge {
-                cursor: encode_doc_cursor(&metadata, cursor_kind),
-                node: DocType::from_metadata(metadata),
+            .map(|metadata| {
+                let cursor = encode_doc_cursor(&metadata, cursor_kind);
+                let doc_id = metadata.id.clone();
+                let node = if let Some(perms) = permissions_cache.get(&doc_id) {
+                    DocType::from_metadata_with_permissions(metadata, perms.clone())
+                } else {
+                    DocType::from_metadata(metadata)
+                };
+
+                DocTypeEdge { cursor, node }
             })
             .collect();
 
@@ -1364,7 +1432,7 @@ mod tests {
     use crate::{
         auth::generate_password_hash,
         graphql::{self, RequestUser},
-        test_support::{insert_document, seed_workspace, setup_state},
+        testing::{insert_document, seed_workspace, setup_state},
     };
     use async_graphql::Request as GraphQLRequest;
     use std::collections::HashMap;

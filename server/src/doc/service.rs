@@ -9,10 +9,12 @@ use barffine_core::{
 
 use crate::{
     AppError,
+    doc::roles::{doc_role_for_user_cached, invalidate_doc_role_cache},
     graphql::{
         DocPermissions, DocRole, Permission, doc_permissions_for_role, doc_role_from_str,
         fixup_doc_role, workspace_role_from_str,
     },
+    request_cache,
     state::AppState,
     workspace::service::WorkspaceService,
 };
@@ -41,11 +43,18 @@ impl DocAccessService {
         workspace_id: &str,
         doc_id: &str,
     ) -> Result<bool, AppError> {
+        if let Some(caches) = request_cache::current_request_caches() {
+            if let Some(cached) = caches.doc_metadata().get(workspace_id, doc_id) {
+                return Ok(cached.is_some());
+            }
+        }
+
         let metadata = self
             .document_store
             .find_metadata(workspace_id, doc_id)
             .await
             .map_err(AppError::from_anyhow)?;
+        remember_metadata_lookup(metadata.as_ref(), workspace_id, doc_id);
         Ok(metadata.is_some())
     }
 
@@ -72,6 +81,7 @@ impl DocAccessService {
             .await
             .map_err(AppError::from_anyhow)?
         {
+            remember_metadata_lookup(Some(&metadata), &workspace.id, doc_id);
             return Ok(metadata);
         }
 
@@ -90,11 +100,13 @@ impl DocAccessService {
                 .await
                 .map_err(AppError::from_anyhow)?,
         };
+        remember_metadata_lookup(Some(&metadata), &workspace.id, doc_id);
 
         self.doc_role_store
             .upsert(&workspace.id, doc_id, &workspace.owner_id, "owner")
             .await
             .map_err(AppError::from_anyhow)?;
+        invalidate_doc_role_cache(&workspace.id, doc_id, &workspace.owner_id);
 
         Ok(metadata)
     }
@@ -126,11 +138,9 @@ impl DocAccessService {
         }
 
         let doc_role = if let Some(user_id) = user_id {
-            if let Some(role) = self
-                .doc_role_store
-                .find_for_user(&workspace.id, &metadata.id, user_id)
-                .await
-                .map_err(AppError::from_anyhow)?
+            if let Some(role) =
+                doc_role_for_user_cached(&self.doc_role_store, &workspace.id, &metadata.id, user_id)
+                    .await?
             {
                 Some(doc_role_from_str(&role.role))
             } else {
@@ -184,6 +194,16 @@ impl DocAuthorization {
         match self.permissions.as_ref() {
             Some(perms) if predicate(perms) => Ok(()),
             _ => Err(AppError::forbidden(error_message)),
+        }
+    }
+}
+
+fn remember_metadata_lookup(metadata: Option<&DocumentMetadata>, workspace_id: &str, doc_id: &str) {
+    if let Some(caches) = request_cache::current_request_caches() {
+        if let Some(metadata) = metadata {
+            caches.doc_metadata().insert(metadata.clone());
+        } else {
+            caches.doc_metadata().insert_absent(workspace_id, doc_id);
         }
     }
 }

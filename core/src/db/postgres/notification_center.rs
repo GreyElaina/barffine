@@ -4,7 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
-use sqlx::{Pool, Row, Sqlite};
+use sqlx::{Pool, Postgres, Row, postgres::PgRow};
 
 use crate::{
     db::Database,
@@ -12,14 +12,19 @@ use crate::{
 };
 
 #[derive(Clone)]
-pub struct SqliteNotificationCenter {
-    pool: Arc<Pool<Sqlite>>,
+pub struct PostgresNotificationCenter {
+    pool: Arc<Pool<Postgres>>,
 }
 
-impl SqliteNotificationCenter {
+impl PostgresNotificationCenter {
     pub fn new(database: &Database) -> Self {
         Self {
-            pool: Arc::new(database.pool().clone()),
+            pool: Arc::new(
+                database
+                    .postgres_pool()
+                    .expect("postgres pool unavailable")
+                    .clone(),
+            ),
         }
     }
 
@@ -31,7 +36,7 @@ impl SqliteNotificationCenter {
         Ok(serde_json::to_string(payload)?)
     }
 
-    fn map_row(row: sqlx::sqlite::SqliteRow) -> NotificationRecord {
+    fn map_row(row: PgRow) -> NotificationRecord {
         NotificationRecord {
             id: row.get("id"),
             user_id: row.get("user_id"),
@@ -45,11 +50,11 @@ impl SqliteNotificationCenter {
 }
 
 #[async_trait]
-impl NotificationCenter for SqliteNotificationCenter {
+impl NotificationCenter for PostgresNotificationCenter {
     async fn enqueue(&self, notification: NotificationRecord) -> Result<()> {
         let payload = Self::serialize_payload(&notification.payload)?;
 
-        sqlx::query(
+        pg_query!(
             "INSERT INTO notifications (id, user_id, kind, payload, read, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
@@ -67,7 +72,7 @@ impl NotificationCenter for SqliteNotificationCenter {
     }
 
     async fn list_unread(&self, user_id: &str) -> Result<Vec<NotificationRecord>> {
-        let rows = sqlx::query(
+        let rows = pg_query!(
             "SELECT id, user_id, kind, payload, read, created_at, updated_at
              FROM notifications
              WHERE user_id = ? AND read = 0
@@ -88,7 +93,7 @@ impl NotificationCenter for SqliteNotificationCenter {
         after: Option<(i64, String)>,
     ) -> Result<Vec<NotificationRecord>> {
         let rows = if let Some((timestamp, id)) = after {
-            sqlx::query(
+            pg_query!(
                 "SELECT id, user_id, kind, payload, read, created_at, updated_at
                  FROM notifications
                  WHERE user_id = ?
@@ -105,7 +110,7 @@ impl NotificationCenter for SqliteNotificationCenter {
             .fetch_all(&*self.pool)
             .await?
         } else {
-            sqlx::query(
+            pg_query!(
                 "SELECT id, user_id, kind, payload, read, created_at, updated_at
                  FROM notifications
                  WHERE user_id = ?
@@ -125,7 +130,7 @@ impl NotificationCenter for SqliteNotificationCenter {
 
     async fn count_for_user(&self, user_id: &str) -> Result<i64> {
         let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read = 0")
+            pg_query_scalar!("SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read = 0")
                 .bind(user_id)
                 .fetch_one(&*self.pool)
                 .await?;
@@ -135,7 +140,7 @@ impl NotificationCenter for SqliteNotificationCenter {
 
     async fn count_unread(&self, user_id: &str) -> Result<i64> {
         let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read = 0")
+            pg_query_scalar!("SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read = 0")
                 .bind(user_id)
                 .fetch_one(&*self.pool)
                 .await?;
@@ -144,12 +149,11 @@ impl NotificationCenter for SqliteNotificationCenter {
     }
 
     async fn mark_read(&self, notification_id: &str, user_id: &str) -> Result<bool> {
-        let now = Utc::now().timestamp();
-        let result = sqlx::query(
-            "UPDATE notifications SET read = 1, updated_at = ?
-             WHERE id = ? AND user_id = ?",
+        let result = pg_query!(
+            "UPDATE notifications
+             SET read = 1
+             WHERE id = ? AND user_id = ? AND read = 0",
         )
-        .bind(now)
         .bind(notification_id)
         .bind(user_id)
         .execute(&*self.pool)
@@ -160,7 +164,7 @@ impl NotificationCenter for SqliteNotificationCenter {
         }
 
         let exists: i64 =
-            sqlx::query_scalar("SELECT COUNT(1) FROM notifications WHERE id = ? AND user_id = ?")
+            pg_query_scalar!("SELECT COUNT(1) FROM notifications WHERE id = ? AND user_id = ?")
                 .bind(notification_id)
                 .bind(user_id)
                 .fetch_one(&*self.pool)
@@ -170,13 +174,11 @@ impl NotificationCenter for SqliteNotificationCenter {
     }
 
     async fn mark_all_read(&self, user_id: &str) -> Result<u64> {
-        let now = Utc::now().timestamp();
-        let result = sqlx::query(
+        let result = pg_query!(
             "UPDATE notifications
-             SET read = 1, updated_at = ?
+             SET read = 1
              WHERE user_id = ? AND read = 0",
         )
-        .bind(now)
         .bind(user_id)
         .execute(&*self.pool)
         .await?;

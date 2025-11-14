@@ -1,21 +1,28 @@
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use sqlx::{Pool, Row, Sqlite, sqlite::SqliteRow};
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use uuid::Uuid;
 
 use crate::{
-    db::Database,
-    doc::DocEngine,
-    doc_update_log::{
-        DocUpdateRecord, fetch_doc_logs, fetch_doc_logs_via_executor, insert_doc_updates,
-        trim_doc_updates,
+    db::{
+        Database,
+        doc_repo::{
+            AppendDocUpdatesParams, CompactionApplyParams, DocRepositoryRef, DocumentListOrder,
+            DuplicateDocParams, HistorySnapshotInsert, InsertDocRecordParams,
+            MetadataBackfillParams, ReplaceDocSnapshotParams, SnapshotUpsertParams,
+        },
     },
+    doc::DocEngine,
+    doc_update_log::{DocUpdateLogReaderRef, DocUpdateRecord},
 };
 
 pub const DOC_UPDATE_LOG_LIMIT: i64 = 200;
-const SPACE_TYPE_WORKSPACE: &str = "workspace";
+pub const SPACE_TYPE_WORKSPACE: &str = "workspace";
 const WORKSPACE_DB_DOC_SUFFIXES: &[&str] = &[
     "folders",
     "docProperties",
@@ -67,7 +74,7 @@ pub struct DocumentSnapshot {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DocumentMetadata {
     pub id: String,
     pub workspace_id: String,
@@ -103,55 +110,19 @@ pub struct DocumentCursor {
 
 #[derive(Clone)]
 pub struct DocumentStore {
-    pool: Pool<Sqlite>,
+    doc_repo: DocRepositoryRef,
+    doc_logs: DocUpdateLogReaderRef,
 }
 
 impl DocumentStore {
     pub fn new(database: &Database) -> Self {
-        Self {
-            pool: database.pool().clone(),
-        }
+        let doc_repo = database.repositories().doc_repo();
+        let doc_logs = database.doc_update_logs();
+        Self { doc_repo, doc_logs }
     }
 
     fn now_millis() -> i64 {
         Utc::now().timestamp_millis()
-    }
-
-    fn metadata_from_row(row: SqliteRow) -> DocumentMetadata {
-        let public = row.get::<i64, _>("public") != 0;
-        let blocked = row.try_get::<i64, _>("blocked").unwrap_or(0) != 0;
-        let share_token = row
-            .try_get::<Option<String>, _>("share_token")
-            .unwrap_or(None)
-            .filter(|_| public);
-
-        let trashed_at = row.try_get::<Option<i64>, _>("trashed_at").unwrap_or(None);
-        let trashed_by = row
-            .try_get::<Option<String>, _>("trashed_by")
-            .unwrap_or(None);
-
-        DocumentMetadata {
-            id: row.get("id"),
-            workspace_id: row.get("workspace_id"),
-            created_at: row.get::<i64, _>("created_at"),
-            updated_at: row.get::<i64, _>("updated_at"),
-            default_role: row.get("default_role"),
-            public,
-            blocked,
-            mode: row.get("mode"),
-            title: row.try_get::<Option<String>, _>("title").unwrap_or(None),
-            summary: row.try_get::<Option<String>, _>("summary").unwrap_or(None),
-            creator_id: row
-                .try_get::<Option<String>, _>("creator_id")
-                .unwrap_or(None),
-            updater_id: row
-                .try_get::<Option<String>, _>("updater_id")
-                .unwrap_or(None),
-            share_token,
-            trashed_at,
-            trashed_by,
-            snapshot: None,
-        }
     }
 
     fn metadata_needs_backfill(metadata: &DocumentMetadata) -> bool {
@@ -161,6 +132,15 @@ impl DocumentStore {
             || metadata.updater_id.is_none()
             || metadata.created_at == 0
             || metadata.updated_at == 0
+    }
+
+    fn metadata_backfill_changed(original: &DocumentMetadata, updated: &DocumentMetadata) -> bool {
+        original.title != updated.title
+            || original.summary != updated.summary
+            || original.creator_id != updated.creator_id
+            || original.updater_id != updated.updater_id
+            || original.created_at != updated.created_at
+            || original.updated_at != updated.updated_at
     }
 
     fn merge_parsed_metadata(metadata: &mut DocumentMetadata, parsed: ParsedDocMeta) {
@@ -202,6 +182,62 @@ impl DocumentStore {
         }
     }
 
+    async fn hydrate_metadata_with_snapshot(
+        &self,
+        metadata: DocumentMetadata,
+        snapshot: Vec<u8>,
+    ) -> Result<DocumentMetadata> {
+        let mut updated = metadata.clone();
+        updated.snapshot = Some(snapshot.clone());
+        let parsed = extract_doc_meta(&snapshot, &metadata.id);
+        Self::merge_parsed_metadata(&mut updated, parsed);
+
+        if Self::metadata_backfill_changed(&metadata, &updated) {
+            self.doc_repo
+                .backfill_metadata(MetadataBackfillParams {
+                    workspace_id: updated.workspace_id.clone(),
+                    doc_id: updated.id.clone(),
+                    title: updated.title.clone(),
+                    summary: updated.summary.clone(),
+                    creator_id: updated.creator_id.clone(),
+                    updater_id: updated.updater_id.clone(),
+                    created_at: updated.created_at,
+                    updated_at: updated.updated_at,
+                })
+                .await?;
+        }
+
+        Ok(updated)
+    }
+
+    /// Backfill document metadata using a provided snapshot, if needed.
+    ///
+    /// This is primarily used by the doc cache flush path, where we already
+    /// have an up-to-date snapshot in memory and want to avoid re-parsing it
+    /// on read paths (e.g. document listing).
+    pub async fn backfill_metadata_from_snapshot(
+        &self,
+        workspace_id: &str,
+        doc_id: &str,
+        snapshot: &[u8],
+    ) -> Result<()> {
+        let Some(metadata) = self.doc_repo.fetch_metadata(workspace_id, doc_id).await? else {
+            return Ok(());
+        };
+
+        if !Self::metadata_needs_backfill(&metadata) {
+            return Ok(());
+        }
+
+        // Reuse the existing snapshot-based hydration logic – it will update
+        // metadata fields and persist them when they actually change.
+        let _ = self
+            .hydrate_metadata_with_snapshot(metadata, snapshot.to_vec())
+            .await?;
+
+        Ok(())
+    }
+
     pub async fn hydrate_metadata(&self, metadata: DocumentMetadata) -> Result<DocumentMetadata> {
         if !Self::metadata_needs_backfill(&metadata) {
             return Ok(metadata);
@@ -218,32 +254,8 @@ impl DocumentStore {
             return Ok(metadata);
         };
 
-        let parsed = extract_doc_meta(&snapshot, &metadata.id);
-        let mut updated = metadata.clone();
-        updated.snapshot = Some(snapshot.clone());
-        Self::merge_parsed_metadata(&mut updated, parsed);
-
-        if updated == metadata {
-            return Ok(metadata);
-        }
-
-        sqlx::query(
-            "UPDATE documents
-             SET title = ?, summary = ?, creator_id = ?, updater_id = ?, created_at = ?, updated_at = ?
-             WHERE workspace_id = ? AND id = ?",
-        )
-        .bind(updated.title.as_deref())
-        .bind(updated.summary.as_deref())
-        .bind(updated.creator_id.as_deref())
-        .bind(updated.updater_id.as_deref())
-        .bind(updated.created_at)
-        .bind(updated.updated_at)
-        .bind(&updated.workspace_id)
-        .bind(&updated.id)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(updated)
+        self.hydrate_metadata_with_snapshot(metadata, snapshot)
+            .await
     }
 
     fn generate_share_token() -> String {
@@ -260,100 +272,48 @@ impl DocumentStore {
             return Err(anyhow!("updates payload must not be empty"));
         }
 
-        let mut tx = self.pool.begin().await?;
-        let snapshot_row =
-            sqlx::query("SELECT snapshot FROM documents WHERE workspace_id = ? AND id = ?")
-                .bind(workspace_id)
-                .bind(doc_id)
-                .fetch_optional(&mut *tx)
-                .await?;
+        let existing_snapshot = self
+            .doc_repo
+            .fetch_snapshot_with_timestamp(workspace_id, doc_id)
+            .await?
+            .map(|snapshot| snapshot.snapshot);
 
-        let existing_snapshot: Option<Vec<u8>> = snapshot_row
-            .as_ref()
-            .map(|row| row.try_get("snapshot"))
-            .transpose()
-            .context("failed to read snapshot column")?;
+        let existing_snapshot_ref = existing_snapshot.as_deref();
 
         let SnapshotComputation {
             snapshot: new_snapshot,
             meta,
             created_at,
             updated_at,
-        } = build_snapshot_from_updates(
-            doc_id,
-            existing_snapshot.as_deref(),
-            updates,
-            Self::now_millis,
-        )?;
+        } = build_snapshot_from_updates(doc_id, existing_snapshot_ref, updates, Self::now_millis)?;
 
-        if existing_snapshot.is_none() {
-            sqlx::query(
-                "INSERT INTO documents (id, workspace_id, snapshot, created_at, updated_at, default_role, public, blocked, mode, title, summary, creator_id, updater_id, trashed_at, trashed_by)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
-            )
-            .bind(doc_id)
-            .bind(workspace_id)
-            .bind(&new_snapshot)
-            .bind(created_at)
-            .bind(updated_at)
-            .bind("manager")
-            .bind(0_i64)
-            .bind(0_i64)
-            .bind("page")
-            .bind(meta.title.as_deref())
-            .bind(meta.summary.as_deref())
-            .bind(meta.creator_id.as_deref())
-            .bind(meta.updater_id.as_deref())
-            .execute(&mut *tx)
+        let had_existing = existing_snapshot_ref.is_some();
+        let history_entry = existing_snapshot.map(|snapshot| HistorySnapshotInsert {
+            snapshot,
+            created_at: updated_at,
+        });
+
+        self.doc_repo
+            .upsert_snapshot_with_updates(SnapshotUpsertParams {
+                workspace_id: workspace_id.to_owned(),
+                doc_id: doc_id.to_owned(),
+                snapshot: new_snapshot.clone(),
+                created_at,
+                updated_at,
+                title: meta.title.clone(),
+                summary: meta.summary.clone(),
+                creator_id: meta.creator_id.clone(),
+                updater_id: meta.updater_id.clone(),
+                default_role: "manager".to_string(),
+                mode: "page".to_string(),
+                history_entry,
+                new_document: !had_existing,
+                doc_updates: updates.to_vec(),
+                log_editor_id: meta.updater_id.clone(),
+                log_timestamp: updated_at,
+                log_limit: DOC_UPDATE_LOG_LIMIT,
+            })
             .await?;
-        } else {
-            sqlx::query(
-                "UPDATE documents SET snapshot = ?, updated_at = ?, title = ?, summary = ?, updater_id = COALESCE(?, updater_id), creator_id = COALESCE(?, creator_id) WHERE id = ? AND workspace_id = ?",
-            )
-            .bind(&new_snapshot)
-            .bind(updated_at)
-            .bind(meta.title.as_deref())
-            .bind(meta.summary.as_deref())
-            .bind(meta.updater_id.as_deref())
-            .bind(meta.creator_id.as_deref())
-            .bind(doc_id)
-            .bind(workspace_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        if let Some(previous) = existing_snapshot {
-            sqlx::query(
-                "INSERT INTO document_history (doc_id, workspace_id, snapshot, created_at) VALUES (?, ?, ?, ?)",
-            )
-            .bind(doc_id)
-            .bind(workspace_id)
-            .bind(previous)
-            .bind(updated_at)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        insert_doc_updates(
-            &mut tx,
-            SPACE_TYPE_WORKSPACE,
-            workspace_id,
-            doc_id,
-            updates,
-            meta.updater_id.as_deref(),
-            updated_at,
-        )
-        .await?;
-        trim_doc_updates(
-            &mut tx,
-            SPACE_TYPE_WORKSPACE,
-            workspace_id,
-            doc_id,
-            DOC_UPDATE_LOG_LIMIT,
-        )
-        .await?;
-
-        tx.commit().await?;
 
         Ok(new_snapshot)
     }
@@ -370,105 +330,60 @@ impl DocumentStore {
             return Ok(());
         }
 
-        let mut tx = self.pool.begin().await?;
-        let result = sqlx::query(
-            "UPDATE documents
-             SET updated_at = ?, updater_id = COALESCE(?, updater_id)
-             WHERE workspace_id = ? AND id = ?",
-        )
-        .bind(timestamp)
-        .bind(editor_id)
-        .bind(workspace_id)
-        .bind(doc_id)
-        .execute(&mut *tx)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            tx.rollback().await?;
-            anyhow::bail!("document not found: {workspace_id}/{doc_id}");
-        }
-
-        insert_doc_updates(
-            &mut tx,
-            SPACE_TYPE_WORKSPACE,
-            workspace_id,
-            doc_id,
-            updates,
-            editor_id,
-            timestamp,
-        )
-        .await?;
-        trim_doc_updates(
-            &mut tx,
-            SPACE_TYPE_WORKSPACE,
-            workspace_id,
-            doc_id,
-            DOC_UPDATE_LOG_LIMIT,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(())
+        self.doc_repo
+            .append_doc_updates(AppendDocUpdatesParams {
+                workspace_id: workspace_id.to_owned(),
+                doc_id: doc_id.to_owned(),
+                updates: updates.to_vec(),
+                editor_id: editor_id.map(|id| id.to_owned()),
+                timestamp,
+                log_limit: DOC_UPDATE_LOG_LIMIT,
+            })
+            .await
     }
 
     pub async fn compact_doc(&self, workspace_id: &str, doc_id: &str) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT snapshot FROM documents WHERE workspace_id = ? AND id = ?")
-            .bind(workspace_id)
-            .bind(doc_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-
-        let Some(row) = row else {
-            tx.rollback().await?;
+        let Some(source) = self
+            .doc_repo
+            .load_compaction_source(workspace_id, doc_id)
+            .await?
+        else {
             return Ok(());
         };
 
-        let base_snapshot: Vec<u8> = row.try_get("snapshot")?;
-        let logs =
-            fetch_doc_logs_via_executor(tx.as_mut(), SPACE_TYPE_WORKSPACE, workspace_id, doc_id)
-                .await?;
-        if logs.is_empty() {
-            tx.commit().await?;
+        if source.logs.is_empty() {
             return Ok(());
         }
 
-        let updates = logs
+        let updates = source
+            .logs
             .iter()
             .map(|log| log.update.clone())
             .collect::<Vec<_>>();
-        let merged_snapshot = DocEngine::apply_updates_to_snapshot(Some(&base_snapshot), &updates)
-            .context("merge doc updates during compaction")?;
+        let merged_snapshot =
+            DocEngine::apply_updates_to_snapshot(Some(&source.base_snapshot), &updates)
+                .context("merge doc updates during compaction")?;
         let meta = extract_doc_meta(&merged_snapshot, doc_id);
         let updated_at = meta
             .updated_at
-            .or_else(|| logs.last().map(|log| log.created_at))
+            .or_else(|| source.logs.last().map(|log| log.created_at))
             .unwrap_or_else(Self::now_millis);
 
-        sqlx::query(
-            "UPDATE documents
-             SET snapshot = ?, updated_at = ?, title = ?, summary = ?,
-                 updater_id = COALESCE(?, updater_id), creator_id = COALESCE(?, creator_id)
-             WHERE workspace_id = ? AND id = ?",
-        )
-        .bind(&merged_snapshot)
-        .bind(updated_at)
-        .bind(meta.title.as_deref())
-        .bind(meta.summary.as_deref())
-        .bind(meta.updater_id.as_deref())
-        .bind(meta.creator_id.as_deref())
-        .bind(workspace_id)
-        .bind(doc_id)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query("DELETE FROM doc_updates WHERE space_type = ? AND space_id = ? AND doc_id = ?")
-            .bind(SPACE_TYPE_WORKSPACE)
-            .bind(workspace_id)
-            .bind(doc_id)
-            .execute(&mut *tx)
+        self.doc_repo
+            .apply_compaction_result(CompactionApplyParams {
+                workspace_id: workspace_id.to_owned(),
+                doc_id: doc_id.to_owned(),
+                snapshot: merged_snapshot,
+                updated_at,
+                title: meta.title,
+                summary: meta.summary,
+                creator_id: meta.creator_id,
+                updater_id: meta.updater_id,
+                last_log_id: source.logs.last().map(|log| log.id),
+                expected_updated_at: source.doc_updated_at,
+            })
             .await?;
 
-        tx.commit().await?;
         Ok(())
     }
 
@@ -479,7 +394,7 @@ impl DocumentStore {
         owner_id: &str,
         title: Option<&str>,
     ) -> Result<DocumentMetadata> {
-        if let Some(metadata) = self.find_metadata(workspace_id, doc_id).await? {
+        if let Some(metadata) = self.doc_repo.fetch_metadata(workspace_id, doc_id).await? {
             return Ok(metadata);
         }
 
@@ -489,44 +404,35 @@ impl DocumentStore {
             .map(str::trim)
             .filter(|trimmed| !trimmed.is_empty())
             .map(ToOwned::to_owned);
+        let insert_params = InsertDocRecordParams {
+            workspace_id: workspace_id.to_string(),
+            doc_id: doc_id.to_string(),
+            snapshot: snapshot.clone(),
+            owner_id: owner_id.to_string(),
+            title: title_value.clone(),
+            created_at: now_ts,
+        };
+        self.doc_repo.insert_doc_record(insert_params).await?;
 
-        let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "INSERT INTO documents (
-                 id,
-                 workspace_id,
-                 snapshot,
-                 created_at,
-                 updated_at,
-                 default_role,
-                 public,
-                 blocked,
-                 mode,
-                 title,
-                 summary,
-                 creator_id,
-                 updater_id,
-                 trashed_at,
-                 trashed_by
-             ) VALUES (?, ?, ?, ?, ?, 'manager', 0, 0, 'page', ?, NULL, ?, ?, NULL, NULL)",
-        )
-        .bind(doc_id)
-        .bind(workspace_id)
-        .bind(&snapshot)
-        .bind(now_ts)
-        .bind(now_ts)
-        .bind(title_value.as_deref())
-        .bind(owner_id)
-        .bind(owner_id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
+        let metadata = DocumentMetadata {
+            id: doc_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            created_at: now_ts,
+            updated_at: now_ts,
+            default_role: "manager".to_string(),
+            public: false,
+            blocked: false,
+            mode: "page".to_string(),
+            title: title_value,
+            summary: None,
+            creator_id: Some(owner_id.to_owned()),
+            updater_id: Some(owner_id.to_owned()),
+            share_token: None,
+            trashed_at: None,
+            trashed_by: None,
+            snapshot: Some(snapshot),
+        };
 
-        let mut metadata = self
-            .find_metadata(workspace_id, doc_id)
-            .await?
-            .ok_or_else(|| anyhow!("workspace root doc inserted but not found"))?;
-        metadata.snapshot = Some(snapshot);
         Ok(metadata)
     }
 
@@ -547,20 +453,13 @@ impl DocumentStore {
         workspace_id: &str,
         doc_id: &str,
     ) -> Result<Option<DocumentSnapshot>> {
-        let row = sqlx::query(
-            "SELECT snapshot, updated_at FROM documents WHERE workspace_id = ? AND id = ?",
-        )
-        .bind(workspace_id)
-        .bind(doc_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        let Some(row) = row else {
+        let Some(mut snapshot_with_ts) = self
+            .doc_repo
+            .fetch_snapshot_with_timestamp(workspace_id, doc_id)
+            .await?
+        else {
             return Ok(None);
         };
-
-        let mut snapshot: Vec<u8> = row.try_get("snapshot").context("failed to read snapshot")?;
-        let mut updated_at: i64 = row.try_get("updated_at")?;
 
         let logs = self.fetch_doc_logs(workspace_id, doc_id).await?;
         if !logs.is_empty() {
@@ -568,17 +467,17 @@ impl DocumentStore {
                 .iter()
                 .map(|log| log.update.clone())
                 .collect::<Vec<_>>();
-            snapshot = DocEngine::apply_updates_to_snapshot(Some(&snapshot), &log_updates)
-                .context("apply doc updates from log to snapshot")?;
+            snapshot_with_ts.snapshot = DocEngine::apply_updates_to_snapshot(
+                Some(&snapshot_with_ts.snapshot),
+                &log_updates,
+            )
+            .context("apply doc updates from log to snapshot")?;
             if let Some(last) = logs.last() {
-                updated_at = updated_at.max(last.created_at);
+                snapshot_with_ts.updated_at = snapshot_with_ts.updated_at.max(last.created_at);
             }
         }
 
-        Ok(Some(DocumentSnapshot {
-            snapshot,
-            updated_at,
-        }))
+        Ok(Some(snapshot_with_ts))
     }
 
     pub async fn list_doc_timestamps(
@@ -586,25 +485,13 @@ impl DocumentStore {
         workspace_id: &str,
         after: Option<i64>,
     ) -> Result<HashMap<String, i64>> {
-        let rows = if let Some(threshold) = after {
-            sqlx::query(
-                "SELECT id, updated_at FROM documents WHERE workspace_id = ? AND updated_at > ?",
-            )
-            .bind(workspace_id)
-            .bind(threshold)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query("SELECT id, updated_at FROM documents WHERE workspace_id = ?")
-                .bind(workspace_id)
-                .fetch_all(&self.pool)
-                .await?
-        };
+        let entries = self
+            .doc_repo
+            .list_doc_timestamps(workspace_id, after)
+            .await?;
 
-        let mut map = HashMap::with_capacity(rows.len());
-        for row in rows {
-            let id: String = row.try_get("id")?;
-            let updated_at: i64 = row.try_get("updated_at")?;
+        let mut map = HashMap::with_capacity(entries.len());
+        for (id, updated_at) in entries {
             map.insert(id, updated_at);
         }
 
@@ -617,30 +504,9 @@ impl DocumentStore {
         doc_id: &str,
         limit: i64,
     ) -> Result<Vec<DocumentHistoryRecord>> {
-        let rows = sqlx::query(
-            "SELECT id, snapshot, created_at FROM document_history
-             WHERE workspace_id = ? AND doc_id = ?
-             ORDER BY created_at DESC, id DESC
-             LIMIT ?",
-        )
-        .bind(workspace_id)
-        .bind(doc_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let records = rows
-            .into_iter()
-            .map(|row| -> Result<_> {
-                Ok(DocumentHistoryRecord {
-                    id: row.try_get("id").context("failed to read history id")?,
-                    snapshot: row.try_get("snapshot").context("failed to read snapshot")?,
-                    created_at: row.try_get("created_at")?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(records)
+        self.doc_repo
+            .list_history_entries(workspace_id, doc_id, limit)
+            .await
     }
 
     pub async fn fetch_history_as_of(
@@ -649,24 +515,17 @@ impl DocumentStore {
         doc_id: &str,
         timestamp: i64,
     ) -> Result<Option<Vec<u8>>> {
-        let row = sqlx::query(
-            "SELECT snapshot FROM document_history
-             WHERE workspace_id = ? AND doc_id = ? AND created_at <= ?
-             ORDER BY created_at DESC, id DESC
-             LIMIT 1",
-        )
-        .bind(workspace_id)
-        .bind(doc_id)
-        .bind(timestamp)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        let snapshot = match row {
-            Some(row) => Some(row.try_get("snapshot").context("failed to read snapshot")?),
-            None => None,
+        let Some(history_id) = self
+            .doc_repo
+            .find_history_id_before(workspace_id, doc_id, timestamp)
+            .await?
+        else {
+            return Ok(None);
         };
 
-        Ok(snapshot)
+        self.doc_repo
+            .fetch_history_snapshot(workspace_id, doc_id, history_id)
+            .await
     }
 
     pub async fn find_metadata(
@@ -674,35 +533,7 @@ impl DocumentStore {
         workspace_id: &str,
         doc_id: &str,
     ) -> Result<Option<DocumentMetadata>> {
-        let row = sqlx::query(
-            "SELECT
-                 d.id,
-                 d.workspace_id,
-                 d.created_at,
-                 d.updated_at,
-                 d.default_role,
-                 d.public,
-                 d.blocked,
-                 d.mode,
-                 d.title,
-                 d.summary,
-                 d.creator_id,
-                 d.updater_id,
-                 d.trashed_at,
-                 d.trashed_by,
-                 l.token AS share_token
-             FROM documents d
-             LEFT JOIN doc_public_links l
-               ON l.workspace_id = d.workspace_id AND l.doc_id = d.id
-             WHERE d.workspace_id = ? AND d.id = ?",
-        )
-        .bind(workspace_id)
-        .bind(doc_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        if let Some(row) = row {
-            let metadata = Self::metadata_from_row(row);
+        if let Some(metadata) = self.doc_repo.fetch_metadata(workspace_id, doc_id).await? {
             let hydrated = self.hydrate_metadata(metadata).await?;
             Ok(Some(hydrated))
         } else {
@@ -717,74 +548,16 @@ impl DocumentStore {
         offset: i64,
         cursor: Option<&DocumentCursor>,
     ) -> Result<Vec<DocumentMetadata>> {
-        let rows = if let Some(cursor) = cursor {
-            sqlx::query(
-                "SELECT
-                     d.id,
-                     d.workspace_id,
-                     d.created_at,
-                     d.updated_at,
-                     d.default_role,
-                     d.public,
-                     d.blocked,
-                     d.mode,
-                     d.title,
-                     d.summary,
-                     d.creator_id,
-                     d.updater_id,
-                                     d.trashed_at,
-                                     d.trashed_by,
-                                     l.token AS share_token
-                 FROM documents d
-                 LEFT JOIN doc_public_links l
-                   ON l.workspace_id = d.workspace_id AND l.doc_id = d.id
-                 WHERE d.workspace_id = ?
-                                 AND d.trashed_at IS NULL
-                   AND (d.created_at > ? OR (d.created_at = ? AND d.id > ?))
-                 ORDER BY d.created_at ASC, d.id ASC
-                 LIMIT ?",
+        let mut records = self
+            .doc_repo
+            .list_documents(
+                workspace_id,
+                limit + 1,
+                offset,
+                cursor,
+                DocumentListOrder::CreatedAsc,
             )
-            .bind(workspace_id)
-            .bind(cursor.timestamp)
-            .bind(cursor.timestamp)
-            .bind(&cursor.id)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query(
-                "SELECT
-                     d.id,
-                     d.workspace_id,
-                     d.created_at,
-                     d.updated_at,
-                     d.default_role,
-                     d.public,
-                     d.blocked,
-                     d.mode,
-                     d.title,
-                     d.summary,
-                     d.creator_id,
-                     d.updater_id,
-                                     d.trashed_at,
-                                     d.trashed_by,
-                                     l.token AS share_token
-                 FROM documents d
-                 LEFT JOIN doc_public_links l
-                   ON l.workspace_id = d.workspace_id AND l.doc_id = d.id
-                 WHERE d.workspace_id = ?
-                                 AND d.trashed_at IS NULL
-                 ORDER BY d.created_at ASC, d.id ASC
-                 LIMIT ? OFFSET ?",
-            )
-            .bind(workspace_id)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?
-        };
-
-        let mut records: Vec<_> = rows.into_iter().map(Self::metadata_from_row).collect();
+            .await?;
         for record in &mut records {
             if Self::metadata_needs_backfill(record) {
                 *record = self.hydrate_metadata(record.clone()).await?;
@@ -801,74 +574,16 @@ impl DocumentStore {
         offset: i64,
         cursor: Option<&DocumentCursor>,
     ) -> Result<Vec<DocumentMetadata>> {
-        let rows = if let Some(cursor) = cursor {
-            sqlx::query(
-                "SELECT
-                     d.id,
-                     d.workspace_id,
-                     d.created_at,
-                     d.updated_at,
-                     d.default_role,
-                     d.public,
-                     d.blocked,
-                     d.mode,
-                     d.title,
-                     d.summary,
-                     d.creator_id,
-                     d.updater_id,
-                                     d.trashed_at,
-                                     d.trashed_by,
-                                     l.token AS share_token
-                 FROM documents d
-                 LEFT JOIN doc_public_links l
-                   ON l.workspace_id = d.workspace_id AND l.doc_id = d.id
-                 WHERE d.workspace_id = ?
-                                 AND d.trashed_at IS NULL
-                   AND (d.updated_at < ? OR (d.updated_at = ? AND d.id < ?))
-                 ORDER BY d.updated_at DESC, d.id DESC
-                 LIMIT ?",
+        let mut records = self
+            .doc_repo
+            .list_documents(
+                workspace_id,
+                limit + 1,
+                offset,
+                cursor,
+                DocumentListOrder::UpdatedDesc,
             )
-            .bind(workspace_id)
-            .bind(cursor.timestamp)
-            .bind(cursor.timestamp)
-            .bind(&cursor.id)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query(
-                "SELECT
-                     d.id,
-                     d.workspace_id,
-                     d.created_at,
-                     d.updated_at,
-                     d.default_role,
-                     d.public,
-                     d.blocked,
-                     d.mode,
-                     d.title,
-                     d.summary,
-                     d.creator_id,
-                     d.updater_id,
-                                     d.trashed_at,
-                                     d.trashed_by,
-                                     l.token AS share_token
-                 FROM documents d
-                 LEFT JOIN doc_public_links l
-                   ON l.workspace_id = d.workspace_id AND l.doc_id = d.id
-                 WHERE d.workspace_id = ?
-                                 AND d.trashed_at IS NULL
-                 ORDER BY d.updated_at DESC, d.id DESC
-                 LIMIT ? OFFSET ?",
-            )
-            .bind(workspace_id)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?
-        };
-
-        let mut records: Vec<_> = rows.into_iter().map(Self::metadata_from_row).collect();
+            .await?;
         for record in &mut records {
             if Self::metadata_needs_backfill(record) {
                 *record = self.hydrate_metadata(record.clone()).await?;
@@ -879,41 +594,14 @@ impl DocumentStore {
     }
 
     pub async fn count_by_workspace(&self, workspace_id: &str) -> Result<i64> {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) as count FROM documents WHERE workspace_id = ? AND trashed_at IS NULL",
-        )
-        .bind(workspace_id)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(count)
+        self.doc_repo.count_documents(workspace_id).await
     }
 
     pub async fn list_share_tokens_for_user(
         &self,
         user_id: &str,
     ) -> Result<Vec<UserShareTokenRecord>> {
-        let rows = sqlx::query(
-            "SELECT l.workspace_id, l.doc_id, l.token, l.created_at
-             FROM doc_public_links l
-             JOIN workspace_members wm
-               ON wm.workspace_id = l.workspace_id
-             WHERE wm.user_id = ?
-             ORDER BY l.created_at DESC, l.workspace_id ASC, l.doc_id ASC",
-        )
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows
-            .into_iter()
-            .map(|row| UserShareTokenRecord {
-                workspace_id: row.get("workspace_id"),
-                doc_id: row.get("doc_id"),
-                token: row.get("token"),
-                created_at: row.get::<i64, _>("created_at"),
-            })
-            .collect())
+        self.doc_repo.list_share_tokens_for_user(user_id).await
     }
 
     pub async fn publish_doc(
@@ -923,38 +611,14 @@ impl DocumentStore {
         mode: &str,
     ) -> Result<Option<DocumentMetadata>> {
         let now = Self::now_millis();
-        let mut tx = self.pool.begin().await?;
-        let result = sqlx::query(
-            "UPDATE documents
-             SET public = 1, mode = ?, updated_at = ?
-             WHERE workspace_id = ? AND id = ? AND trashed_at IS NULL",
-        )
-        .bind(mode)
-        .bind(now)
-        .bind(workspace_id)
-        .bind(doc_id)
-        .execute(&mut *tx)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            tx.rollback().await?;
+        let token = Self::generate_share_token();
+        let rows = self
+            .doc_repo
+            .publish_doc_entry(workspace_id, doc_id, mode, now, &token)
+            .await?;
+        if rows == 0 {
             return Ok(None);
         }
-
-        sqlx::query(
-            "INSERT INTO doc_public_links (workspace_id, doc_id, token, created_at)
-             VALUES (?, ?, ?, ?)
-             ON CONFLICT(workspace_id, doc_id) DO NOTHING",
-        )
-        .bind(workspace_id)
-        .bind(doc_id)
-        .bind(Self::generate_share_token())
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-
         self.find_metadata(workspace_id, doc_id).await
     }
 
@@ -964,18 +628,11 @@ impl DocumentStore {
         doc_id: &str,
     ) -> Result<Option<DocumentMetadata>> {
         let now = Self::now_millis();
-        let result = sqlx::query(
-            "UPDATE documents
-             SET public = 0, updated_at = ?
-             WHERE workspace_id = ? AND id = ? AND trashed_at IS NULL",
-        )
-        .bind(now)
-        .bind(workspace_id)
-        .bind(doc_id)
-        .execute(&self.pool)
-        .await?;
-
-        if result.rows_affected() == 0 {
+        let rows = self
+            .doc_repo
+            .unpublish_doc_entry(workspace_id, doc_id, now)
+            .await?;
+        if rows == 0 {
             return Ok(None);
         }
 
@@ -988,16 +645,11 @@ impl DocumentStore {
         doc_id: &str,
         role: &str,
     ) -> Result<bool> {
-        let result = sqlx::query(
-            "UPDATE documents SET default_role = ? WHERE workspace_id = ? AND id = ? AND trashed_at IS NULL",
-        )
-        .bind(role)
-        .bind(workspace_id)
-        .bind(doc_id)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(result.rows_affected() > 0)
+        let rows = self
+            .doc_repo
+            .update_default_role_entry(workspace_id, doc_id, role)
+            .await?;
+        Ok(rows > 0)
     }
 
     pub async fn duplicate_doc(
@@ -1009,77 +661,17 @@ impl DocumentStore {
         creator_id: &str,
         title_override: Option<&str>,
     ) -> Result<Option<DocumentMetadata>> {
-        let mut tx = self.pool.begin().await?;
-
-        let source_row = sqlx::query(
-            "SELECT snapshot, default_role, mode, title, summary FROM documents WHERE workspace_id = ? AND id = ?",
-        )
-        .bind(source_workspace_id)
-        .bind(source_doc_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let Some(row) = source_row else {
-            tx.rollback().await?;
-            return Ok(None);
+        let params = DuplicateDocParams {
+            source_workspace_id: source_workspace_id.to_owned(),
+            source_doc_id: source_doc_id.to_owned(),
+            target_workspace_id: target_workspace_id.to_owned(),
+            new_doc_id: new_doc_id.to_owned(),
+            creator_id: creator_id.to_owned(),
+            title_override: title_override.map(str::to_owned),
+            now: Self::now_millis(),
         };
 
-        let snapshot: Vec<u8> = row.try_get("snapshot")?;
-        let default_role: String = row.try_get("default_role")?;
-        let mode: String = row.try_get("mode")?;
-        let original_title: Option<String> = row.try_get("title").unwrap_or(None);
-        let summary: Option<String> = row.try_get("summary").unwrap_or(None);
-
-        let sanitized_title = title_override
-            .and_then(|value| {
-                let trimmed = value.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            })
-            .or_else(|| original_title.clone());
-
-        let now = Self::now_millis();
-        sqlx::query(
-            "INSERT INTO documents (
-                 id,
-                 workspace_id,
-                 snapshot,
-                 created_at,
-             updated_at,
-             default_role,
-             public,
-             blocked,
-             mode,
-                 title,
-                 summary,
-                 creator_id,
-                 updater_id,
-                 trashed_at,
-             trashed_by
-         ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, NULL, NULL)",
-        )
-        .bind(new_doc_id)
-        .bind(target_workspace_id)
-        .bind(&snapshot)
-        .bind(now)
-        .bind(now)
-        .bind(&default_role)
-        .bind(&mode)
-        .bind(sanitized_title.as_deref())
-        .bind(summary.as_deref())
-        .bind(creator_id)
-        .bind(creator_id)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-
-        let metadata = self.find_metadata(target_workspace_id, new_doc_id).await?;
-
-        Ok(metadata)
+        self.doc_repo.duplicate_doc_entry(params).await
     }
 
     pub async fn ensure_workspace_defaults(
@@ -1136,21 +728,11 @@ impl DocumentStore {
         trashed_by: &str,
     ) -> Result<Option<DocumentMetadata>> {
         let now = Self::now_millis();
-        let result = sqlx::query(
-            "UPDATE documents
-             SET trashed_at = ?, trashed_by = ?, updated_at = ?, updater_id = ?
-             WHERE workspace_id = ? AND id = ? AND trashed_at IS NULL",
-        )
-        .bind(now)
-        .bind(trashed_by)
-        .bind(now)
-        .bind(trashed_by)
-        .bind(workspace_id)
-        .bind(doc_id)
-        .execute(&self.pool)
-        .await?;
-
-        if result.rows_affected() == 0 {
+        let rows = self
+            .doc_repo
+            .set_doc_trashed(workspace_id, doc_id, now, trashed_by)
+            .await?;
+        if rows == 0 {
             return Ok(None);
         }
 
@@ -1164,19 +746,11 @@ impl DocumentStore {
         restored_by: &str,
     ) -> Result<Option<DocumentMetadata>> {
         let now = Self::now_millis();
-        let result = sqlx::query(
-            "UPDATE documents
-             SET trashed_at = NULL, trashed_by = NULL, updated_at = ?, updater_id = ?
-             WHERE workspace_id = ? AND id = ? AND trashed_at IS NOT NULL",
-        )
-        .bind(now)
-        .bind(restored_by)
-        .bind(workspace_id)
-        .bind(doc_id)
-        .execute(&self.pool)
-        .await?;
-
-        if result.rows_affected() == 0 {
+        let rows = self
+            .doc_repo
+            .restore_doc_entry(workspace_id, doc_id, now, restored_by)
+            .await?;
+        if rows == 0 {
             return Ok(None);
         }
 
@@ -1184,20 +758,8 @@ impl DocumentStore {
     }
 
     pub async fn delete_doc(&self, workspace_id: &str, doc_id: &str) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
-        let result = sqlx::query("DELETE FROM documents WHERE workspace_id = ? AND id = ?")
-            .bind(workspace_id)
-            .bind(doc_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM doc_updates WHERE space_type = ? AND space_id = ? AND doc_id = ?")
-            .bind(SPACE_TYPE_WORKSPACE)
-            .bind(workspace_id)
-            .bind(doc_id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(result.rows_affected() > 0)
+        let affected = self.doc_repo.delete_doc_entry(workspace_id, doc_id).await?;
+        Ok(affected > 0)
     }
 
     pub async fn restore_doc_history(
@@ -1207,74 +769,52 @@ impl DocumentStore {
         history_id: i64,
         updater_id: &str,
     ) -> Result<Option<DocumentMetadata>> {
-        let mut tx = self.pool.begin().await?;
-
-        let history_row = sqlx::query(
-            "SELECT snapshot FROM document_history WHERE id = ? AND workspace_id = ? AND doc_id = ?",
-        )
-        .bind(history_id)
-        .bind(workspace_id)
-        .bind(doc_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let Some(history_row) = history_row else {
-            tx.rollback().await?;
-            return Ok(None);
+        let target_snapshot = match self
+            .doc_repo
+            .fetch_history_snapshot(workspace_id, doc_id, history_id)
+            .await?
+        {
+            Some(snapshot) => snapshot,
+            None => return Ok(None),
         };
 
-        let target_snapshot: Vec<u8> = history_row.try_get("snapshot")?;
-
-        let doc_row =
-            sqlx::query("SELECT snapshot FROM documents WHERE workspace_id = ? AND id = ?")
-                .bind(workspace_id)
-                .bind(doc_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-        let Some(doc_row) = doc_row else {
-            tx.rollback().await?;
+        let Some(current_snapshot) = self
+            .doc_repo
+            .fetch_snapshot_with_timestamp(workspace_id, doc_id)
+            .await?
+        else {
             return Ok(None);
         };
-
-        let previous_snapshot: Vec<u8> = doc_row.try_get("snapshot")?;
-        let now = Utc::now().timestamp();
-
-        sqlx::query(
-            "INSERT INTO document_history (doc_id, workspace_id, snapshot, created_at)
-             VALUES (?, ?, ?, ?)",
-        )
-        .bind(doc_id)
-        .bind(workspace_id)
-        .bind(previous_snapshot)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
 
         let mut parsed = extract_doc_meta(&target_snapshot, doc_id);
         if parsed.updater_id.is_none() {
             parsed.updater_id = Some(updater_id.to_string());
         }
 
-        let updated_at = now;
+        let updated_at = Self::now_millis();
+        let history_entry = HistorySnapshotInsert {
+            snapshot: current_snapshot.snapshot,
+            created_at: updated_at,
+        };
 
-        sqlx::query(
-            "UPDATE documents SET snapshot = ?, updated_at = ?, title = ?, summary = ?,
-             updater_id = COALESCE(?, updater_id), creator_id = COALESCE(?, creator_id)
-             WHERE workspace_id = ? AND id = ?",
-        )
-        .bind(&target_snapshot)
-        .bind(updated_at)
-        .bind(parsed.title.as_deref())
-        .bind(parsed.summary.as_deref())
-        .bind(parsed.updater_id.as_deref())
-        .bind(parsed.creator_id.as_deref())
-        .bind(workspace_id)
-        .bind(doc_id)
-        .execute(&mut *tx)
-        .await?;
+        let replaced = self
+            .doc_repo
+            .replace_doc_snapshot(ReplaceDocSnapshotParams {
+                workspace_id: workspace_id.to_owned(),
+                doc_id: doc_id.to_owned(),
+                snapshot: target_snapshot.clone(),
+                updated_at,
+                title: parsed.title.clone(),
+                summary: parsed.summary.clone(),
+                creator_id: parsed.creator_id.clone(),
+                updater_id: parsed.updater_id.clone(),
+                history_entry: Some(history_entry),
+            })
+            .await?;
 
-        tx.commit().await?;
+        if !replaced {
+            return Ok(None);
+        }
 
         let metadata = self.find_metadata(workspace_id, doc_id).await?;
         Ok(metadata.map(|mut value| {
@@ -1290,19 +830,11 @@ impl DocumentStore {
         timestamp: i64,
         updater_id: &str,
     ) -> Result<Option<DocumentMetadata>> {
-        let history_id: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM document_history
-             WHERE workspace_id = ? AND doc_id = ? AND created_at <= ?
-             ORDER BY created_at DESC, id DESC
-             LIMIT 1",
-        )
-        .bind(workspace_id)
-        .bind(doc_id)
-        .bind(timestamp)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        let Some(history_id) = history_id else {
+        let Some(history_id) = self
+            .doc_repo
+            .find_history_id_before(workspace_id, doc_id, timestamp)
+            .await?
+        else {
             return Ok(None);
         };
 
@@ -1311,45 +843,11 @@ impl DocumentStore {
     }
 
     pub async fn is_public(&self, workspace_id: &str, doc_id: &str) -> Result<bool> {
-        let value: Option<i64> =
-            sqlx::query_scalar("SELECT public FROM documents WHERE workspace_id = ? AND id = ?")
-                .bind(workspace_id)
-                .bind(doc_id)
-                .fetch_optional(&self.pool)
-                .await?;
-
-        Ok(value.unwrap_or(0) != 0)
+        self.doc_repo.is_doc_public(workspace_id, doc_id).await
     }
 
     pub async fn list_public(&self, workspace_id: &str) -> Result<Vec<DocumentMetadata>> {
-        let rows = sqlx::query(
-            "SELECT
-                 d.id,
-                 d.workspace_id,
-                 d.created_at,
-                 d.updated_at,
-                 d.default_role,
-                 d.public,
-                 d.blocked,
-                 d.mode,
-                 d.title,
-                 d.summary,
-                 d.creator_id,
-                 d.updater_id,
-                                 d.trashed_at,
-                                 d.trashed_by,
-                                 l.token AS share_token
-             FROM documents d
-             LEFT JOIN doc_public_links l
-               ON l.workspace_id = d.workspace_id AND l.doc_id = d.id
-                         WHERE d.workspace_id = ? AND d.public = 1 AND d.trashed_at IS NULL
-             ORDER BY d.created_at ASC, d.id ASC",
-        )
-        .bind(workspace_id)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut records: Vec<_> = rows.into_iter().map(Self::metadata_from_row).collect();
+        let mut records = self.doc_repo.list_public_docs(workspace_id).await?;
         for record in &mut records {
             if Self::metadata_needs_backfill(record) {
                 *record = self.hydrate_metadata(record.clone()).await?;
@@ -1364,25 +862,9 @@ impl DocumentStore {
         threshold: i64,
         limit: i64,
     ) -> Result<Vec<(String, String)>> {
-        let rows = sqlx::query(
-            "SELECT space_id, doc_id
-             FROM doc_updates
-             WHERE space_type = ?
-             GROUP BY space_id, doc_id
-             HAVING COUNT(*) > ?
-             LIMIT ?",
-        )
-        .bind(SPACE_TYPE_WORKSPACE)
-        .bind(threshold)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut docs = Vec::with_capacity(rows.len());
-        for row in rows {
-            docs.push((row.try_get("space_id")?, row.try_get("doc_id")?));
-        }
-        Ok(docs)
+        self.doc_repo
+            .docs_requiring_compaction(threshold, limit)
+            .await
     }
 }
 
@@ -1392,15 +874,14 @@ impl DocumentStore {
         workspace_id: &str,
         doc_id: &str,
     ) -> Result<Vec<DocUpdateRecord>> {
-        fetch_doc_logs(
-            self.pool.clone(),
-            SPACE_TYPE_WORKSPACE,
-            workspace_id,
-            doc_id,
-        )
-        .await
+        self.doc_logs
+            .fetch_logs(SPACE_TYPE_WORKSPACE, workspace_id, doc_id)
+            .await
     }
 }
+
+static YRS_META_SUCCESS: AtomicU64 = AtomicU64::new(0);
+static YRS_META_FAILURE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default, Clone)]
 pub(crate) struct ParsedDocMeta {
@@ -1413,6 +894,10 @@ pub(crate) struct ParsedDocMeta {
 }
 
 pub(crate) fn extract_doc_meta(snapshot: &[u8], doc_id: &str) -> ParsedDocMeta {
+    if let Some(parsed) = try_extract_doc_meta_with_yrs(snapshot, doc_id) {
+        return parsed;
+    }
+
     use y_octo::Doc;
 
     let doc = match Doc::try_from_binary_v1(snapshot) {
@@ -1433,6 +918,52 @@ pub(crate) fn extract_doc_meta(snapshot: &[u8], doc_id: &str) -> ParsedDocMeta {
         Ok(json) => parse_meta_from_json(json, doc_id),
         Err(_) => ParsedDocMeta::default(),
     }
+}
+
+fn try_extract_doc_meta_with_yrs(snapshot: &[u8], doc_id: &str) -> Option<ParsedDocMeta> {
+    match parse_doc_meta_with_yrs(snapshot, doc_id) {
+        Ok(parsed) => {
+            YRS_META_SUCCESS.fetch_add(1, Ordering::Relaxed);
+            Some(parsed)
+        }
+        Err(error) => {
+            let failures = YRS_META_FAILURE.fetch_add(1, Ordering::Relaxed) + 1;
+            if failures <= 5 || failures.is_power_of_two() {
+                tracing::debug!(%doc_id, failures, ?error, "yrs doc meta fallback");
+            }
+            None
+        }
+    }
+}
+
+fn parse_doc_meta_with_yrs(snapshot: &[u8], doc_id: &str) -> Result<ParsedDocMeta> {
+    use yrs::types::ToJson;
+    use yrs::updates::decoder::Decode;
+    use yrs::{Doc as YrsDoc, Map, ReadTxn, Transact, Update};
+
+    let update = Update::decode_v1(snapshot).context("decode snapshot as yrs update")?;
+
+    let doc = YrsDoc::new();
+    {
+        let mut txn = doc.transact_mut();
+        txn.apply_update(update)
+            .context("apply snapshot update to yrs doc")?;
+    }
+
+    let txn = doc.transact();
+    let Some(meta) = txn.get_map("meta") else {
+        return Ok(ParsedDocMeta::default());
+    };
+    let Some(pages) = meta.get(&txn, "pages") else {
+        return Ok(ParsedDocMeta::default());
+    };
+    let pages_json = pages.to_json(&txn);
+    let json = match serde_json::to_value(pages_json) {
+        Ok(value) => value,
+        Err(_) => return Ok(ParsedDocMeta::default()),
+    };
+
+    Ok(parse_meta_from_json(json, doc_id))
 }
 
 fn number_to_millis(value: &JsonValue) -> Option<i64> {

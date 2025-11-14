@@ -1,12 +1,13 @@
 use async_graphql::{ID, InputObject};
 
-use crate::graphql::doc::DocRole;
+use crate::graphql::doc::{DocPermissions, DocRole};
 
 use barffine_core::doc_store::DocumentMetadata;
 
 #[derive(Clone)]
 pub struct DocType {
     pub metadata: DocumentMetadata,
+    pub cached_permissions: Option<DocPermissions>,
 }
 
 #[derive(InputObject, Clone)]

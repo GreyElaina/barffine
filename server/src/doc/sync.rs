@@ -4,6 +4,7 @@ use crate::{
     AppError, AppState, doc::channels::doc_channel_key, socket::rooms::SpaceType,
     state::SocketBroadcastMeta, types::SessionUser,
 };
+use tracing::warn;
 
 /// Controls whether the cache should be refreshed from storage before broadcasting a snapshot.
 #[derive(Clone, Copy, Debug)]
@@ -57,16 +58,40 @@ pub async fn workspace_snapshot_or_not_found(
     {
         Ok(snapshot) => Ok(snapshot),
         Err(err) => {
-            let exists = state
+            warn!(
+                workspace_id = %workspace_id,
+                doc_id = %doc_id,
+                error = %err,
+                "doc cache snapshot miss; falling back to storage",
+            );
+            let fallback = state
                 .document_store
-                .find_metadata(workspace_id, doc_id)
+                .fetch_snapshot_with_timestamp(workspace_id, doc_id)
                 .await
-                .map_err(AppError::from_anyhow)?
-                .is_some();
-            if exists {
-                Err(AppError::from_anyhow(err))
-            } else {
-                Err(AppError::doc_not_found(workspace_id, doc_id))
+                .map_err(AppError::from_anyhow)?;
+            match fallback {
+                Some(snapshot) => {
+                    if let Err(cache_err) = state
+                        .doc_cache
+                        .prime_snapshot(
+                            SpaceType::Workspace,
+                            workspace_id,
+                            doc_id,
+                            snapshot.snapshot.clone(),
+                            snapshot.updated_at,
+                        )
+                        .await
+                    {
+                        warn!(
+                            workspace_id = %workspace_id,
+                            doc_id = %doc_id,
+                            error = %cache_err,
+                            "failed to prime doc cache after fallback",
+                        );
+                    }
+                    Ok((snapshot.snapshot, snapshot.updated_at))
+                }
+                None => Err(AppError::doc_not_found(workspace_id, doc_id)),
             }
         }
     }

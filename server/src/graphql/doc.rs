@@ -17,8 +17,8 @@ use super::{
     RequestUser,
     cursors::{decode_cursor_payload, parse_timestamp_cursor},
     helpers::{
-        doc_permissions_for_user, map_anyhow, map_app_error, require_request_user,
-        timestamp_to_datetime,
+        doc_permissions_for_user_with_metadata, fetch_workspace_record, map_anyhow, map_app_error,
+        require_request_user, timestamp_to_datetime,
     },
     types::{PageInfo, PaginationInput},
     workspace::Permission,
@@ -677,38 +677,41 @@ pub(crate) async fn ensure_doc_owner_role(
 
 impl DocType {
     pub(crate) fn from_metadata(metadata: DocumentMetadata) -> Self {
-        Self { metadata }
+        Self {
+            metadata,
+            cached_permissions: None,
+        }
+    }
+
+    pub(crate) fn from_metadata_with_permissions(
+        metadata: DocumentMetadata,
+        permissions: DocPermissions,
+    ) -> Self {
+        Self {
+            metadata,
+            cached_permissions: Some(permissions),
+        }
     }
 
     async fn workspace_record(
         &self,
         ctx: &Context<'_>,
-    ) -> GraphQLResult<Option<core_workspace::WorkspaceRecord>> {
+    ) -> GraphQLResult<core_workspace::WorkspaceRecord> {
         let state = ctx.data::<AppState>()?;
-        let workspace = state
-            .workspace_store
-            .find_by_id(&self.metadata.workspace_id)
-            .await
-            .map_err(map_anyhow)?;
-        Ok(workspace)
+        fetch_workspace_record(state, &self.metadata.workspace_id).await
     }
 
     async fn workspace_owner_record(
         &self,
         ctx: &Context<'_>,
     ) -> GraphQLResult<Option<user::UserRecord>> {
-        let Some(workspace) = self.workspace_record(ctx).await? else {
-            return Ok(None);
-        };
-
+        let workspace = self.workspace_record(ctx).await?;
         let state = ctx.data::<AppState>()?;
-        let owner = state
-            .user_store
-            .find_by_id(&workspace.owner_id)
+        state
+            .user_service
+            .maybe_find_user(&workspace.owner_id)
             .await
-            .map_err(map_anyhow)?;
-
-        Ok(owner)
+            .map_err(map_app_error)
     }
 
     async fn metadata_user_record(
@@ -716,10 +719,13 @@ impl DocType {
         ctx: &Context<'_>,
         user_id: Option<&String>,
     ) -> GraphQLResult<Option<user::UserRecord>> {
-        let state = ctx.data::<AppState>()?;
         if let Some(id) = user_id {
-            let user = state.user_store.find_by_id(id).await.map_err(map_anyhow)?;
-            Ok(user)
+            let state = ctx.data::<AppState>()?;
+            state
+                .user_service
+                .maybe_find_user(id)
+                .await
+                .map_err(map_app_error)
         } else {
             Ok(None)
         }
@@ -743,12 +749,17 @@ impl DocType {
     }
 
     async fn permissions(&self, ctx: &Context<'_>) -> GraphQLResult<DocPermissions> {
+        if let Some(perms) = self.cached_permissions.as_ref() {
+            return Ok(perms.clone());
+        }
+
         if let Some(request_user) = ctx.data_opt::<RequestUser>() {
+            let workspace = self.workspace_record(ctx).await?;
             let state = ctx.data::<AppState>()?;
-            if let Some(perms) = doc_permissions_for_user(
+            if let Some(perms) = doc_permissions_for_user_with_metadata(
                 state,
-                &self.metadata.workspace_id,
-                &self.metadata.id,
+                &workspace,
+                &self.metadata,
                 &request_user.user_id,
             )
             .await?
@@ -884,11 +895,12 @@ impl DocType {
     ) -> GraphQLResult<PaginatedGrantedDocUserType> {
         let request_user = require_request_user(ctx)?;
         let state = ctx.data::<AppState>()?;
+        let workspace = self.workspace_record(ctx).await?;
 
-        let permissions = doc_permissions_for_user(
+        let permissions = doc_permissions_for_user_with_metadata(
             state,
-            &self.metadata.workspace_id,
-            &self.metadata.id,
+            &workspace,
+            &self.metadata,
             &request_user.user_id,
         )
         .await?
@@ -989,11 +1001,10 @@ mod tests {
     use crate::{
         auth::generate_password_hash,
         graphql::{self, RequestUser},
-        test_support::{insert_document, seed_workspace, setup_state},
+        testing::{insert_document, seed_workspace, setup_state},
     };
     use async_graphql::Request as GraphQLRequest;
     use serde_json::to_value;
-    use sqlx::query;
     use uuid::Uuid;
 
     #[test]
@@ -1742,18 +1753,8 @@ mod tests {
         insert_document(&database, &workspace_id, &readable_doc, false, "page").await;
         insert_document(&database, &workspace_id, &hidden_doc, false, "page").await;
 
-        query("UPDATE documents SET default_role = 'none' WHERE workspace_id = ? AND id = ?")
-            .bind(&workspace_id)
-            .bind(&readable_doc)
-            .execute(database.pool())
-            .await
-            .expect("demote readable doc default role");
-        query("UPDATE documents SET default_role = 'none' WHERE workspace_id = ? AND id = ?")
-            .bind(&workspace_id)
-            .bind(&hidden_doc)
-            .execute(database.pool())
-            .await
-            .expect("demote hidden doc default role");
+        set_default_role(&database, &workspace_id, &readable_doc, "none").await;
+        set_default_role(&database, &workspace_id, &hidden_doc, "none").await;
 
         let password_hash = generate_password_hash("secret").expect("hash password");
         let collaborator = state
@@ -1831,12 +1832,7 @@ mod tests {
         let (workspace_id, _owner_id) = seed_workspace(&state).await;
         let doc_id = Uuid::new_v4().to_string();
         insert_document(&database, &workspace_id, &doc_id, false, "page").await;
-        query("UPDATE documents SET default_role = 'none' WHERE workspace_id = ? AND id = ?")
-            .bind(&workspace_id)
-            .bind(&doc_id)
-            .execute(database.pool())
-            .await
-            .expect("demote doc default role");
+        set_default_role(&database, &workspace_id, &doc_id, "none").await;
 
         let password_hash = generate_password_hash("secret").expect("hash password");
         let collaborator = state
@@ -1899,12 +1895,7 @@ mod tests {
         let (workspace_id, _owner_id) = seed_workspace(&state).await;
         let doc_id = Uuid::new_v4().to_string();
         insert_document(&database, &workspace_id, &doc_id, false, "page").await;
-        query("UPDATE documents SET default_role = 'none' WHERE workspace_id = ? AND id = ?")
-            .bind(&workspace_id)
-            .bind(&doc_id)
-            .execute(database.pool())
-            .await
-            .expect("demote history doc default role");
+        set_default_role(&database, &workspace_id, &doc_id, "none").await;
 
         let password_hash = generate_password_hash("secret").expect("hash password");
         let collaborator = state
@@ -1990,5 +1981,19 @@ mod tests {
             .map(|value| value["name"].as_str().unwrap_or_default().to_string())
             .collect();
         assert_eq!(names, ["Page", "Edgeless"]);
+    }
+
+    async fn set_default_role(
+        database: &barffine_core::db::Database,
+        workspace_id: &str,
+        doc_id: &str,
+        role: &str,
+    ) {
+        database
+            .repositories()
+            .doc_repo()
+            .update_default_role_entry(workspace_id, doc_id, role)
+            .await
+            .expect("update default role");
     }
 }

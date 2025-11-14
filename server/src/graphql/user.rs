@@ -8,9 +8,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value as JsonValue, json};
 
 use barffine_core::{
-    feature::FeatureNamespace,
-    notification::{NotificationCenter, NotificationRecord},
-    user,
+    feature::FeatureNamespace, notification::NotificationRecord, user,
     workspace::DEFAULT_WORKSPACE_NAME,
 };
 
@@ -284,18 +282,17 @@ mod tests {
     use crate::{
         auth::generate_password_hash,
         graphql::{self, RequestUser},
-        test_support::{insert_document, seed_workspace, setup_state},
+        testing::{insert_document, seed_workspace, setup_state},
     };
     use async_graphql::{Request as GraphQLRequest, Value as GraphQLValue};
-    use barffine_core::notification::{NotificationCenter, NotificationRecord};
+    use barffine_core::notification::NotificationRecord;
     use chrono::{Duration, Utc};
     use serde_json::json;
-    use sqlx::query;
     use uuid::Uuid;
 
     #[tokio::test]
     async fn graphql_user_by_id_returns_authenticated_user() {
-        let (_temp_dir, _database, state) = setup_state().await;
+        let (_temp_dir, database, state) = setup_state().await;
         let password_hash = generate_password_hash("secret").expect("hash password");
         let user = state
             .user_store
@@ -323,7 +320,7 @@ mod tests {
 
     #[tokio::test]
     async fn graphql_user_profile_fields_reflect_database_state() {
-        let (_temp_dir, database, state) = setup_state().await;
+        let (_temp_dir, _database, state) = setup_state().await;
         let password_hash = generate_password_hash("secret").expect("hash password");
         let user = state
             .user_store
@@ -335,14 +332,25 @@ mod tests {
             .await
             .expect("create user");
 
-        let verified_at = Utc::now().timestamp();
-        query("UPDATE users SET avatar_url = ?, email_verified_at = ?, disabled = 1 WHERE id = ?")
-            .bind("https://example.com/avatar.png")
-            .bind(verified_at)
-            .bind(&user.id)
-            .execute(database.pool())
+        state
+            .user_store
+            .update_profile(
+                &user.id,
+                None,
+                Some(Some("https://example.com/avatar.png".to_string())),
+            )
             .await
-            .expect("update profile fields");
+            .expect("update avatar");
+        state
+            .user_store
+            .set_email_verified(&user.id, true)
+            .await
+            .expect("verify email");
+        state
+            .user_store
+            .set_disabled(&user.id, true)
+            .await
+            .expect("disable user");
 
         let schema = graphql::build_schema(state.clone());
         let query = "{ currentUser { name avatarUrl emailVerified disabled } }";

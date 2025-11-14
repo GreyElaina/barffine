@@ -7,10 +7,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use barffine_core::{config::AppConfig, db::Database};
-use barffine_server::{
-    build_state, socket::rooms::SpaceType, state::AppState, utils::db::run_migrations,
+use barffine_core::{
+    config::{AppConfig, BlobStoreBackend, DocDataBackend},
+    db::Database,
 };
+use barffine_server::{build_state, socket::rooms::SpaceType, state::AppState};
 use clap::Parser;
 use pprof::ProfilerGuardBuilder;
 use tokio::task::JoinSet;
@@ -149,15 +150,20 @@ async fn prepare_state() -> Result<WorkloadContext> {
         .join("profile.db")
         .to_string_lossy()
         .to_string();
+    config.doc_data_backend = DocDataBackend::Sqlite;
+    config.doc_data_path = tmp_dir.path().join("doc-kv").to_string_lossy().to_string();
+    config.blob_store_backend = BlobStoreBackend::Sql;
+    config.blob_store_path = tmp_dir
+        .path()
+        .join("blob-store")
+        .to_string_lossy()
+        .to_string();
 
     let database = Database::connect(&config)
         .await
         .context("connect sqlite database")?;
-    run_migrations(database.pool())
-        .await
-        .context("apply migrations")?;
 
-    let state = build_state(&database);
+    let state = build_state(&database, &config);
     state
         .workspace_store
         .normalize_member_statuses()

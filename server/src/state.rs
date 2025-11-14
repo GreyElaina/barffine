@@ -21,13 +21,22 @@ use tracing::{info, warn};
 use barffine_core::{
     access_token::AccessTokenStore,
     blob::BlobStorage,
-    comment_attachment::SqliteCommentAttachmentStore,
-    comment_store::SqliteCommentStore,
+    comment_attachment::CommentAttachmentStore,
+    comment_store::RepositoryCommentStore,
+    config::{AppConfig, BlobStoreBackend, DatabaseBackend, DocStoreBackend},
     db::Database,
+    db::{
+        libsql::notification_center::LibsqlNotificationCenter,
+        postgres::notification_center::PostgresNotificationCenter,
+        rocks::{blob_store::RocksBlobStorage, notification_center::RocksNotificationCenter},
+        sql::blob_store::SqlBlobStorage,
+        sqlite::notification_center::SqliteNotificationCenter,
+    },
+    doc_data::DocDataBackend,
     doc_roles::DocumentRoleStore,
     doc_store::{DOC_UPDATE_LOG_LIMIT, DocumentStore},
     feature::{DeterministicFeatureStore, FeatureFlag, FeatureNamespace, FeatureSnapshot},
-    notification_store::SqliteNotificationCenter,
+    notification::{CommentStore as CommentStoreTrait, NotificationCenter},
     user::UserStore,
     user_doc_store::UserDocStore,
     user_settings::UserSettingsStore,
@@ -37,7 +46,6 @@ use barffine_core::{
 
 use crate::oauth::OAuthService;
 use crate::{
-    blob_store::SqliteBlobStorage,
     crypto::DocTokenSigner,
     doc::{
         cache::{DocCache, DocCacheBuilder, DocCacheConfig},
@@ -45,7 +53,10 @@ use crate::{
     },
     feature_service::FeatureService,
     graphql::copilot::CopilotSessionRecord,
-    socket::rooms::{RoomKind, SpaceType, space_room_name},
+    socket::{
+        rooms::{RoomKind, SpaceType, space_room_name},
+        types::SocketRequestDeduper,
+    },
     types::SessionUser,
     user::service::UserService,
     workspace::service::WorkspaceService,
@@ -68,9 +79,9 @@ pub struct AppState {
     pub user_doc_store: UserDocStore,
     pub doc_role_store: DocumentRoleStore,
     pub access_token_store: AccessTokenStore,
-    pub comment_store: SqliteCommentStore,
-    pub comment_attachment_store: SqliteCommentAttachmentStore,
-    pub notification_center: SqliteNotificationCenter,
+    pub comment_store: Arc<dyn CommentStoreTrait>,
+    pub comment_attachment_store: CommentAttachmentStore,
+    pub notification_center: Arc<dyn NotificationCenter>,
     pub sync_hub: SyncHub,
     pub doc_sessions: Arc<DocSessionManager>,
     pub doc_cache: Arc<DocCache>,
@@ -91,6 +102,7 @@ pub struct AppState {
     pub socket_metrics: Arc<SocketMetrics>,
     pub workspace_embedding_events: broadcast::Sender<WorkspaceEmbeddingEvent>,
     pub oauth: Arc<OAuthService>,
+    pub request_deduper: Arc<SocketRequestDeduper>,
 }
 
 #[derive(Clone, Default)]
@@ -219,24 +231,7 @@ impl SyncHub {
             }
         }
 
-        let mut legacy_payload = json!({
-            "spaceType": space_type,
-            "spaceId": space_id,
-            "docId": doc_id,
-            "updates": base_updates,
-            "timestamp": timestamp,
-        });
-
-        if let JsonValue::Object(ref mut map) = legacy_payload {
-            if let Some(editor_user) = editor_user {
-                map.insert("editor".to_string(), json!(editor_user.id));
-            } else if let Some(editor_id) = editor_id {
-                map.insert("editor".to_string(), json!(editor_id));
-            }
-        }
-
         let room_sync = space_room_name(space_type, &space_id, RoomKind::Sync);
-        let room_legacy = space_room_name(space_type, &space_id, RoomKind::LegacySync);
 
         let io_for_sync = io.clone();
         let payload_sync = payload.clone();
@@ -248,19 +243,6 @@ impl SyncHub {
                     .await
                 {
                     warn!(?err, "failed to emit socket doc update");
-                }
-            }
-        });
-
-        let io_for_legacy = io.clone();
-        spawn(async move {
-            if let Some(ns) = io_for_legacy.of("/") {
-                if let Err(err) = ns
-                    .to(room_legacy)
-                    .emit("space:broadcast-doc-updates", &legacy_payload)
-                    .await
-                {
-                    info!(?err, "failed to emit legacy doc update");
                 }
             }
         });
@@ -628,18 +610,22 @@ fn namespace_to_string(namespace: &FeatureNamespace) -> String {
     }
 }
 
-pub fn build_state(database: &Database) -> AppState {
-    build_state_with_config(database, StateBuildConfig::default())
+pub fn build_state(database: &Database, app_config: &AppConfig) -> AppState {
+    build_state_with_config(database, app_config, StateBuildConfig::default())
 }
 
-pub fn build_state_with_config(database: &Database, config: StateBuildConfig) -> AppState {
+pub fn build_state_with_config(
+    database: &Database,
+    app_config: &AppConfig,
+    config: StateBuildConfig,
+) -> AppState {
     let deterministic_store = DeterministicFeatureStore::with_global_defaults();
     let workspace_feature_store = WorkspaceFeatureStore::new(database);
     let workspace_embedding_files = Arc::new(DashMap::new());
     let workspace_embedding_ignored_docs = Arc::new(DashMap::new());
     let copilot_sessions = Arc::new(DashMap::new());
-    let comment_attachment_store = SqliteCommentAttachmentStore::new(database);
-    let blob_store: Arc<dyn BlobStorage> = Arc::new(SqliteBlobStorage::new(database));
+    let comment_attachment_store = CommentAttachmentStore::new(database);
+    let blob_store = create_blob_store(database, app_config);
     let doc_token_signer = Arc::new(DocTokenSigner::new());
     let server_path = detect_server_path();
     let base_url = compute_base_url(server_path.as_deref());
@@ -649,20 +635,39 @@ pub fn build_state_with_config(database: &Database, config: StateBuildConfig) ->
     let (workspace_embedding_events, _) = broadcast::channel(64);
     let document_store = DocumentStore::new(database);
     let user_doc_store = UserDocStore::new(database);
-    let doc_cache_builder = DocCacheBuilder::new(document_store.clone(), user_doc_store.clone());
-    let doc_cache = Arc::new(if let Some(doc_cache_config) = config.doc_cache.clone() {
-        doc_cache_builder.with_config(doc_cache_config).build()
-    } else {
-        doc_cache_builder.build()
-    });
+    let doc_cache = match app_config.doc_store_backend {
+        DocStoreBackend::Sql => {
+            let doc_cache_builder = DocCacheBuilder::new(
+                document_store.clone(),
+                user_doc_store.clone(),
+                database
+                    .doc_data_store()
+                    .map(|store| store as Arc<dyn DocDataBackend>),
+            );
+            Arc::new(if let Some(doc_cache_config) = config.doc_cache.clone() {
+                doc_cache_builder.with_config(doc_cache_config).build()
+            } else {
+                doc_cache_builder.build()
+            })
+        }
+        DocStoreBackend::RocksDb => {
+            // When the doc store backend is RocksDB, we bypass the
+            // in-memory doc cache and go directly to storage for
+            // snapshots/updates.
+            Arc::new(DocCache::new_bypass(
+                document_store.clone(),
+                user_doc_store.clone(),
+            ))
+        }
+    };
     let user_store = UserStore::new(database);
     let user_service = Arc::new(UserService::new(user_store.clone()));
     let user_settings = UserSettingsStore::new(database);
     let workspace_store = WorkspaceStore::new(database);
     let doc_role_store = DocumentRoleStore::new(database);
     let access_token_store = AccessTokenStore::new(database);
-    let comment_store = SqliteCommentStore::new(database);
-    let notification_center = SqliteNotificationCenter::new(database);
+    let comment_store = create_comment_store(database);
+    let notification_center = create_notification_center(database);
     let workspace_service = Arc::new(WorkspaceService::new(
         workspace_store.clone(),
         user_store.clone(),
@@ -677,6 +682,7 @@ pub fn build_state_with_config(database: &Database, config: StateBuildConfig) ->
     ));
     let doc_sessions = Arc::new(DocSessionManager::default());
     let sync_hub = SyncHub::new(socket_io.clone(), socket_metrics.clone());
+    let request_deduper = Arc::new(SocketRequestDeduper::default());
 
     let state = AppState {
         user_store,
@@ -688,7 +694,7 @@ pub fn build_state_with_config(database: &Database, config: StateBuildConfig) ->
         access_token_store,
         comment_store,
         comment_attachment_store,
-        notification_center,
+        notification_center: notification_center.clone(),
         sync_hub,
         doc_sessions,
         doc_cache,
@@ -708,11 +714,105 @@ pub fn build_state_with_config(database: &Database, config: StateBuildConfig) ->
         socket_metrics,
         workspace_embedding_events,
         oauth,
+        request_deduper,
     };
 
     spawn_background_tasks(&state);
 
     state
+}
+
+fn create_notification_center(database: &Database) -> Arc<dyn NotificationCenter> {
+    if let Ok(value) = env::var("BARFFINE_NOTIFICATION_CENTER_BACKEND") {
+        let backend = value.trim().to_ascii_lowercase();
+        if !backend.is_empty() && backend != "auto" {
+            match backend.as_str() {
+                "libsql" => match database.backend() {
+                    DatabaseBackend::Libsql => {
+                        info!(
+                            "using LibsqlNotificationCenter (BARFFINE_NOTIFICATION_CENTER_BACKEND={backend})"
+                        );
+                        return Arc::new(LibsqlNotificationCenter::new(database));
+                    }
+                    other => {
+                        panic!(
+                            "BARFFINE_NOTIFICATION_CENTER_BACKEND=libsql requires \
+                             BARFFINE_DATABASE_BACKEND=libsql (current backend: {other:?})"
+                        );
+                    }
+                },
+                "rocksdb" | "rocks" => {
+                    if let Some(doc_data) = database.doc_data_store() {
+                        info!(
+                            "using RocksNotificationCenter (BARFFINE_NOTIFICATION_CENTER_BACKEND={backend})"
+                        );
+                        return Arc::new(RocksNotificationCenter::new(doc_data));
+                    }
+                    panic!(
+                        "BARFFINE_NOTIFICATION_CENTER_BACKEND=rocksdb requires \
+                         BARFFINE_DOC_DATA_BACKEND=rocksdb; doc data store is not configured"
+                    );
+                }
+                "sqlite" => match database.backend() {
+                    DatabaseBackend::Sqlite => {
+                        info!(
+                            "using SqliteNotificationCenter (BARFFINE_NOTIFICATION_CENTER_BACKEND={backend})"
+                        );
+                        return Arc::new(SqliteNotificationCenter::new(database));
+                    }
+                    other => {
+                        panic!(
+                            "BARFFINE_NOTIFICATION_CENTER_BACKEND=sqlite requires \
+                             BARFFINE_DATABASE_BACKEND=sqlite (current backend: {other:?})"
+                        );
+                    }
+                },
+                "postgres" | "postgresql" | "pg" => match database.backend() {
+                    DatabaseBackend::Postgres => {
+                        info!(
+                            "using PostgresNotificationCenter (BARFFINE_NOTIFICATION_CENTER_BACKEND={backend})"
+                        );
+                        return Arc::new(PostgresNotificationCenter::new(database));
+                    }
+                    other => {
+                        panic!(
+                            "BARFFINE_NOTIFICATION_CENTER_BACKEND=postgres requires \
+                             BARFFINE_DATABASE_BACKEND=postgres (current backend: {other:?})"
+                        );
+                    }
+                },
+                other => {
+                    warn!(
+                        "unsupported BARFFINE_NOTIFICATION_CENTER_BACKEND='{other}'; falling back to default notification backend"
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(doc_data) = database.doc_data_store() {
+        Arc::new(RocksNotificationCenter::new(doc_data))
+    } else {
+        match database.backend() {
+            DatabaseBackend::Sqlite => Arc::new(SqliteNotificationCenter::new(database)),
+            DatabaseBackend::Postgres => Arc::new(PostgresNotificationCenter::new(database)),
+            DatabaseBackend::Libsql => Arc::new(LibsqlNotificationCenter::new(database)),
+        }
+    }
+}
+
+fn create_blob_store(database: &Database, app_config: &AppConfig) -> Arc<dyn BlobStorage> {
+    match app_config.blob_store_backend {
+        BlobStoreBackend::Sql => Arc::new(SqlBlobStorage::new(database)),
+        BlobStoreBackend::Rocks => Arc::new(
+            RocksBlobStorage::open(&app_config.blob_store_path)
+                .unwrap_or_else(|err| panic!("failed to open rocksdb blob store: {err}")),
+        ),
+    }
+}
+
+fn create_comment_store(database: &Database) -> Arc<dyn CommentStoreTrait> {
+    Arc::new(RepositoryCommentStore::new(database))
 }
 
 fn detect_server_path() -> Option<String> {

@@ -26,7 +26,7 @@ If you prefer containers over a local Rust toolchain, use the published image at
    ```shell
    docker pull ghcr.io/greyelaina/barffine:latest
    ```
-2. Prepare a `.env` file (see below) and a data directory on the host for the SQLite file, then start the container:
+2. Prepare a `.env` file (see below) and a data directory on the host for the SQLite + doc-data files, then start the container:
    ```shell
    docker run -d \
      --name barffine \
@@ -35,12 +35,13 @@ If you prefer containers over a local Rust toolchain, use the published image at
      -v $(pwd)/data:/app/data \
      ghcr.io/greyelaina/barffine:latest
    ```
-   The example mounts `./data` so the SQLite database persists outside the container. Adjust the port mapping when reverse proxies or different hosts are involved.
+   The example mounts `./data`, which now contains both `barffine.db` and the RocksDB column families under `data/doc-kv`. Adjust the port mapping when reverse proxies or different hosts are involved, and make sure the host volume has enough inodes/space for the additional KV files.
 3. Use `docker logs -f barffine` to monitor startup and reuse the operational commands below via `docker exec barffine <command>` when needed.
 
 `docker-compose.ghcr.yml` mirrors these steps and can be used as a template for multi-container deployments.
 
 ## Operational commands
+
 | Command | Description |
 | --- | --- |
 | `cargo run -p barffine-server -- serve` | Start the HTTP, GraphQL, and Socket.IO services (default subcommand). |
@@ -49,14 +50,23 @@ If you prefer containers over a local Rust toolchain, use the published image at
 Planned CLI parity with the Node backend (see `server/src/cli/mod.rs`) documents future subcommands such as `data-migrate` and workspace inspection.
 
 ## Configuration
-Barffine loads configuration in the following order (later items win): defaults → optional TOML file pointed to by `BARFFINE_CONFIG_FILE` → environment variables → `.env` (via `dotenvy`). Keep `.env` around for local runs and promote the same values into your process manager when deploying.
+
+Barffine resolves configuration in the following order (later items win): built-in defaults → environment variables → `.env` (via `dotenvy`). Keep a `.env` file for local runs and mirror the same values into your process manager or orchestration layer when deploying.
 
 Key variables:
 
 | Variable | Default / Example | Notes |
 | --- | --- | --- |
 | `BARFFINE_BIND_ADDRESS` | `127.0.0.1:8081` | Socket address for the HTTP listener. |
-| `BARFFINE_DATABASE_PATH` | `./data/barffine.db` | Path to the sqlite-only database. |
+| `BARFFINE_DATABASE_PATH` | `./data` | Directory that stores the SQLite metadata database (Barffine creates `barffine.db` inside) and co-locates RocksDB column families. Keep this pointing at a directory; file paths are best-effort supported for backward compatibility. |
+| `BARFFINE_DATABASE_BACKEND` | `sqlite` | Choose `sqlite`, `postgres`, or `libsql`. |
+| `BARFFINE_DATABASE_URL` | `postgres://user:pass@localhost:5432/barffine` | Required when `BARFFINE_DATABASE_BACKEND=postgres`; ignored otherwise. |
+| `BARFFINE_LIBSQL_URL` | unset | When `BARFFINE_DATABASE_BACKEND=libsql`, set this to a remote libsql endpoint (e.g. a Turso database or self-hosted `sqld`) to use remote storage instead of an embedded file. Leave unset to use a local libsql database at `BARFFINE_DATABASE_PATH`. |
+| `BARFFINE_LIBSQL_AUTH_TOKEN` | unset | Optional auth token used when connecting to `BARFFINE_LIBSQL_URL` (for Turso or protected `sqld` instances). |
+| `BARFFINE_DATABASE_MAX_CONNECTIONS` | `16` | Controls the metadata connection pool size. Increase for higher concurrency. |
+| `BARFFINE_DOC_DATA_BACKEND` | `sqlite` / `rocksdb` | Selects where doc updates, snapshots, notifications, and other large KV payloads live. |
+| `BARFFINE_DOC_DATA_PATH` | `./data/doc-kv` | Directory for RocksDB column families (used when `BARFFINE_DOC_DATA_BACKEND=rocksdb`). |
+| `BARFFINE_NOTIFICATION_CENTER_BACKEND` | unset / `auto` | Optional override for the notification backend. See “Notification center backend” below for supported values and defaults. |
 | `BARFFINE_BASE_URL` | Derived from host/port | Used to build absolute links returned to clients. Set when exposing Barffine behind a proxy. |
 | `BARFFINE_SERVER_HOST` / `BARFFINE_SERVER_PORT` | `127.0.0.1` / `8081` | Populate compatibility metadata surfaced to AFFiNE clients / Proxy. |
 | `BARFFINE_SERVER_PATH` / `BARFFINE_SERVER_SUB_PATH` | unset | Mount the API under a prefix when sitting behind a reverse proxy. |
@@ -69,6 +79,57 @@ Key variables:
 | `LOGFIRE_TOKEN` | unset | Enables Logfire export; tracing falls back to `tracing_subscriber` when absent. |
 | `RUST_LOG` | `info` | Standard Rust log filter. |
 | `BARFFINE_TRACE_*` | unset | Control sampling behaviour for custom tracing (see `server/src/observability.rs`). |
+
+### Libsql remote / sqld
+
+When `BARFFINE_DATABASE_BACKEND=libsql`:
+
+- If `BARFFINE_LIBSQL_URL` is **unset**, Barffine uses an embedded libsql database file under `BARFFINE_DATABASE_PATH` (default: `./data/barffine.db`), similar to the default SQLite mode but backed by libsql.
+- If `BARFFINE_LIBSQL_URL` is **set**, Barffine connects to that remote libsql endpoint (for example a Turso database or a self-hosted `sqld` instance such as `libsql://127.0.0.1:8080` or `https://<db>-<org>.turso.io`) and automatically runs the bundled SQLite migrations against it on startup.
+
+In remote mode, the metadata schema is kept in sync with the SQLite/Postgres backends, and you can still choose where to store high-volume doc data via `BARFFINE_DOC_DATA_BACKEND` (`sqlite` or `rocksdb`).
+
+### Example `.env`
+
+```dotenv
+AFFINE_VERSION=0.25.0
+DEPLOYMENT_TYPE=selfhosted
+SERVER_FLAVOR=allinone
+
+BARFFINE_DATABASE_PATH=./data
+BARFFINE_BASE_URL=http://127.0.0.1:8081
+BARFFINE_PUBLIC_BASE_URL=http://127.0.0.1:8081
+BARFFINE_SERVER_NAME="Barffine Server"
+BARFFINE_SERVER_HOST=127.0.0.1
+BARFFINE_SERVER_PORT=8081
+
+BARFFINE_DOC_DATA_BACKEND=rocksdb
+BARFFINE_DOC_DATA_PATH=./data/doc-kv
+
+RUST_LOG=info,tower_http=trace,axum=debug
+```
+
+### Notification center backend
+
+Barffine uses a `NotificationCenter` to store and fan out comment/mention/workspace notifications.
+
+By default (when `BARFFINE_NOTIFICATION_CENTER_BACKEND` is unset or set to `auto`):
+
+- If `BARFFINE_DOC_DATA_BACKEND=rocksdb`, Barffine uses `RocksNotificationCenter` backed by the RocksDB doc-data store (`notifications` column family).
+- Otherwise, Barffine picks a backend that matches the metadata database:
+  - `DatabaseBackend::Sqlite` → `SqliteNotificationCenter`
+  - `DatabaseBackend::Postgres` → `PostgresNotificationCenter`
+  - `DatabaseBackend::Libsql` → `LibsqlNotificationCenter`
+
+You can override this selection with `BARFFINE_NOTIFICATION_CENTER_BACKEND`:
+
+- `auto` (or unset): use the default detection described above.
+- `rocksdb` / `rocks`: force `RocksNotificationCenter`. Requires `BARFFINE_DOC_DATA_BACKEND=rocksdb`, otherwise the server will fail to start.
+- `sqlite`: force `SqliteNotificationCenter`. Requires `BARFFINE_DATABASE_BACKEND=sqlite`.
+- `postgres` / `postgresql` / `pg`: force `PostgresNotificationCenter`. Requires `BARFFINE_DATABASE_BACKEND=postgres`.
+- `libsql`: force `LibsqlNotificationCenter`. Requires `BARFFINE_DATABASE_BACKEND=libsql` (local or remote).
+
+Unsupported values are ignored with a warning and Barffine falls back to the default backend. For most deployments, leaving this setting unset is recommended.
 
 ### OAuth providers
 
@@ -83,19 +144,17 @@ Barffine now exposes the same `/api/oauth/*` endpoints and GraphQL metadata as t
 
 Use `BARFFINE_ALLOW_OAUTH_SIGNUP` (defaults to `true`) to forbid new users from being created through OAuth flows while still allowing existing linked accounts to sign in.
 
-Example `.env`:
+## Doc-data backend (RocksDB)
 
-```dotenv
-AFFINE_VERSION=0.25.0
-DEPLOYMENT_TYPE=selfhosted
-SERVER_FLAVOR=allinone
+When `BARFFINE_DOC_DATA_BACKEND=rocksdb`, the server opens `BARFFINE_DOC_DATA_PATH` as a RocksDB instance with multiple column families:
 
-BARFFINE_DATABASE_PATH=./data/barffine.db
-BARFFINE_BASE_URL=http://127.0.0.1:8081
-BARFFINE_PUBLIC_BASE_URL=http://127.0.0.1:8081
-BARFFINE_SERVER_NAME="Barffine Server"
-BARFFINE_SERVER_HOST=127.0.0.1
-BARFFINE_SERVER_PORT=8081
+| Column family | Usage |
+| --- | --- |
+| `doc_logs` | Per-document Yjs update logs and sequence counters for workspace + userspace documents (used by the doc update log store). |
+| `doc_snapshots` | External storage for document and userspace snapshots referenced from the SQL metadata database via `DocSnapshotStore`. |
+| `doc_cache` | Reserved for a future persistent doc cache backend (currently unused; in-memory cache is used instead). |
+| `notifications` | Unread notification list + per-user counters (`RocksNotificationCenter`). |
+| `doc_store` | Workspace and userspace document metadata + latest snapshots when the Rocks-backed doc store is enabled. |
+| `doc_history` | Long-lived document history snapshots maintained by the Rocks-backed doc store (mirrors the `document_history` table semantics). |
 
-RUST_LOG=info,tower_http=trace,axum=debug
-```
+If the backend stays on `sqlite`, the stores fall back to inline blobs inside the existing tables; no extra setup is required. Switching to RocksDB for doc-data is incremental—new writes land in the KV store, while old rows without KV keys continue to read from SQLite until they are rewritten or deleted. Resolved notifications are deleted immediately in either backend, matching client expectations and reducing churn on SQLite.

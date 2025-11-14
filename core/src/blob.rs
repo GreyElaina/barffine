@@ -5,6 +5,13 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Pseudo workspace namespace for storing user avatars inside the generic blob store.
+///
+/// This constant is shared between the server's avatar handlers and
+/// the database-backed blob stores so that namespace data can be
+/// partitioned cleanly from normal workspace blobs.
+pub const AVATAR_STORAGE_NAMESPACE: &str = "__avatars__";
+
 /// Descriptor for a blob belonging to a workspace or document context.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlobDescriptor {
@@ -132,5 +139,40 @@ mod tests {
         let descriptor = BlobDescriptor::new("workspace", "path/to/blob");
         assert_eq!(descriptor.workspace_id, "workspace");
         assert_eq!(descriptor.key, "path/to/blob");
+    }
+}
+
+/// Logical scope for blob persistence (workspace vs. special namespaces such as avatars).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobScope {
+    Workspace { workspace_id: String },
+    Namespace { namespace: String },
+}
+
+impl BlobScope {
+    pub fn workspace(workspace_id: impl Into<String>) -> Self {
+        Self::Workspace {
+            workspace_id: workspace_id.into(),
+        }
+    }
+
+    pub fn namespace(namespace: impl Into<String>) -> Self {
+        Self::Namespace {
+            namespace: namespace.into(),
+        }
+    }
+
+    pub fn workspace_id(&self) -> Option<&str> {
+        match self {
+            Self::Workspace { workspace_id } => Some(workspace_id.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn identifier(&self) -> &str {
+        match self {
+            Self::Workspace { workspace_id } => workspace_id,
+            Self::Namespace { namespace } => namespace,
+        }
     }
 }

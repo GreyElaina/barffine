@@ -9,7 +9,7 @@ use crate::{
         build_session_cookie, build_user_cookie, clear_session_cookie, clear_user_cookie,
         extract_session_token,
     },
-    observability,
+    observability, request_cache,
     state::AppState,
     types::{AuthenticatedRestSession, SessionLookup, SessionUser},
 };
@@ -56,16 +56,19 @@ impl UserService {
     where
         F: FnOnce() -> AppError,
     {
-        self.user_store
-            .find_by_id(user_id)
-            .await
-            .map_err(AppError::from_anyhow)?
-            .ok_or_else(not_found)
+        self.find_user_cached(user_id).await?.ok_or_else(not_found)
     }
 
     pub async fn fetch_user(&self, user_id: &str) -> Result<user::UserRecord, AppError> {
         self.fetch_user_with(user_id, || AppError::not_found("user not found"))
             .await
+    }
+
+    pub async fn maybe_find_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<user::UserRecord>, AppError> {
+        self.find_user_cached(user_id).await
     }
 
     pub async fn authenticate_rest_request(
@@ -85,12 +88,7 @@ impl UserService {
             return Err(AppError::unauthorized("session expired"));
         };
 
-        let Some(user) = self
-            .user_store
-            .find_by_id(&session.user_id)
-            .await
-            .map_err(AppError::from_anyhow)?
-        else {
+        let Some(user) = self.find_user_cached(&session.user_id).await? else {
             return Err(AppError::unauthorized("authentication required"));
         };
 
@@ -134,12 +132,7 @@ impl UserService {
             });
         };
 
-        let Some(user) = self
-            .user_store
-            .find_by_id(&session.user_id)
-            .await
-            .map_err(AppError::from_anyhow)?
-        else {
+        let Some(user) = self.find_user_cached(&session.user_id).await? else {
             self.delete_session(&session.id).await?;
             cookies.push(clear_session_cookie());
             cookies.push(clear_user_cookie());
@@ -176,10 +169,47 @@ impl UserService {
     }
 
     pub async fn is_admin(&self, user_id: &str) -> Result<bool, AppError> {
-        self.user_store
-            .is_admin(user_id)
-            .await
-            .map_err(AppError::from_anyhow)
+        self.is_admin_cached(user_id).await
+    }
+
+    pub fn invalidate_user_cache(&self, user_id: &str) {
+        if let Some(caches) = request_cache::current_request_caches() {
+            caches.user_records().invalidate(user_id);
+            caches.user_admin().invalidate(user_id);
+        }
+    }
+
+    async fn find_user_cached(&self, user_id: &str) -> Result<Option<user::UserRecord>, AppError> {
+        let fetch = || async {
+            self.user_store
+                .find_by_id(user_id)
+                .await
+                .map_err(AppError::from_anyhow)
+        };
+
+        if let Some(caches) = request_cache::current_request_caches() {
+            return caches
+                .user_records()
+                .get_or_fetch(user_id, || fetch())
+                .await;
+        }
+
+        fetch().await
+    }
+
+    async fn is_admin_cached(&self, user_id: &str) -> Result<bool, AppError> {
+        let fetch = || async {
+            self.user_store
+                .is_admin(user_id)
+                .await
+                .map_err(AppError::from_anyhow)
+        };
+
+        if let Some(caches) = request_cache::current_request_caches() {
+            return caches.user_admin().get_or_fetch(user_id, || fetch()).await;
+        }
+
+        fetch().await
     }
 }
 

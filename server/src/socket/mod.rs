@@ -2,7 +2,7 @@ mod ack;
 mod auth;
 mod events;
 pub mod rooms;
-mod types;
+pub mod types;
 
 use socketioxide::{SocketIo, layer::SocketIoLayer};
 

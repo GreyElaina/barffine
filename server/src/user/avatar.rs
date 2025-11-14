@@ -1,7 +1,4 @@
-use barffine_core::blob::BlobDescriptor;
-
-/// Pseudo workspace namespace for storing user avatars inside the generic blob store.
-pub(crate) const AVATAR_STORAGE_NAMESPACE: &str = "__avatars__";
+use barffine_core::blob::{AVATAR_STORAGE_NAMESPACE, BlobDescriptor};
 
 /// Route prefix used by the HTTP handler that serves avatar binaries.
 pub(crate) const AVATAR_ROUTE_PREFIX: &str = "/api/avatars/";

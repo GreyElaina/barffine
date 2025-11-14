@@ -9,7 +9,7 @@ use super::context::ClientVersion;
 use crate::oauth::OAuthProviderKind;
 use crate::{
     AppError, AppState,
-    doc::{history, sync::workspace_snapshot_or_not_found},
+    doc::{history, metadata as doc_metadata, sync::workspace_snapshot_or_not_found},
     workspace::{
         invites::{self as workspace_invites, InviteLinkLookup},
         service::WorkspaceService,
@@ -31,8 +31,9 @@ use super::{
     UserOrLimitedUser, UserType, WorkspaceType, default_copilot_prompts,
     default_subscription_prices, doc::WorkspaceUserGraph, ensure_document_exists,
     ensure_workspace_exists, fetch_workspace_record, map_anyhow, map_app_error,
-    normalize_non_empty_input, parse_feature_namespace, require_admin_user, require_doc_permission,
-    require_request_user, require_workspace_permission, workspace_permission_for_user,
+    normalize_non_empty_input, parse_feature_namespace, require_admin_user,
+    require_doc_permission_with_metadata_hint, require_request_user, require_workspace_permission,
+    workspace_permission_for_user,
 };
 use serde_json::{Value as JsonValue, json};
 
@@ -575,18 +576,21 @@ impl QueryRoot {
 
         let _ = op;
 
-        require_doc_permission(
+        let state = ctx.data::<AppState>()?;
+        let metadata = doc_metadata::fetch_required(state, &workspace_id, &doc_id)
+            .await
+            .map_err(map_app_error)?;
+
+        require_doc_permission_with_metadata_hint(
             ctx,
             &workspace_id,
-            &doc_id,
+            &metadata,
             |perms| perms.can_update_doc(),
             "Doc.Update permission required",
         )
         .await?;
 
-        let state = ctx.data::<AppState>()?;
         ensure_workspace_exists(state, &workspace_id).await?;
-        ensure_document_exists(state, &workspace_id, &doc_id).await?;
 
         Ok(updates.trim().to_string())
     }
@@ -857,7 +861,7 @@ fn parse_bool(value: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{graphql::build_schema, test_support::setup_state};
+    use crate::{graphql::build_schema, testing::setup_state};
     use async_graphql::Request;
     use once_cell::sync::Lazy;
     use tokio::sync::Mutex;

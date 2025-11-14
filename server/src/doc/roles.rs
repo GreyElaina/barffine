@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 
 use barffine_core::{
-    notification::{NotificationCenter, NotificationRecord},
+    doc_roles::{DocumentRoleRecord, DocumentRoleStore},
+    notification::NotificationRecord,
     user_settings::NotificationPreferenceKind,
     workspace::WorkspaceRecord,
 };
@@ -9,7 +10,7 @@ use chrono::Utc;
 use serde_json::{Value as JsonValue, json};
 use uuid::Uuid;
 
-use crate::{AppError, AppState};
+use crate::{AppError, AppState, request_cache};
 
 fn notification_preference_from_kind(kind: &str) -> NotificationPreferenceKind {
     if kind == "comment.mention" {
@@ -123,6 +124,38 @@ pub async fn notify_owner_and_creator(
     Ok(())
 }
 
+pub async fn doc_role_for_user_cached(
+    doc_role_store: &DocumentRoleStore,
+    workspace_id: &str,
+    doc_id: &str,
+    user_id: &str,
+) -> Result<Option<DocumentRoleRecord>, AppError> {
+    let fetch = || async {
+        doc_role_store
+            .find_for_user(workspace_id, doc_id, user_id)
+            .await
+            .map_err(AppError::from_anyhow)
+    };
+
+    if let Some(caches) = request_cache::current_request_caches() {
+        return caches
+            .doc_roles()
+            .get_or_fetch(workspace_id, doc_id, user_id, || fetch())
+            .await;
+    }
+
+    fetch().await
+}
+
+pub fn invalidate_doc_role_cache(workspace_id: &str, doc_id: &str, user_id: &str) {
+    if let Some(caches) = request_cache::current_request_caches() {
+        caches.doc_roles().invalidate(workspace_id, doc_id, user_id);
+        caches
+            .doc_permissions()
+            .invalidate(workspace_id, doc_id, user_id);
+    }
+}
+
 pub async fn assign_doc_roles(
     state: &AppState,
     workspace: &WorkspaceRecord,
@@ -145,6 +178,7 @@ pub async fn assign_doc_roles(
             .upsert(&workspace.id, doc_id, user_id, role_label)
             .await
             .map_err(AppError::from_anyhow)?;
+        invalidate_doc_role_cache(&workspace.id, doc_id, user_id);
 
         notify_doc_activity(
             state,
@@ -180,6 +214,7 @@ pub async fn revoke_doc_role(
         .remove(&workspace.id, doc_id, user_id)
         .await
         .map_err(AppError::from_anyhow)?;
+    invalidate_doc_role_cache(&workspace.id, doc_id, user_id);
 
     notify_doc_activity(
         state,
@@ -213,6 +248,7 @@ pub async fn update_doc_role(
         .upsert(&workspace.id, doc_id, user_id, role_label)
         .await
         .map_err(AppError::from_anyhow)?;
+    invalidate_doc_role_cache(&workspace.id, doc_id, user_id);
 
     notify_doc_activity(
         state,
@@ -251,6 +287,7 @@ pub async fn transfer_doc_owner(
             .upsert(&workspace.id, doc_id, &owner.user_id, "manager")
             .await
             .map_err(AppError::from_anyhow)?;
+        invalidate_doc_role_cache(&workspace.id, doc_id, &owner.user_id);
 
         notify_doc_activity(
             state,
@@ -268,6 +305,7 @@ pub async fn transfer_doc_owner(
         .upsert(&workspace.id, doc_id, new_owner_id, "owner")
         .await
         .map_err(AppError::from_anyhow)?;
+    invalidate_doc_role_cache(&workspace.id, doc_id, new_owner_id);
 
     notify_doc_activity(
         state,

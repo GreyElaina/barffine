@@ -6,13 +6,15 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use barffine_core::{config::AppConfig, db::Database};
+use barffine_core::{
+    config::{AppConfig, BlobStoreBackend, DocDataBackend},
+    db::Database,
+};
 use barffine_server::{
     build_state_with_config,
     doc::cache::{DocCacheAdaptiveConfig, DocCacheConfig},
     socket::rooms::SpaceType,
     state::{AppState, StateBuildConfig},
-    utils::db::run_migrations,
 };
 use clap::{Parser, ValueEnum};
 use pprof::ProfilerGuardBuilder;
@@ -476,16 +478,21 @@ async fn prepare_state_with_config(doc_cache_config: DocCacheConfig) -> Result<W
         .join("profile.db")
         .to_string_lossy()
         .to_string();
+    app_config.doc_data_backend = DocDataBackend::Sqlite;
+    app_config.doc_data_path = tmp_dir.path().join("doc-kv").to_string_lossy().to_string();
+    app_config.blob_store_backend = BlobStoreBackend::Sql;
+    app_config.blob_store_path = tmp_dir
+        .path()
+        .join("blob-store")
+        .to_string_lossy()
+        .to_string();
 
     let database = Database::connect(&app_config)
         .await
         .context("connect sqlite database")?;
-    run_migrations(database.pool())
-        .await
-        .context("apply migrations")?;
-
     let state = build_state_with_config(
         &database,
+        &app_config,
         StateBuildConfig {
             doc_cache: Some(doc_cache_config),
         },

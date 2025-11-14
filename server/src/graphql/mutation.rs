@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
 use async_graphql::{Context, ID, Object, Result as GraphQLResult, Upload};
-use sqlx::Error as SqlxError;
 
 use crate::{
     AppError, AppState,
@@ -21,7 +20,7 @@ use crate::{
         sniff_mime as sniff_avatar_mime,
     },
     user::helpers::is_valid_email,
-    utils::attachments::sanitize_attachment_filename,
+    utils::{attachments::sanitize_attachment_filename, db::is_unique_violation},
     workspace::{
         invites::{self as workspace_invites, InviteLinkLookup},
         members::{self as workspace_members, MemberAcceptance},
@@ -31,7 +30,7 @@ use crate::{
 use barffine_core::{
     blob::{BlobDescriptor, BlobMetadata},
     comment_attachment::CommentAttachmentUpsert,
-    notification::{CommentStore, NotificationCenter},
+    notification::CommentStore,
     user_settings::UserNotificationSettingsUpdate,
 };
 use chrono::{DateTime, Utc};
@@ -153,6 +152,10 @@ impl MutationRoot {
             .await
             .map_err(map_anyhow)?;
 
+        state
+            .user_service
+            .invalidate_user_cache(&request_user.user_id);
+
         Ok(UserType::from(user))
     }
 
@@ -263,6 +266,10 @@ impl MutationRoot {
             .await
             .map_err(map_anyhow)?;
 
+        state
+            .user_service
+            .invalidate_user_cache(&request_user.user_id);
+
         Ok(RemoveAvatarType { success: true })
     }
 
@@ -326,7 +333,10 @@ impl MutationRoot {
             .await;
 
         match result {
-            Ok(user) => Ok(UserType::from(user)),
+            Ok(user) => {
+                state.user_service.invalidate_user_cache(&user_id);
+                Ok(UserType::from(user))
+            }
             Err(err) => {
                 if err.to_string().contains("user not found") {
                     return Err(map_app_error(
@@ -334,15 +344,10 @@ impl MutationRoot {
                     ));
                 }
 
-                if let Some(sqlx_err) = err.downcast_ref::<SqlxError>() {
-                    if let SqlxError::Database(db_err) = sqlx_err {
-                        if db_err.message().contains("UNIQUE") {
-                            return Err(map_app_error(
-                                AppError::conflict("email already used")
-                                    .with_name("EMAIL_ALREADY_USED"),
-                            ));
-                        }
-                    }
+                if is_unique_violation(&err) {
+                    return Err(map_app_error(
+                        AppError::conflict("email already used").with_name("EMAIL_ALREADY_USED"),
+                    ));
                 }
 
                 Err(map_app_error(AppError::from_anyhow(err)))
@@ -3064,7 +3069,7 @@ mod tests {
     use crate::{
         auth::generate_password_hash,
         graphql::{self, RequestUser},
-        test_support::{insert_document, seed_workspace, setup_state},
+        testing::{insert_document, seed_workspace, setup_state},
     };
     use argon2::{
         Argon2,
@@ -3073,12 +3078,25 @@ mod tests {
     use async_graphql::Request as GraphQLRequest;
     use barffine_core::notification::CommentStore;
     use serde_json::Value as JsonValue;
-    use sqlx::query;
     use uuid::Uuid;
+
+    async fn set_default_role(
+        database: &barffine_core::db::Database,
+        workspace_id: &str,
+        doc_id: &str,
+        role: &str,
+    ) {
+        database
+            .repositories()
+            .doc_repo()
+            .update_default_role_entry(workspace_id, doc_id, role)
+            .await
+            .expect("update default role");
+    }
 
     #[tokio::test]
     async fn graphql_change_password_revokes_sessions() {
-        let (_temp_dir, _database, state) = setup_state().await;
+        let (_temp_dir, database, state) = setup_state().await;
         let password_hash = generate_password_hash("old-secret").expect("hash password");
         let user = state
             .user_store
@@ -3138,7 +3156,7 @@ mod tests {
 
     #[tokio::test]
     async fn graphql_update_user_allows_admin_changes() {
-        let (_temp_dir, _database, state) = setup_state().await;
+        let (_temp_dir, database, state) = setup_state().await;
         let password_hash = generate_password_hash("secret").expect("hash password");
         let admin = state
             .user_store
@@ -3201,7 +3219,7 @@ mod tests {
 
     #[tokio::test]
     async fn graphql_update_user_settings_persists_preferences() {
-        let (_temp_dir, _database, state) = setup_state().await;
+        let (_temp_dir, database, state) = setup_state().await;
         let password_hash = generate_password_hash("secret").expect("hash password");
         let user = state
             .user_store
@@ -3518,12 +3536,7 @@ mod tests {
         let doc_id = Uuid::new_v4().to_string();
         insert_document(&database, &workspace_id, &doc_id, false, "page").await;
 
-        query("UPDATE documents SET default_role = 'reader' WHERE workspace_id = ? AND id = ?")
-            .bind(&workspace_id)
-            .bind(&doc_id)
-            .execute(database.pool())
-            .await
-            .expect("set default role");
+        set_default_role(&database, &workspace_id, &doc_id, "reader").await;
 
         let password_hash = generate_password_hash("secret").expect("hash password");
         let collaborator = state
@@ -3745,12 +3758,7 @@ mod tests {
         let doc_id = Uuid::new_v4().to_string();
         insert_document(&database, &workspace_id, &doc_id, false, "page").await;
 
-        query("UPDATE documents SET default_role = 'commenter' WHERE workspace_id = ? AND id = ?")
-            .bind(&workspace_id)
-            .bind(&doc_id)
-            .execute(database.pool())
-            .await
-            .expect("set default role");
+        set_default_role(&database, &workspace_id, &doc_id, "commenter").await;
 
         let password_hash = generate_password_hash("secret").expect("hash password");
         let collaborator = state
@@ -4309,9 +4317,9 @@ mod tests {
             .await
             .expect("create user");
 
-        query("UPDATE users SET disabled = 1 WHERE id = ?")
-            .bind(&user.id)
-            .execute(database.pool())
+        state
+            .user_store
+            .set_disabled(&user.id, true)
             .await
             .expect("disable user");
 

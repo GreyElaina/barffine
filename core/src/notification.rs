@@ -51,6 +51,8 @@ pub struct CommentChangeRecord {
     pub doc_id: String,
     pub item: JsonValue,
     pub updated_at: DateTime<Utc>,
+    pub change_row_id: i64,
+    pub is_reply: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +70,10 @@ pub struct CommentCursor {
     pub comment_updated_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_updated_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment_change_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_change_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +114,8 @@ pub trait CommentStore: Send + Sync {
         doc_id: &str,
         after_comment_ts: Option<i64>,
         after_reply_ts: Option<i64>,
+        after_comment_change_id: Option<i64>,
+        after_reply_change_id: Option<i64>,
         limit: i64,
     ) -> Result<Vec<CommentChangeRecord>>;
 }

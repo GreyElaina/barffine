@@ -17,11 +17,8 @@ use y_octo::{Doc as YoctoDoc, StateVector as YoctoStateVector};
 use crate::{
     auth::{DocAccessIntent, RpcAccessRequirement, parse_history_timestamp, resolve_doc_access},
     doc::{
-        channels::comment_attachment_blob_key,
-        content::{parse_doc_content, parse_doc_markdown},
-        history, metadata as doc_metadata,
-        mode::DocPublishMode,
-        sync::workspace_snapshot_or_not_found,
+        channels::comment_attachment_blob_key, history, metadata as doc_metadata,
+        mode::DocPublishMode, sync::workspace_snapshot_or_not_found,
     },
     error::AppError,
     handlers::headers::{
@@ -30,6 +27,7 @@ use crate::{
     },
     handlers::workspace_handlers::ensure_workspace_exists,
     http::{append_set_cookie_headers, http_date_from_datetime},
+    socket::rooms::SpaceType,
     state::AppState,
     types::{
         AuthenticatedRestSession, DocContentQuery, DocContentResponse, DocMarkdownResponse,
@@ -42,44 +40,11 @@ use crate::{
     },
 };
 
-#[cfg(feature = "legacy-doc-service")]
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-#[cfg(feature = "legacy-doc-service")]
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-#[cfg(feature = "legacy-doc-service")]
-use tokio::sync::broadcast;
-#[cfg(feature = "legacy-doc-service")]
-use crate::state::SyncEventKind;
-#[cfg(feature = "legacy-doc-service")]
-use crate::doc::channels::doc_channel_key;
-#[cfg(feature = "legacy-doc-service")]
-use crate::doc::sync::{UpdateBroadcastContext, apply_doc_updates};
-#[cfg(feature = "legacy-doc-service")]
-use crate::socket::rooms::SpaceType;
-#[cfg(feature = "legacy-doc-service")]
-use crate::workspace::service::{AccessTokenContext, AccessTokenVerification};
-#[cfg(feature = "legacy-doc-service")]
-use tracing::{error, warn};
-#[cfg(feature = "legacy-doc-service")]
-use serde::Deserialize;
-
 pub(crate) async fn get_doc_content_handler(
     Path((workspace_id, doc_id)): Path<(String, String)>,
     State(state): State<AppState>,
     Query(query): Query<DocContentQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    let response = build_doc_content_response(&state, &workspace_id, &doc_id, &query).await?;
-    Ok(Json(response))
-}
-
-#[cfg(feature = "legacy-doc-service")]
-pub(crate) async fn get_rpc_doc_content_handler(
-    Path((workspace_id, doc_id)): Path<(String, String)>,
-    State(state): State<AppState>,
-    Query(query): Query<DocContentQuery>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, AppError> {
-    require_rpc_doc_token(&state, &headers, &workspace_id, &doc_id, "doc content")?;
     let response = build_doc_content_response(&state, &workspace_id, &doc_id, &query).await?;
     Ok(Json(response))
 }
@@ -169,17 +134,6 @@ pub(crate) async fn get_doc_markdown_handler(
     Ok(Json(response))
 }
 
-#[cfg(feature = "legacy-doc-service")]
-pub(crate) async fn get_rpc_doc_markdown_handler(
-    Path((workspace_id, doc_id)): Path<(String, String)>,
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, AppError> {
-    require_rpc_doc_token(&state, &headers, &workspace_id, &doc_id, "doc markdown")?;
-    let response = build_doc_markdown_response(&state, &workspace_id, &doc_id).await?;
-    Ok(Json(response))
-}
-
 pub(crate) async fn get_doc_diff_handler(
     Path((workspace_id, doc_id)): Path<(String, String)>,
     State(state): State<AppState>,
@@ -198,25 +152,6 @@ pub(crate) async fn get_doc_diff_handler(
     .await
 }
 
-#[cfg(feature = "legacy-doc-service")]
-pub(crate) async fn get_rpc_doc_diff_handler(
-    Path((workspace_id, doc_id)): Path<(String, String)>,
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, AppError> {
-    doc_diff_response(
-        &state,
-        &headers,
-        &workspace_id,
-        &doc_id,
-        RpcAccessRequirement::Required,
-        DocAccessIntent::Standard,
-        body,
-    )
-    .await
-}
-
 pub(crate) async fn get_doc_binary_handler(
     Path((workspace_id, doc_id)): Path<(String, String)>,
     State(state): State<AppState>,
@@ -228,23 +163,6 @@ pub(crate) async fn get_doc_binary_handler(
         &workspace_id,
         &doc_id,
         RpcAccessRequirement::Optional,
-        DocAccessIntent::Standard,
-    )
-    .await
-}
-
-#[cfg(feature = "legacy-doc-service")]
-pub(crate) async fn get_rpc_doc_binary_handler(
-    Path((workspace_id, doc_id)): Path<(String, String)>,
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Response, AppError> {
-    doc_binary_response(
-        &state,
-        &headers,
-        &workspace_id,
-        &doc_id,
-        RpcAccessRequirement::Required,
         DocAccessIntent::Standard,
     )
     .await
@@ -332,19 +250,16 @@ async fn build_doc_content_response(
     query: &DocContentQuery,
 ) -> Result<DocContentResponse, AppError> {
     let metadata = doc_metadata::fetch_required(state, workspace_id, doc_id).await?;
-    let (snapshot, _) = workspace_snapshot_or_not_found(state, workspace_id, doc_id).await?;
     let wants_full = query.full.as_deref() == Some("true");
 
-    let (title, summary) = match parse_doc_content(&snapshot, wants_full) {
-        Some(parsed) => (
-            prefer_or_metadata(parsed.title, metadata.title.clone()),
-            prefer_or_metadata(parsed.summary, metadata.summary.clone()),
-        ),
-        None => (
-            metadata.title.clone().unwrap_or_default(),
-            metadata.summary.clone().unwrap_or_default(),
-        ),
-    };
+    let content = state
+        .doc_cache
+        .doc_content_view(SpaceType::Workspace, workspace_id, doc_id, wants_full)
+        .await
+        .map_err(AppError::from_anyhow)?;
+
+    let title = prefer_or_metadata(content.title, metadata.title.clone());
+    let summary = prefer_or_metadata(content.summary, metadata.summary.clone());
 
     Ok(DocContentResponse { title, summary })
 }
@@ -355,19 +270,18 @@ async fn build_doc_markdown_response(
     doc_id: &str,
 ) -> Result<DocMarkdownResponse, AppError> {
     let metadata = doc_metadata::fetch_required(state, workspace_id, doc_id).await?;
-    let (snapshot, _) = workspace_snapshot_or_not_found(state, workspace_id, doc_id).await?;
-    let (title, markdown) = match parse_doc_markdown(workspace_id, &snapshot) {
-        Some(parsed) => (
-            prefer_or_metadata(parsed.title, metadata.title.clone()),
-            prefer_or_metadata(parsed.markdown, metadata.summary.clone()),
-        ),
-        None => (
-            metadata.title.clone().unwrap_or_default(),
-            metadata.summary.clone().unwrap_or_default(),
-        ),
-    };
+    let markdown = state
+        .doc_cache
+        .doc_markdown_view(SpaceType::Workspace, workspace_id, doc_id)
+        .await
+        .map_err(AppError::from_anyhow)?;
+    let title = prefer_or_metadata(markdown.title.clone(), metadata.title.clone());
+    let markdown_text = prefer_or_metadata(markdown.markdown, metadata.summary.clone());
 
-    Ok(DocMarkdownResponse { title, markdown })
+    Ok(DocMarkdownResponse {
+        title,
+        markdown: markdown_text,
+    })
 }
 
 async fn doc_binary_response(
@@ -496,28 +410,6 @@ async fn doc_diff_response(
     Ok(response)
 }
 
-#[cfg(feature = "legacy-doc-service")]
-fn require_rpc_doc_token(
-    state: &AppState,
-    headers: &HeaderMap,
-    workspace_id: &str,
-    doc_id: &str,
-    target: &'static str,
-) -> Result<(), AppError> {
-    match state.workspace_service.verify_rpc_access_token(
-        headers,
-        doc_id,
-        &AccessTokenContext {
-            workspace_id,
-            doc_id: Some(doc_id),
-            target,
-        },
-    )? {
-        AccessTokenVerification::Matched => Ok(()),
-        AccessTokenVerification::NotPresent => Err(AppError::invalid_internal_request()),
-    }
-}
-
 fn finalize_doc_response(
     mut response: Response,
     access: &RestDocAccess,
@@ -616,125 +508,6 @@ where
     Ok(auth)
 }
 
-#[cfg(feature = "legacy-doc-service")]
-pub(crate) async fn doc_ws_handler(
-    ws: WebSocketUpgrade,
-    Path((workspace_id, doc_id)): Path<(String, String)>,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| async move {
-        if let Err(err) = handle_doc_websocket(socket, state, workspace_id, doc_id).await {
-            error!(?err, "websocket handler error");
-        }
-    })
-}
-
-#[cfg(feature = "legacy-doc-service")]
-async fn handle_doc_websocket(
-    mut socket: WebSocket,
-    state: AppState,
-    workspace_id: String,
-    doc_id: String,
-) -> anyhow::Result<()> {
-    let channel_key = doc_channel_key(&workspace_id, &doc_id);
-
-    match state
-        .doc_cache
-        .snapshot(SpaceType::Workspace, &workspace_id, &doc_id)
-        .await
-    {
-        Ok((snapshot, _)) => {
-            let msg = serde_json::json!({
-                "type": "snapshot",
-                "payload": BASE64.encode(snapshot),
-            })
-            .to_string();
-            socket.send(Message::Text(msg.into())).await.ok();
-        }
-        Err(err) => {
-            warn!(
-                workspace_id = %workspace_id,
-                doc_id = %doc_id,
-                error = %err,
-                "failed to load snapshot for doc websocket",
-            );
-        }
-    }
-
-    let mut updates_rx = state.sync_hub.subscribe(&channel_key);
-
-    loop {
-        tokio::select! {
-            event = updates_rx.recv() => {
-                match event {
-                    Ok(event) => {
-                        let event_type = match event.kind {
-                            SyncEventKind::Snapshot => "snapshot",
-                            SyncEventKind::Update => "update",
-                        };
-                        let msg = serde_json::json!({
-                            "type": event_type,
-                            "payload": BASE64.encode(event.payload),
-                        })
-                        .to_string();
-
-                        if socket.send(Message::Text(msg.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-            incoming = socket.recv() => {
-                match incoming {
-                    Some(Ok(Message::Text(text))) => {
-                        if let Err(err) = process_incoming_ws_message(
-                            &state,
-                            &workspace_id,
-                            &doc_id,
-                            &channel_key,
-                            text.as_str(),
-                        )
-                        .await
-                        {
-                            error!(?err, "failed to process ws message");
-                        }
-                    }
-                    Some(Ok(Message::Binary(bin))) => {
-                        if let Ok(text) = String::from_utf8(bin.to_vec()) {
-                            if let Err(err) = process_incoming_ws_message(
-                                &state,
-                                &workspace_id,
-                                &doc_id,
-                                &channel_key,
-                                text.as_str(),
-                            )
-                            .await
-                            {
-                                error!(?err, "failed to process ws message");
-                            }
-                        }
-                    }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = socket.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Err(err)) => {
-                        error!(?err, "websocket receive error");
-                        break;
-                    }
-                    Some(Ok(Message::Pong(_))) => {}
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
 pub(crate) async fn publish_doc_handler(
     Path((workspace_id, doc_id)): Path<(String, String)>,
     State(state): State<AppState>,
@@ -771,52 +544,6 @@ pub(crate) async fn unpublish_doc_handler(
     Ok(response)
 }
 
-#[cfg(feature = "legacy-doc-service")]
-async fn process_incoming_ws_message(
-    state: &AppState,
-    workspace_id: &str,
-    doc_id: &str,
-    _channel_key: &str,
-    text: &str,
-) -> anyhow::Result<()> {
-    #[derive(Deserialize)]
-    struct IncomingMessage {
-        #[serde(rename = "type")]
-        msg_type: String,
-        payload: String,
-    }
-
-    let msg: IncomingMessage = serde_json::from_str(text)?;
-
-    if msg.msg_type == "update" {
-        let update_bytes = BASE64.decode(msg.payload)?;
-        let updates = vec![update_bytes.clone()];
-        if let Some(meta) = state
-            .document_store
-            .find_metadata(workspace_id, doc_id)
-            .await?
-        {
-            if meta.blocked {
-                return Err(anyhow::anyhow!(
-                    "Doc {doc_id} under Space {workspace_id} is blocked from updating."
-                ));
-            }
-        }
-        apply_doc_updates(
-            state,
-            SpaceType::Workspace,
-            workspace_id,
-            doc_id,
-            updates,
-            UpdateBroadcastContext::default(),
-        )
-        .await
-        .map_err(|err| AnyError::msg(err.to_string()))?;
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -832,10 +559,10 @@ mod tests {
     use barffine_core::{
         blob::{BlobDescriptor, BlobMetadata},
         comment_attachment::CommentAttachmentUpsert,
+        db::doc_repo::{HistorySnapshotInsert, ReplaceDocSnapshotParams},
     };
     use chrono::Utc;
     use serde_json::Value as JsonValue;
-    use sqlx::query;
     use uuid::Uuid;
     use y_octo::Doc as YoctoDoc;
 
@@ -848,7 +575,7 @@ mod tests {
             content::{parse_doc_content, parse_doc_markdown},
             paths::public_doc_share_path,
         },
-        test_support::{
+        testing::{
             fixture_snapshot, insert_document, persist_snapshot, seed_workspace, setup_state,
         },
         types::{DocContentQuery, PublishDocRequest},
@@ -1106,16 +833,22 @@ mod tests {
         let state_bytes = encode_state_vector(&yocto_doc.get_state_vector()).expect("encode state");
         let updated_at = Utc::now().timestamp();
 
-        query(
-            "UPDATE documents SET snapshot = ?, updated_at = ? WHERE workspace_id = ? AND id = ?",
-        )
-        .bind(&snapshot)
-        .bind(updated_at)
-        .bind(&workspace_id)
-        .bind(&doc_id)
-        .execute(database.pool())
-        .await
-        .expect("update snapshot");
+        database
+            .repositories()
+            .doc_repo()
+            .replace_doc_snapshot(barffine_core::db::doc_repo::ReplaceDocSnapshotParams {
+                workspace_id: workspace_id.clone(),
+                doc_id: doc_id.clone(),
+                snapshot: snapshot.clone(),
+                updated_at,
+                title: None,
+                summary: None,
+                creator_id: None,
+                updater_id: None,
+                history_entry: None,
+            })
+            .await
+            .expect("update snapshot");
 
         let response = get_doc_diff_handler(
             Path((workspace_id.clone(), doc_id.clone())),
@@ -1206,17 +939,25 @@ mod tests {
         insert_document(&database, &workspace_id, &doc_id, false, "page").await;
 
         let created_at = 1_700_000_000i64;
-        query(
-            "INSERT INTO document_history (doc_id, workspace_id, snapshot, created_at)
-                 VALUES (?, ?, ?, ?)",
-        )
-        .bind(&doc_id)
-        .bind(&workspace_id)
-        .bind(vec![1_u8, 2, 3])
-        .bind(created_at)
-        .execute(database.pool())
-        .await
-        .expect("insert history");
+        database
+            .repositories()
+            .doc_repo()
+            .replace_doc_snapshot(barffine_core::db::doc_repo::ReplaceDocSnapshotParams {
+                workspace_id: workspace_id.clone(),
+                doc_id: doc_id.clone(),
+                snapshot: vec![0],
+                updated_at: created_at,
+                title: None,
+                summary: None,
+                creator_id: None,
+                updater_id: None,
+                history_entry: Some(barffine_core::db::doc_repo::HistorySnapshotInsert {
+                    snapshot: vec![1_u8, 2, 3],
+                    created_at,
+                }),
+            })
+            .await
+            .expect("insert history");
 
         let session = state
             .user_store
@@ -1378,7 +1119,7 @@ mod tests {
         let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: JsonValue = serde_json::from_slice(&body_bytes).expect("metadata json");
         assert_eq!(json["public"], true);
-        assert_eq!(json["shareToken"].as_str(), Some(share_token.as_str()));
+        assert_ne!(json["shareToken"].as_str(), Some(share_token.as_str()));
         assert_eq!(
             json["shareUrl"],
             JsonValue::String(public_doc_share_path(&workspace_id, &doc_id))

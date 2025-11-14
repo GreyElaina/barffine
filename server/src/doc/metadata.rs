@@ -1,6 +1,6 @@
 use barffine_core::doc_store::DocumentMetadata;
 
-use crate::{AppError, AppState};
+use crate::{AppError, AppState, request_cache};
 
 use super::{access, mode::DocPublishMode, paths::public_doc_share_path};
 
@@ -17,12 +17,18 @@ pub async fn fetch_required(
     workspace_id: &str,
     doc_id: &str,
 ) -> Result<DocumentMetadata, AppError> {
-    state
-        .document_store
-        .find_metadata(workspace_id, doc_id)
-        .await
-        .map_err(AppError::from_anyhow)?
-        .ok_or_else(|| AppError::doc_not_found(workspace_id, doc_id))
+    let metadata = if let Some(caches) = request_cache::current_request_caches() {
+        caches
+            .doc_metadata()
+            .get_or_fetch(workspace_id, doc_id, || async {
+                load_metadata(state, workspace_id, doc_id).await
+            })
+            .await?
+    } else {
+        load_metadata(state, workspace_id, doc_id).await?
+    };
+
+    metadata.ok_or_else(|| AppError::doc_not_found(workspace_id, doc_id))
 }
 
 pub async fn publish_doc(
@@ -34,12 +40,15 @@ pub async fn publish_doc(
     ensure_workspace_present(state, workspace_id).await?;
     access::ensure_document_exists(state, workspace_id, doc_id).await?;
 
-    state
+    let metadata = state
         .document_store
         .publish_doc(workspace_id, doc_id, mode.as_str())
         .await
         .map_err(AppError::from_anyhow)?
-        .ok_or_else(|| AppError::doc_not_found(workspace_id, doc_id))
+        .ok_or_else(|| AppError::doc_not_found(workspace_id, doc_id))?;
+
+    cache_metadata(&metadata);
+    Ok(metadata)
 }
 
 pub async fn unpublish_doc(
@@ -60,12 +69,33 @@ pub async fn unpublish_doc(
         return Err(AppError::bad_request("doc is not public"));
     }
 
-    state
+    let metadata = state
         .document_store
         .unpublish_doc(workspace_id, doc_id)
         .await
         .map_err(AppError::from_anyhow)?
-        .ok_or_else(|| AppError::doc_not_found(workspace_id, doc_id))
+        .ok_or_else(|| AppError::doc_not_found(workspace_id, doc_id))?;
+
+    cache_metadata(&metadata);
+    Ok(metadata)
+}
+
+async fn load_metadata(
+    state: &AppState,
+    workspace_id: &str,
+    doc_id: &str,
+) -> Result<Option<DocumentMetadata>, AppError> {
+    state
+        .document_store
+        .find_metadata(workspace_id, doc_id)
+        .await
+        .map_err(AppError::from_anyhow)
+}
+
+fn cache_metadata(metadata: &DocumentMetadata) {
+    if let Some(caches) = request_cache::current_request_caches() {
+        caches.doc_metadata().insert(metadata.clone());
+    }
 }
 
 async fn ensure_workspace_present(state: &AppState, workspace_id: &str) -> Result<(), AppError> {

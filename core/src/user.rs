@@ -1,9 +1,11 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use chrono::Utc;
-use sqlx::{Pool, QueryBuilder, Row, Sqlite, sqlite::SqliteRow};
 use uuid::Uuid;
 
-use crate::db::Database;
+use crate::db::{
+    Database,
+    user_repo::{CreateSessionParams, CreateUserParams, UserRepositoryRef},
+};
 
 pub const SESSION_TTL_SECONDS: i64 = 60 * 60 * 24 * 14;
 
@@ -74,13 +76,13 @@ pub struct ConnectedAccountTokens<'a> {
 
 #[derive(Clone)]
 pub struct UserStore {
-    pool: Pool<Sqlite>,
+    user_repo: UserRepositoryRef,
 }
 
 impl UserStore {
     pub fn new(database: &Database) -> Self {
         Self {
-            pool: database.pool().clone(),
+            user_repo: database.repositories().user_repo(),
         }
     }
 
@@ -93,71 +95,27 @@ impl UserStore {
         let id = Uuid::new_v4().to_string();
         let created_at = Utc::now().timestamp();
 
-        sqlx::query(
-            "INSERT INTO users (id, email, password_hash, created_at, name) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(email)
-        .bind(password_hash)
-        .bind(created_at)
-        .bind(name)
-        .execute(&self.pool)
-        .await
-        .with_context(|| "failed to insert user".to_string())?;
-
-        Ok(UserRecord {
-            id,
-            email: email.to_owned(),
-            password_hash: password_hash.to_owned(),
-            name: name.map(|value| value.to_owned()),
-            avatar_url: None,
-            email_verified_at: None,
-            disabled: false,
-            created_at,
-        })
+        self.user_repo
+            .create_user(CreateUserParams {
+                id,
+                email: email.to_owned(),
+                password_hash: password_hash.to_owned(),
+                name: name.map(|value| value.to_owned()),
+                created_at,
+            })
+            .await
     }
 
     pub async fn find_by_email(&self, email: &str) -> Result<Option<UserRecord>> {
-        let row = sqlx::query(
-            "SELECT id, email, password_hash, name, avatar_url, email_verified_at, disabled, created_at \
-             FROM users WHERE email = ?",
-        )
-        .bind(email)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(row.map(Self::map_row))
+        self.user_repo.fetch_user_by_email(email).await
     }
 
     pub async fn find_by_id(&self, id: &str) -> Result<Option<UserRecord>> {
-        let row = sqlx::query(
-            "SELECT id, email, password_hash, name, avatar_url, email_verified_at, disabled, created_at \
-             FROM users WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(row.map(Self::map_row))
+        self.user_repo.fetch_user_by_id(id).await
     }
 
     pub async fn find_by_ids(&self, ids: &[String]) -> Result<Vec<UserRecord>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut builder = QueryBuilder::new(
-            "SELECT id, email, password_hash, name, avatar_url, email_verified_at, disabled, created_at FROM users WHERE id IN (",
-        );
-        let mut separated = builder.separated(", ");
-        for id in ids {
-            separated.push_bind(id);
-        }
-        builder.push(")");
-
-        let rows = builder.build().fetch_all(&self.pool).await?;
-
-        Ok(rows.into_iter().map(Self::map_row).collect())
+        self.user_repo.fetch_users_by_ids(ids).await
     }
 
     pub async fn create_session(&self, user_id: &str) -> Result<SessionRecord> {
@@ -165,52 +123,28 @@ impl UserStore {
         let created_at = Utc::now().timestamp();
         let expires_at = created_at + SESSION_TTL_SECONDS;
 
-        sqlx::query(
-            "INSERT INTO sessions (id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(user_id)
-        .bind(created_at)
-        .bind(expires_at)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(SessionRecord {
-            id,
-            user_id: user_id.to_owned(),
-            created_at,
-            expires_at,
-        })
+        self.user_repo
+            .create_session(CreateSessionParams {
+                id,
+                user_id: user_id.to_owned(),
+                created_at,
+                expires_at,
+            })
+            .await
     }
 
     pub async fn update_password(&self, user_id: &str, password_hash: &str) -> Result<()> {
-        sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
-            .bind(password_hash)
-            .bind(user_id)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
-
-        Ok(())
+        self.user_repo
+            .update_password_hash(user_id, password_hash)
+            .await
     }
 
     pub async fn find_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
-        let row =
-            sqlx::query("SELECT id, user_id, created_at, expires_at FROM sessions WHERE id = ?")
-                .bind(session_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row = self.user_repo.fetch_session(session_id).await?;
 
         let now = Utc::now().timestamp();
 
-        let record = row.map(|row| SessionRecord {
-            id: row.get("id"),
-            user_id: row.get("user_id"),
-            created_at: row.get::<i64, _>("created_at"),
-            expires_at: row.get::<i64, _>("expires_at"),
-        });
-
-        if let Some(record) = record {
+        if let Some(record) = row {
             if record.is_expired(now) {
                 self.delete_session(&record.id).await?;
                 Ok(None)
@@ -223,19 +157,11 @@ impl UserStore {
     }
 
     pub async fn delete_session(&self, session_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM sessions WHERE id = ?")
-            .bind(session_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+        self.user_repo.delete_session(session_id).await
     }
 
     pub async fn delete_sessions_by_user(&self, user_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM sessions WHERE user_id = ?")
-            .bind(user_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+        self.user_repo.delete_sessions_by_user(user_id).await
     }
 
     pub async fn get_connected_account(
@@ -243,16 +169,9 @@ impl UserStore {
         provider: &str,
         provider_account_id: &str,
     ) -> Result<Option<ConnectedAccountRecord>> {
-        let row = sqlx::query(
-            "SELECT id, user_id, provider, provider_account_id, scope, access_token, refresh_token, expires_at, created_at, updated_at \
-             FROM user_connected_accounts WHERE provider = ? AND provider_account_id = ?",
-        )
-        .bind(provider)
-        .bind(provider_account_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(row.map(Self::map_connected_account))
+        self.user_repo
+            .fetch_connected_account(provider, provider_account_id)
+            .await
     }
 
     pub async fn create_connected_account(
@@ -261,37 +180,9 @@ impl UserStore {
     ) -> Result<ConnectedAccountRecord> {
         let id = Uuid::new_v4().to_string();
         let timestamp = Utc::now().timestamp();
-
-        sqlx::query(
-            "INSERT INTO user_connected_accounts \
-             (id, user_id, provider, provider_account_id, scope, access_token, refresh_token, expires_at, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(input.user_id)
-        .bind(input.provider)
-        .bind(input.provider_account_id)
-        .bind(input.scope)
-        .bind(input.access_token)
-        .bind(input.refresh_token)
-        .bind(input.expires_at)
-        .bind(timestamp)
-        .bind(timestamp)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(ConnectedAccountRecord {
-            id,
-            user_id: input.user_id.to_owned(),
-            provider: input.provider.to_owned(),
-            provider_account_id: input.provider_account_id.to_owned(),
-            scope: input.scope.map(|value| value.to_owned()),
-            access_token: input.access_token.map(|value| value.to_owned()),
-            refresh_token: input.refresh_token.map(|value| value.to_owned()),
-            expires_at: input.expires_at,
-            created_at: timestamp,
-            updated_at: timestamp,
-        })
+        self.user_repo
+            .create_connected_account(id, input, timestamp)
+            .await
     }
 
     pub async fn update_connected_account_tokens(
@@ -300,42 +191,35 @@ impl UserStore {
         tokens: ConnectedAccountTokens<'_>,
     ) -> Result<ConnectedAccountRecord> {
         let timestamp = Utc::now().timestamp();
+        self.user_repo
+            .update_connected_account_tokens(account_id, tokens, timestamp)
+            .await?;
 
-        sqlx::query(
-            "UPDATE user_connected_accounts \
-             SET scope = ?, access_token = ?, refresh_token = ?, expires_at = ?, updated_at = ? \
-             WHERE id = ?",
-        )
-        .bind(tokens.scope)
-        .bind(tokens.access_token)
-        .bind(tokens.refresh_token)
-        .bind(tokens.expires_at)
-        .bind(timestamp)
-        .bind(account_id)
-        .execute(&self.pool)
-        .await?;
-
-        self.find_connected_account_by_id(account_id)
+        self.user_repo
+            .fetch_connected_account_by_id(account_id)
             .await?
             .ok_or_else(|| anyhow!("connected account not found"))
     }
 
     pub async fn delete_connected_account(&self, account_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM user_connected_accounts WHERE id = ?")
-            .bind(account_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+        self.user_repo.delete_connected_account(account_id).await
     }
 
     pub async fn refresh_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
+        // Reduce write amplification by only extending the session TTL when it is actually
+        // approaching expiry. Most requests do not need to bump the expiry if plenty of TTL is
+        // left. This avoids an UPDATE on every request (a hotspot in SQLite/WAL).
         if let Some(mut record) = self.find_session(session_id).await? {
-            record.expires_at = Utc::now().timestamp() + SESSION_TTL_SECONDS;
-            sqlx::query("UPDATE sessions SET expires_at = ? WHERE id = ?")
-                .bind(record.expires_at)
-                .bind(session_id)
-                .execute(&self.pool)
-                .await?;
+            let now = Utc::now().timestamp();
+            let remaining = record.expires_at.saturating_sub(now);
+            // Only refresh when less than this threshold remains. Start conservative at 25% of TTL.
+            let refresh_threshold = SESSION_TTL_SECONDS / 4;
+            if remaining <= refresh_threshold {
+                record.expires_at = now + SESSION_TTL_SECONDS;
+                self.user_repo
+                    .expire_session(session_id, record.expires_at)
+                    .await?;
+            }
             Ok(Some(record))
         } else {
             Ok(None)
@@ -349,45 +233,9 @@ impl UserStore {
         keyword: Option<&str>,
         cursor: Option<&UserCursor>,
     ) -> Result<Vec<UserRecord>> {
-        let mut query = QueryBuilder::new(
-            "SELECT id, email, password_hash, name, avatar_url, email_verified_at, disabled, created_at \
-             FROM users",
-        );
-
-        let mut has_filter = false;
-
-        if let Some(term) = keyword {
-            let like = format!("%{}%", term.to_ascii_lowercase());
-            query.push(" WHERE (LOWER(email) LIKE ");
-            query.push_bind(like.clone());
-            query.push(" OR LOWER(COALESCE(name, '')) LIKE ");
-            query.push_bind(like);
-            query.push(")");
-            has_filter = true;
-        }
-
-        if let Some(cursor) = cursor {
-            if has_filter {
-                query.push(" AND ");
-            } else {
-                query.push(" WHERE ");
-            }
-            query.push("(created_at < ");
-            query.push_bind(cursor.created_at);
-            query.push(" OR (created_at = ");
-            query.push_bind(cursor.created_at);
-            query.push(" AND id < ");
-            query.push_bind(&cursor.id);
-            query.push("))");
-        }
-
-        query
-            .push(" ORDER BY created_at DESC, id DESC LIMIT ")
-            .push_bind(limit);
-        query.push(" OFFSET ").push_bind(skip.max(0));
-
-        let rows = query.build().fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(Self::map_row).collect())
+        self.user_repo
+            .list_users_paginated(skip, limit, keyword, cursor)
+            .await
     }
 
     pub async fn update_profile(
@@ -396,39 +244,19 @@ impl UserStore {
         name: Option<Option<String>>,
         avatar_url: Option<Option<String>>,
     ) -> Result<UserRecord> {
-        let name_value = name.clone();
-        let avatar_value = avatar_url.clone();
-
-        match (name_value, avatar_value) {
-            (None, None) => {
-                return self
-                    .find_by_id(user_id)
-                    .await?
-                    .ok_or_else(|| anyhow!("user not found"));
-            }
-            (Some(name_opt), None) => {
-                sqlx::query("UPDATE users SET name = ? WHERE id = ?")
-                    .bind(name_opt.as_deref())
-                    .bind(user_id)
-                    .execute(&self.pool)
-                    .await?;
-            }
-            (None, Some(avatar_opt)) => {
-                sqlx::query("UPDATE users SET avatar_url = ? WHERE id = ?")
-                    .bind(avatar_opt.as_deref())
-                    .bind(user_id)
-                    .execute(&self.pool)
-                    .await?;
-            }
-            (Some(name_opt), Some(avatar_opt)) => {
-                sqlx::query("UPDATE users SET name = ?, avatar_url = ? WHERE id = ?")
-                    .bind(name_opt.as_deref())
-                    .bind(avatar_opt.as_deref())
-                    .bind(user_id)
-                    .execute(&self.pool)
-                    .await?;
-            }
+        if name.is_none() && avatar_url.is_none() {
+            return self
+                .find_by_id(user_id)
+                .await?
+                .ok_or_else(|| anyhow!("user not found"));
         }
+
+        let name_ref = name.as_ref().map(|value| value.as_deref());
+        let avatar_ref = avatar_url.as_ref().map(|value| value.as_deref());
+
+        self.user_repo
+            .update_user_profile(user_id, name_ref, avatar_ref)
+            .await?;
 
         self.find_by_id(user_id)
             .await?
@@ -441,36 +269,16 @@ impl UserStore {
         email: Option<&str>,
         name: Option<Option<&str>>,
     ) -> Result<UserRecord> {
-        match (email, name) {
-            (Some(email_value), Some(name_value)) => {
-                sqlx::query("UPDATE users SET email = ?, name = ? WHERE id = ?")
-                    .bind(email_value)
-                    .bind(name_value)
-                    .bind(user_id)
-                    .execute(&self.pool)
-                    .await?
-            }
-            (Some(email_value), None) => {
-                sqlx::query("UPDATE users SET email = ? WHERE id = ?")
-                    .bind(email_value)
-                    .bind(user_id)
-                    .execute(&self.pool)
-                    .await?
-            }
-            (None, Some(name_value)) => {
-                sqlx::query("UPDATE users SET name = ? WHERE id = ?")
-                    .bind(name_value)
-                    .bind(user_id)
-                    .execute(&self.pool)
-                    .await?
-            }
-            (None, None) => {
-                return self
-                    .find_by_id(user_id)
-                    .await?
-                    .ok_or_else(|| anyhow!("user not found"));
-            }
-        };
+        if email.is_none() && name.is_none() {
+            return self
+                .find_by_id(user_id)
+                .await?
+                .ok_or_else(|| anyhow!("user not found"));
+        }
+
+        self.user_repo
+            .update_user_account(user_id, email, name)
+            .await?;
 
         self.find_by_id(user_id)
             .await?
@@ -484,10 +292,8 @@ impl UserStore {
             None
         };
 
-        sqlx::query("UPDATE users SET email_verified_at = ? WHERE id = ?")
-            .bind(timestamp)
-            .bind(user_id)
-            .execute(&self.pool)
+        self.user_repo
+            .set_email_verified_at(user_id, timestamp)
             .await?;
 
         self.find_by_id(user_id)
@@ -496,120 +302,60 @@ impl UserStore {
     }
 
     pub async fn count(&self, keyword: Option<&str>) -> Result<i64> {
-        if let Some(term) = keyword {
-            let like = format!("%{}%", term.to_ascii_lowercase());
-            let row = sqlx::query(
-                "SELECT COUNT(*) as count FROM users \
-                 WHERE LOWER(email) LIKE ? OR LOWER(COALESCE(name, '')) LIKE ?",
-            )
-            .bind(&like)
-            .bind(&like)
-            .fetch_one(&self.pool)
-            .await?;
-            return Ok(row.get::<i64, _>("count"));
-        }
-
-        let row = sqlx::query("SELECT COUNT(*) as count FROM users")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(row.get::<i64, _>("count"))
+        self.user_repo.count_users(keyword).await
     }
 
     pub async fn add_admin(&self, user_id: &str) -> Result<()> {
         let now = Utc::now().timestamp();
-        sqlx::query(
-            "INSERT INTO admin_users (user_id, created_at)
-             VALUES (?, ?)
-             ON CONFLICT(user_id) DO UPDATE SET created_at = excluded.created_at",
-        )
-        .bind(user_id)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.user_repo.upsert_admin_user(user_id, now).await
     }
 
     pub async fn is_admin(&self, user_id: &str) -> Result<bool> {
-        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM admin_users WHERE user_id = ?")
-            .bind(user_id)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(exists.is_some())
-    }
-}
-
-impl UserStore {
-    fn map_row(row: SqliteRow) -> UserRecord {
-        let disabled = row.get::<i64, _>("disabled") != 0;
-        UserRecord {
-            id: row.get("id"),
-            email: row.get("email"),
-            password_hash: row.get("password_hash"),
-            name: row.get::<Option<String>, _>("name"),
-            avatar_url: row.get::<Option<String>, _>("avatar_url"),
-            email_verified_at: row.get::<Option<i64>, _>("email_verified_at"),
-            disabled,
-            created_at: row.get::<i64, _>("created_at"),
-        }
+        self.user_repo.is_admin_user(user_id).await
     }
 
-    async fn find_connected_account_by_id(
-        &self,
-        id: &str,
-    ) -> Result<Option<ConnectedAccountRecord>> {
-        let row = sqlx::query(
-            "SELECT id, user_id, provider, provider_account_id, scope, access_token, refresh_token, expires_at, created_at, updated_at \
-             FROM user_connected_accounts WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(row.map(Self::map_connected_account))
-    }
-
-    fn map_connected_account(row: SqliteRow) -> ConnectedAccountRecord {
-        ConnectedAccountRecord {
-            id: row.get("id"),
-            user_id: row.get("user_id"),
-            provider: row.get("provider"),
-            provider_account_id: row.get("provider_account_id"),
-            scope: row.get::<Option<String>, _>("scope"),
-            access_token: row.get::<Option<String>, _>("access_token"),
-            refresh_token: row.get::<Option<String>, _>("refresh_token"),
-            expires_at: row.get::<Option<i64>, _>("expires_at"),
-            created_at: row.get::<i64, _>("created_at"),
-            updated_at: row.get::<i64, _>("updated_at"),
-        }
+    pub async fn set_disabled(&self, user_id: &str, disabled: bool) -> Result<()> {
+        self.user_repo.set_user_disabled(user_id, disabled).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::AppConfig, db::Database};
-    use std::path::PathBuf;
+    use crate::{
+        config::{AppConfig, BlobStoreBackend, DocDataBackend},
+        db::Database,
+    };
+    use tempfile::TempDir;
     use uuid::Uuid;
 
-    async fn setup_database() -> anyhow::Result<(Database, PathBuf)> {
+    async fn setup_database() -> anyhow::Result<(Database, TempDir)> {
+        let temp_dir = tempfile::tempdir()?;
         let mut config = AppConfig::default();
-        let db_path =
-            std::env::temp_dir().join(format!("barffine-user-tests-{}.db", Uuid::new_v4()));
-        config.database_path = db_path.to_string_lossy().to_string();
+        config.database_path = temp_dir.path().to_string_lossy().to_string();
+        config.doc_data_backend = DocDataBackend::Sqlite;
+        config.doc_data_path = temp_dir
+            .path()
+            .join("doc-kv")
+            .to_string_lossy()
+            .into_owned();
+        config.blob_store_backend = BlobStoreBackend::Sql;
+        config.blob_store_path = temp_dir
+            .path()
+            .join("blob-store")
+            .to_string_lossy()
+            .into_owned();
 
         let database = Database::connect(&config).await?;
-        sqlx::migrate!("../server/migrations")
-            .run(database.pool())
-            .await?;
-        Ok((database, db_path))
+        Ok((database, temp_dir))
     }
 
     #[tokio::test]
     async fn list_paginated_returns_most_recent_first() -> anyhow::Result<()> {
-        let (database, db_path) = setup_database().await?;
+        let (database, _temp_dir) = setup_database().await?;
         let store = UserStore::new(&database);
 
-        let pool = database.pool().clone();
+        let user_repo = database.repositories().user_repo();
         let rows = vec![
             ("alice@example.com", 1_000_i64),
             ("bob@example.com", 2_000_i64),
@@ -617,15 +363,15 @@ mod tests {
         ];
 
         for (email, created_at) in &rows {
-            sqlx::query(
-                "INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)",
-            )
-            .bind(Uuid::new_v4().to_string())
-            .bind(email)
-            .bind("hash")
-            .bind(created_at)
-            .execute(&pool)
-            .await?;
+            user_repo
+                .create_user(CreateUserParams {
+                    id: Uuid::new_v4().to_string(),
+                    email: (*email).to_string(),
+                    password_hash: "hash".to_string(),
+                    name: None,
+                    created_at: *created_at,
+                })
+                .await?;
         }
 
         let page = store.list_paginated(0, 2, None, None).await?;
@@ -640,28 +386,14 @@ mod tests {
         let total = store.count(None).await?;
         assert_eq!(total, rows.len() as i64);
 
-        drop(store);
-        drop(database);
-        if let Err(err) = std::fs::remove_file(&db_path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                return Err(err.into());
-            }
-        }
-
-        for suffix in ["db-wal", "db-shm"] {
-            let sidecar = db_path.with_extension(suffix);
-            let _ = std::fs::remove_file(sidecar);
-        }
-
         Ok(())
     }
 
     #[tokio::test]
     async fn list_paginated_supports_keyword() -> anyhow::Result<()> {
-        let (database, db_path) = setup_database().await?;
+        let (database, _temp_dir) = setup_database().await?;
         let store = UserStore::new(&database);
-        let pool = database.pool().clone();
-
+        let user_repo = database.repositories().user_repo();
         let entries = vec![
             ("alice@example.com", Some("Alice Smith")),
             ("bob@example.com", Some("Robert Brown")),
@@ -669,17 +401,15 @@ mod tests {
         ];
 
         for (email, name) in &entries {
-            sqlx::query(
-                "INSERT INTO users (id, email, password_hash, created_at, name, disabled) \
-                 VALUES (?, ?, ?, ?, ?, 0)",
-            )
-            .bind(Uuid::new_v4().to_string())
-            .bind(email)
-            .bind("hash")
-            .bind(1_000_i64)
-            .bind(name)
-            .execute(&pool)
-            .await?;
+            user_repo
+                .create_user(CreateUserParams {
+                    id: Uuid::new_v4().to_string(),
+                    email: (*email).to_string(),
+                    password_hash: "hash".to_string(),
+                    name: name.map(|value| value.to_string()),
+                    created_at: 1_000_i64,
+                })
+                .await?;
         }
 
         let results = store.list_paginated(0, 10, Some("alice"), None).await?;
@@ -697,27 +427,14 @@ mod tests {
         let total = store.count(Some("example")).await?;
         assert_eq!(total, 2);
 
-        drop(store);
-        drop(database);
-        if let Err(err) = std::fs::remove_file(&db_path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                return Err(err.into());
-            }
-        }
-
-        for suffix in ["db-wal", "db-shm"] {
-            let sidecar = db_path.with_extension(suffix);
-            let _ = std::fs::remove_file(sidecar);
-        }
-
         Ok(())
     }
 
     #[tokio::test]
     async fn list_paginated_supports_cursor() -> anyhow::Result<()> {
-        let (database, db_path) = setup_database().await?;
+        let (database, _temp_dir) = setup_database().await?;
         let store = UserStore::new(&database);
-        let pool = database.pool().clone();
+        let user_repo = database.repositories().user_repo();
 
         let rows = vec![
             ("alice@example.com", 1_000_i64),
@@ -726,15 +443,15 @@ mod tests {
         ];
 
         for (email, created_at) in &rows {
-            sqlx::query(
-                "INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)",
-            )
-            .bind(Uuid::new_v4().to_string())
-            .bind(email)
-            .bind("hash")
-            .bind(created_at)
-            .execute(&pool)
-            .await?;
+            user_repo
+                .create_user(CreateUserParams {
+                    id: Uuid::new_v4().to_string(),
+                    email: (*email).to_string(),
+                    password_hash: "hash".to_string(),
+                    name: None,
+                    created_at: *created_at,
+                })
+                .await?;
         }
 
         let first_page = store.list_paginated(0, 2, None, None).await?;
@@ -749,25 +466,12 @@ mod tests {
         assert!(second_page[0].created_at <= cursor.created_at);
         assert_ne!(second_page[0].id, cursor.id);
 
-        drop(store);
-        drop(database);
-        if let Err(err) = std::fs::remove_file(&db_path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                return Err(err.into());
-            }
-        }
-
-        for suffix in ["db-wal", "db-shm"] {
-            let sidecar = db_path.with_extension(suffix);
-            let _ = std::fs::remove_file(sidecar);
-        }
-
         Ok(())
     }
 
     #[tokio::test]
     async fn connected_account_lifecycle_roundtrips() -> anyhow::Result<()> {
-        let (database, db_path) = setup_database().await?;
+        let (database, _temp_dir) = setup_database().await?;
         let store = UserStore::new(&database);
 
         let user = store
@@ -820,19 +524,6 @@ mod tests {
                 .await?
                 .is_none()
         );
-
-        drop(store);
-        drop(database);
-        if let Err(err) = std::fs::remove_file(&db_path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                return Err(err.into());
-            }
-        }
-
-        for suffix in ["db-wal", "db-shm"] {
-            let sidecar = db_path.with_extension(suffix);
-            let _ = std::fs::remove_file(sidecar);
-        }
 
         Ok(())
     }

@@ -1,0 +1,17 @@
+[target]
+base_url = "http://127.0.0.1:8081"
+admin_email = "admin@example.com"
+admin_password = "password"
+pid_file = "barffine.pid"
+
+[dataset]
+path = "bench-results/dataset.json"
+
+# Example scenario override:
+#[scenarios.low]
+#concurrency = 2
+#think_time_ms = 750
+#duration_secs = 120
+#[[scenarios.low.operations]]
+#kind = "health"
+#weight = 1

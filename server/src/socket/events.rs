@@ -464,12 +464,6 @@ async fn handle_space_join(
             RoomKind::Sync,
         ));
 
-        socket.join(space_room_name(
-            payload.space_type,
-            &payload.space_id,
-            RoomKind::LegacySync,
-        ));
-
         ack_ok(
             ack,
             JoinSpaceResponse {
@@ -527,12 +521,6 @@ async fn handle_space_leave(
             &payload.space_id,
             RoomKind::Sync,
         ));
-        socket.leave(space_room_name(
-            payload.space_type,
-            &payload.space_id,
-            RoomKind::LegacySync,
-        ));
-
         ack_ok(
             ack,
             JoinSpaceResponse {
@@ -902,6 +890,20 @@ async fn handle_space_push_doc_update(
             }
         };
 
+        // If the same space/document/requestId has already been successfully processed once,
+        // reuse the previous timestamp and return to avoid reapplying the exact same logical update
+        // (e.g., due to client retries or network replay).
+        // (e.g., due to client retries or network replay).
+        if let Some(prev_timestamp) = state.request_deduper.check(
+            payload.space_type,
+            &payload.space_id,
+            &payload.doc_id,
+            &request.request_id,
+        ) {
+            ack_doc_update(ack, prev_timestamp);
+            return;
+        }
+
         match payload.space_type {
             SpaceType::Workspace => {
                 let mut access = match resolve_doc_access_cached(
@@ -960,16 +962,13 @@ async fn handle_space_push_doc_update(
                     .await;
 
                 let timestamp = Some(cache_result.timestamp);
-                emit_doc_update_events(
-                    &socket,
+                state.request_deduper.store(
                     payload.space_type,
                     &payload.space_id,
                     &payload.doc_id,
-                    &update_bytes,
+                    &request.request_id,
                     timestamp,
-                    &user,
-                )
-                .await;
+                );
                 ack_doc_update(ack, timestamp);
             }
             SpaceType::Userspace => {
@@ -999,16 +998,13 @@ async fn handle_space_push_doc_update(
                 };
 
                 let timestamp = Some(cache_result.timestamp);
-                emit_doc_update_events(
-                    &socket,
+                state.request_deduper.store(
                     payload.space_type,
                     &payload.space_id,
                     &payload.doc_id,
-                    &update_bytes,
+                    &request.request_id,
                     timestamp,
-                    &user,
-                )
-                .await;
+                );
                 ack_doc_update(ack, timestamp);
             }
         }
@@ -1041,7 +1037,6 @@ async fn handle_space_push_doc_updates(
         doc_id,
         updates,
     } = payload;
-
     async move {
         if updates.is_empty() {
             ack_error::<PushDocUpdateResponse>(
@@ -1057,20 +1052,37 @@ async fn handle_space_push_doc_updates(
             return;
         }
 
+        // Repeated batch update requests for the same space/document/requestId will reuse
+        // the previous result.
+        if let Some(prev_timestamp) =
+            state
+                .request_deduper
+                .check(space_type, &space_id, &doc_id, &request.request_id)
+        {
+            ack_doc_update(ack, prev_timestamp);
+            return;
+        }
+
+        // Decode all updates first, but don't touch `ack` inside the loop to avoid moving it
+        // multiple times across iterations.
         let mut update_bytes = Vec::with_capacity(updates.len());
+        let mut decode_error: Option<AppError> = None;
         for encoded in &updates {
             match BASE64.decode(encoded.as_bytes()) {
                 Ok(bytes) => update_bytes.push(bytes),
                 Err(_) => {
-                    ack_error::<PushDocUpdateResponse>(
-                        ack,
-                        AppError::bad_request("invalid update payload"),
-                        Some(&request.request_id),
-                    );
-                    return;
+                    decode_error = Some(AppError::bad_request("invalid update payload"));
+                    break;
                 }
             }
         }
+
+        if let Some(err) = decode_error {
+            ack_error::<PushDocUpdateResponse>(ack, err, Some(&request.request_id));
+            return;
+        }
+
+        let mut final_timestamp: Option<i64> = None;
 
         match space_type {
             SpaceType::Workspace => {
@@ -1131,6 +1143,13 @@ async fn handle_space_push_doc_updates(
                 doc_access_cache.insert(&space_id, &doc_id, access).await;
 
                 let timestamp = Some(cache_result.timestamp);
+                state.request_deduper.store(
+                    space_type,
+                    &space_id,
+                    &doc_id,
+                    &request.request_id,
+                    timestamp,
+                );
                 let channel_key = doc_channel_key(&space_id, &doc_id);
                 state.sync_hub.publish_updates(
                     &channel_key,
@@ -1169,31 +1188,7 @@ async fn handle_space_push_doc_updates(
                     }
                 }
 
-                let mut legacy_payload = json!({
-                    "spaceType": space_type,
-                    "spaceId": space_id,
-                    "docId": doc_id,
-                    "updates": updates,
-                    "timestamp": timestamp,
-                });
-                attach_editor_metadata(&mut legacy_payload, &user);
-
-                if let Err(err) = socket
-                    .broadcast()
-                    .to(space_room_name(space_type, &space_id, RoomKind::LegacySync))
-                    .emit("space:broadcast-doc-updates", &legacy_payload)
-                    .await
-                {
-                    info!(?err, "failed to emit legacy doc update");
-                }
-
-                ack_ok(
-                    ack,
-                    PushDocUpdateResponse {
-                        accepted: true,
-                        timestamp,
-                    },
-                );
+                final_timestamp = timestamp;
             }
             SpaceType::Userspace => {
                 if let Err(err) = ensure_userspace_owner(&user, &space_id) {
@@ -1225,6 +1220,13 @@ async fn handle_space_push_doc_updates(
                 };
 
                 let timestamp = Some(cache_result.timestamp);
+                state.request_deduper.store(
+                    space_type,
+                    &space_id,
+                    &doc_id,
+                    &request.request_id,
+                    timestamp,
+                );
                 let channel_key = doc_channel_key(&space_id, &doc_id);
                 state.sync_hub.publish_updates(
                     &channel_key,
@@ -1263,84 +1265,14 @@ async fn handle_space_push_doc_updates(
                     }
                 }
 
-                let mut legacy_payload = json!({
-                    "spaceType": space_type,
-                    "spaceId": space_id,
-                    "docId": doc_id,
-                    "updates": updates,
-                    "timestamp": timestamp,
-                });
-                attach_editor_metadata(&mut legacy_payload, &user);
-
-                if let Err(err) = socket
-                    .broadcast()
-                    .to(space_room_name(space_type, &space_id, RoomKind::LegacySync))
-                    .emit("space:broadcast-doc-updates", &legacy_payload)
-                    .await
-                {
-                    info!(?err, "failed to emit legacy doc update");
-                }
-
-                ack_ok(
-                    ack,
-                    PushDocUpdateResponse {
-                        accepted: true,
-                        timestamp,
-                    },
-                );
+                final_timestamp = timestamp;
             }
         }
+
+        ack_doc_update(ack, final_timestamp);
     }
     .instrument(span)
     .await;
-}
-
-async fn emit_doc_update_events(
-    socket: &SocketRef,
-    space_type: SpaceType,
-    space_id: &str,
-    doc_id: &str,
-    update_bytes: &[u8],
-    timestamp: Option<i64>,
-    user: &SocketUserContext,
-) {
-    let encoded_update = BASE64.encode(update_bytes);
-
-    let mut broadcast_payload = json!({
-        "spaceType": space_type,
-        "spaceId": space_id,
-        "docId": doc_id,
-        "update": encoded_update.clone(),
-        "timestamp": timestamp,
-    });
-    attach_editor_metadata(&mut broadcast_payload, user);
-
-    if let Err(err) = socket
-        .broadcast()
-        .to(space_room_name(space_type, space_id, RoomKind::Sync))
-        .emit("space:broadcast-doc-update", &broadcast_payload)
-        .await
-    {
-        warn!(?err, "failed to emit broadcast update");
-    }
-
-    let mut legacy_payload = json!({
-        "spaceType": space_type,
-        "spaceId": space_id,
-        "docId": doc_id,
-        "updates": [encoded_update],
-        "timestamp": timestamp,
-    });
-    attach_editor_metadata(&mut legacy_payload, user);
-
-    if let Err(err) = socket
-        .broadcast()
-        .to(space_room_name(space_type, space_id, RoomKind::LegacySync))
-        .emit("space:broadcast-doc-updates", &legacy_payload)
-        .await
-    {
-        info!(?err, "failed to emit legacy doc update");
-    }
 }
 
 fn ack_doc_update(ack: AckSender, timestamp: Option<i64>) {
@@ -1872,7 +1804,11 @@ async fn handle_disconnect(socket: SocketRef, State(state): State<AppState>) {
 mod tests {
     use super::*;
     use crate::auth::generate_password_hash;
-    use barffine_core::{config::AppConfig, db::Database, doc_store::DocumentMetadata};
+    use barffine_core::{
+        config::{AppConfig, BlobStoreBackend, DocDataBackend},
+        db::Database,
+        doc_store::DocumentMetadata,
+    };
     use tempfile::TempDir;
 
     async fn setup_state() -> (TempDir, Database, AppState) {
@@ -1880,12 +1816,21 @@ mod tests {
         let mut config = AppConfig::default();
         let db_path = temp_dir.path().join("test.db");
         config.database_path = db_path.to_string_lossy().into_owned();
+        config.doc_data_backend = DocDataBackend::Sqlite;
+        config.doc_data_path = temp_dir
+            .path()
+            .join("doc-kv")
+            .to_string_lossy()
+            .into_owned();
+        config.blob_store_backend = BlobStoreBackend::Sql;
+        config.blob_store_path = temp_dir
+            .path()
+            .join("blob-store")
+            .to_string_lossy()
+            .into_owned();
 
         let database = Database::connect(&config).await.expect("connect database");
-        crate::utils::db::run_migrations(database.pool())
-            .await
-            .expect("apply migrations");
-        let state = crate::build_state(&database);
+        let state = crate::build_state(&database, &config);
         state
             .workspace_store
             .normalize_member_statuses()

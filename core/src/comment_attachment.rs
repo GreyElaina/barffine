@@ -1,11 +1,8 @@
-use std::sync::Arc;
-
-use anyhow::{Result, anyhow};
-use chrono::{DateTime, TimeZone, Utc};
+use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Row, Sqlite};
 
-use crate::db::Database;
+use crate::db::{Database, comment_attachment_repo::CommentAttachmentRepositoryRef};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommentAttachmentRecord {
@@ -31,14 +28,14 @@ pub struct CommentAttachmentUpsert<'a> {
 }
 
 #[derive(Clone)]
-pub struct SqliteCommentAttachmentStore {
-    pool: Arc<Pool<Sqlite>>,
+pub struct CommentAttachmentStore {
+    repo: CommentAttachmentRepositoryRef,
 }
 
-impl SqliteCommentAttachmentStore {
+impl CommentAttachmentStore {
     pub fn new(database: &Database) -> Self {
         Self {
-            pool: Arc::new(database.pool().clone()),
+            repo: database.repositories().comment_attachment_repo(),
         }
     }
 
@@ -46,37 +43,7 @@ impl SqliteCommentAttachmentStore {
         &self,
         input: CommentAttachmentUpsert<'_>,
     ) -> Result<CommentAttachmentRecord> {
-        let CommentAttachmentUpsert {
-            workspace_id,
-            doc_id,
-            key,
-            name,
-            mime,
-            size,
-            created_by,
-        } = input;
-
-        let created_at = Utc::now().timestamp();
-
-        sqlx::query(
-            "INSERT INTO comment_attachments (workspace_id, doc_id, key, name, mime, size, created_at, created_by)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(workspace_id, doc_id, key) DO UPDATE SET name = excluded.name, mime = excluded.mime, size = excluded.size",
-        )
-        .bind(workspace_id)
-        .bind(doc_id)
-        .bind(key)
-        .bind(name)
-        .bind(mime)
-        .bind(size)
-        .bind(created_at)
-        .bind(created_by)
-        .execute(&*self.pool)
-        .await?;
-
-        self.get(workspace_id, doc_id, key)
-            .await?
-            .ok_or_else(|| anyhow!("comment attachment not found after upsert"))
+        self.repo.upsert(input).await
     }
 
     pub async fn get(
@@ -85,18 +52,7 @@ impl SqliteCommentAttachmentStore {
         doc_id: &str,
         key: &str,
     ) -> Result<Option<CommentAttachmentRecord>> {
-        let row = sqlx::query(
-            "SELECT workspace_id, doc_id, key, name, mime, size, created_at, created_by
-             FROM comment_attachments
-             WHERE workspace_id = ? AND doc_id = ? AND key = ?",
-        )
-        .bind(workspace_id)
-        .bind(doc_id)
-        .bind(key)
-        .fetch_optional(&*self.pool)
-        .await?;
-
-        Ok(row.map(map_record))
+        self.repo.get(workspace_id, doc_id, key).await
     }
 
     pub async fn list_for_doc(
@@ -104,110 +60,84 @@ impl SqliteCommentAttachmentStore {
         workspace_id: &str,
         doc_id: &str,
     ) -> Result<Vec<CommentAttachmentRecord>> {
-        let rows = sqlx::query(
-            "SELECT workspace_id, doc_id, key, name, mime, size, created_at, created_by
-             FROM comment_attachments
-             WHERE workspace_id = ? AND doc_id = ?
-             ORDER BY created_at ASC",
-        )
-        .bind(workspace_id)
-        .bind(doc_id)
-        .fetch_all(&*self.pool)
-        .await?;
-
-        Ok(rows.into_iter().map(map_record).collect())
+        self.repo.list_for_doc(workspace_id, doc_id).await
     }
 
     pub async fn delete(&self, workspace_id: &str, doc_id: &str, key: &str) -> Result<()> {
-        sqlx::query(
-            "DELETE FROM comment_attachments WHERE workspace_id = ? AND doc_id = ? AND key = ?",
-        )
-        .bind(workspace_id)
-        .bind(doc_id)
-        .bind(key)
-        .execute(&*self.pool)
-        .await?;
-        Ok(())
-    }
-}
-
-fn map_record(row: sqlx::sqlite::SqliteRow) -> CommentAttachmentRecord {
-    let timestamp = row.get::<i64, _>("created_at");
-    let created_at = Utc
-        .timestamp_opt(timestamp, 0)
-        .single()
-        .unwrap_or_else(Utc::now);
-
-    CommentAttachmentRecord {
-        workspace_id: row.get("workspace_id"),
-        doc_id: row.get("doc_id"),
-        key: row.get("key"),
-        name: row.get("name"),
-        mime: row.get("mime"),
-        size: row.get("size"),
-        created_at,
-        created_by: row.get::<Option<String>, _>("created_by"),
+        self.repo.delete(workspace_id, doc_id, key).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AppConfig;
+    use crate::{
+        config::{AppConfig, BlobStoreBackend, DocDataBackend},
+        db::{user_repo::CreateUserParams, workspace_repo::CreateWorkspaceParams},
+        doc_store::DocumentStore,
+    };
     use chrono::Utc;
     use tempfile::TempDir;
 
-    async fn setup_store() -> (TempDir, Database, SqliteCommentAttachmentStore) {
+    async fn setup_store() -> (TempDir, Database, CommentAttachmentStore) {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let mut config = AppConfig::default();
         let db_path = temp_dir.path().join("comment_attachments.db");
         config.database_path = db_path.to_string_lossy().into_owned();
+        config.doc_data_backend = DocDataBackend::Sqlite;
+        config.doc_data_path = temp_dir
+            .path()
+            .join("doc-kv")
+            .to_string_lossy()
+            .into_owned();
+        config.blob_store_backend = BlobStoreBackend::Sql;
+        config.blob_store_path = temp_dir
+            .path()
+            .join("blob-store")
+            .to_string_lossy()
+            .into_owned();
 
         let database = Database::connect(&config).await.expect("connect database");
-        sqlx::migrate!("../server/migrations")
-            .run(database.pool())
-            .await
-            .expect("run migrations");
 
         let now = Utc::now().timestamp();
-        sqlx::query("INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)")
-            .bind("user")
-            .bind("user@example.com")
-            .bind("password-hash")
-            .bind(now)
-            .execute(database.pool())
+        let repos = database.repositories();
+        repos
+            .user_repo()
+            .create_user(CreateUserParams {
+                id: "user".to_string(),
+                email: "user@example.com".to_string(),
+                password_hash: "password-hash".to_string(),
+                name: None,
+                created_at: now,
+            })
             .await
             .expect("seed user");
 
-        sqlx::query("INSERT INTO workspaces (id, name, owner_id, created_at) VALUES (?, ?, ?, ?)")
-            .bind("workspace")
-            .bind("Test Workspace")
-            .bind("user")
-            .bind(now)
-            .execute(database.pool())
+        repos
+            .workspace_repo()
+            .create_workspace(CreateWorkspaceParams {
+                id: "workspace".to_string(),
+                owner_id: "user".to_string(),
+                name: "Test Workspace".to_string(),
+                created_at: now,
+                public: false,
+                enable_ai: true,
+                enable_doc_embedding: true,
+                enable_url_preview: false,
+                avatar_key: None,
+                indexed: false,
+                last_check_embeddings: 0,
+            })
             .await
             .expect("seed workspace");
 
-        sqlx::query(
-            "INSERT INTO documents (id, workspace_id, snapshot, created_at, updated_at, default_role, public, mode, title, summary, creator_id, updater_id)
-             VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
-        )
-        .bind("doc")
-        .bind("workspace")
-        .bind(Vec::<u8>::new())
-        .bind(now)
-        .bind(now)
-        .bind("manager")
-        .bind("page")
-        .bind::<Option<String>>(None)
-        .bind::<Option<String>>(None)
-        .bind::<Option<String>>(None)
-        .bind::<Option<String>>(None)
-        .execute(database.pool())
-        .await
-        .expect("seed document");
+        let doc_store = DocumentStore::new(&database);
+        doc_store
+            .ensure_doc_record("workspace", "doc", "user", Some("Doc"))
+            .await
+            .expect("seed document");
 
-        let store = SqliteCommentAttachmentStore::new(&database);
+        let store = CommentAttachmentStore::new(&database);
         (temp_dir, database, store)
     }
 

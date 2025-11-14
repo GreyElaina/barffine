@@ -21,6 +21,7 @@ use crate::{
         extract_session_token,
     },
     observability::{self, RequestContext},
+    request_cache::{self, RequestCaches},
 };
 
 use super::{BarffineSchema, RequestUser, context::ClientVersion, metrics::GRAPHQL_METRICS};
@@ -78,6 +79,8 @@ pub async fn graphql_handler(
     request = request.data(ClientVersion::new(client_version));
 
     let client_version_label = request_context.client_version().unwrap_or("unknown");
+    let request_caches = RequestCaches::default();
+    request = request.data(request_caches.clone());
 
     let operation_name = request
         .operation_name
@@ -108,7 +111,11 @@ pub async fn graphql_handler(
     );
 
     let start = Instant::now();
-    let execution = schema.execute(request).instrument(graph_span).await;
+    let execution = request_cache::scope_with_request_caches(
+        request_caches,
+        schema.execute(request).instrument(graph_span),
+    )
+    .await;
 
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -229,7 +236,7 @@ mod tests {
     use crate::{
         cookies::{SESSION_COOKIE_NAME, USER_COOKIE_NAME},
         graphql, observability,
-        test_support::{seed_workspace, setup_state},
+        testing::{seed_workspace, setup_state},
     };
     use axum::{
         Extension, Router,

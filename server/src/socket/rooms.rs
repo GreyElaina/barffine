@@ -25,7 +25,6 @@ impl std::fmt::Display for SpaceType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoomKind {
     Sync,
-    LegacySync,
     Awareness { doc_id: String },
 }
 
@@ -33,7 +32,6 @@ impl RoomKind {
     fn suffix(&self) -> String {
         match self {
             RoomKind::Sync => "sync".to_string(),
-            RoomKind::LegacySync => "sync-019".to_string(),
             RoomKind::Awareness { doc_id } => format!("{}:awareness", doc_id),
         }
     }

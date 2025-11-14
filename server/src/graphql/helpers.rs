@@ -3,7 +3,7 @@ use argon2::password_hash;
 use async_graphql::{
     Context, Error as GraphQLError, ErrorExtensions, ID, Result as GraphQLResult, Upload, Value,
 };
-use barffine_core::workspace as core_workspace;
+use barffine_core::{doc_store::DocumentMetadata, workspace as core_workspace};
 use chrono::{DateTime, Utc};
 use std::io::Read;
 
@@ -11,6 +11,7 @@ use crate::{
     AppError, AppState,
     doc::{access as doc_access, metadata as doc_metadata},
     error::UserFriendlyPayload,
+    request_cache,
 };
 
 use super::{
@@ -62,9 +63,7 @@ pub(crate) async fn require_workspace_permission(
     let request_user = require_request_user(ctx)?;
     let state = ctx.data::<AppState>()?;
 
-    let workspace = state
-        .workspace_service
-        .fetch_workspace(workspace_id)
+    let workspace = fetch_workspace_cached(state, workspace_id)
         .await
         .map_err(map_app_error)?;
 
@@ -206,17 +205,49 @@ pub(crate) async fn doc_permissions_for_user_internal(
     doc_id: &str,
     user_id: &str,
 ) -> Result<Option<DocPermissions>, AppError> {
-    let workspace = state
-        .workspace_service
-        .fetch_workspace(workspace_id)
-        .await?;
+    doc_permissions_for_user_internal_with_metadata(state, workspace_id, doc_id, user_id, None)
+        .await
+}
 
-    let metadata = doc_metadata::fetch_required(state, workspace_id, doc_id).await?;
+async fn doc_permissions_for_user_internal_with_metadata(
+    state: &AppState,
+    workspace_id: &str,
+    doc_id: &str,
+    user_id: &str,
+    metadata_hint: Option<&DocumentMetadata>,
+) -> Result<Option<DocPermissions>, AppError> {
+    let caches = request_cache::current_request_caches();
+    let mut metadata_owned = metadata_hint.cloned();
+    if metadata_owned.is_none() {
+        if let Some(c) = caches.as_ref() {
+            metadata_owned = c
+                .doc_metadata()
+                .get(workspace_id, doc_id)
+                .and_then(|value| value);
+        }
+    }
 
-    let authorization =
-        doc_access::resolve_doc_authorization(state, &workspace, &metadata, Some(user_id)).await?;
+    if let Some(caches) = caches {
+        let metadata_for_fetch = metadata_owned.clone();
+        return caches
+            .doc_permissions()
+            .get_or_fetch(workspace_id, doc_id, user_id, || {
+                let metadata_for_fetch = metadata_for_fetch.clone();
+                async move {
+                    compute_doc_permissions(
+                        state,
+                        workspace_id,
+                        doc_id,
+                        metadata_for_fetch,
+                        user_id,
+                    )
+                    .await
+                }
+            })
+            .await;
+    }
 
-    Ok(authorization.permissions)
+    compute_doc_permissions(state, workspace_id, doc_id, metadata_owned, user_id).await
 }
 
 pub(crate) async fn fetch_workspace_record(
@@ -230,6 +261,7 @@ pub(crate) async fn fetch_workspace_record(
         .map_err(map_app_error)
 }
 
+#[cfg_attr(not(any(test, feature = "barffine_extra")), allow(dead_code))]
 pub(crate) async fn doc_permissions_for_user(
     state: &AppState,
     workspace_id: &str,
@@ -237,6 +269,18 @@ pub(crate) async fn doc_permissions_for_user(
     user_id: &str,
 ) -> GraphQLResult<Option<DocPermissions>> {
     doc_permissions_for_user_internal(state, workspace_id, doc_id, user_id)
+        .await
+        .map_err(map_app_error)
+}
+
+pub(crate) async fn doc_permissions_for_user_with_metadata_hint(
+    state: &AppState,
+    workspace_id: &str,
+    doc_id: &str,
+    metadata: Option<&DocumentMetadata>,
+    user_id: &str,
+) -> GraphQLResult<Option<DocPermissions>> {
+    doc_permissions_for_user_internal_with_metadata(state, workspace_id, doc_id, user_id, metadata)
         .await
         .map_err(map_app_error)
 }
@@ -254,8 +298,14 @@ where
     let request_user = require_request_user(ctx)?;
     let state = ctx.data::<AppState>()?;
 
-    let Some(perms) =
-        doc_permissions_for_user(state, workspace_id, doc_id, &request_user.user_id).await?
+    let Some(perms) = doc_permissions_for_user_with_metadata_hint(
+        state,
+        workspace_id,
+        doc_id,
+        None,
+        &request_user.user_id,
+    )
+    .await?
     else {
         return Err(map_app_error(AppError::forbidden(error_message)));
     };
@@ -265,6 +315,55 @@ where
     } else {
         Err(map_app_error(AppError::forbidden(error_message)))
     }
+}
+
+pub(crate) async fn require_doc_permission_with_workspace_metadata<F>(
+    ctx: &Context<'_>,
+    workspace: &core_workspace::WorkspaceRecord,
+    metadata: &DocumentMetadata,
+    predicate: F,
+    error_message: &'static str,
+) -> GraphQLResult<RequestUser>
+where
+    F: Fn(&DocPermissions) -> bool,
+{
+    let request_user = require_request_user(ctx)?;
+    let state = ctx.data::<AppState>()?;
+
+    let Some(perms) =
+        doc_permissions_for_user_with_metadata(state, workspace, metadata, &request_user.user_id)
+            .await?
+    else {
+        return Err(map_app_error(AppError::forbidden(error_message)));
+    };
+
+    if predicate(&perms) {
+        Ok(request_user)
+    } else {
+        Err(map_app_error(AppError::forbidden(error_message)))
+    }
+}
+
+pub(crate) async fn require_doc_permission_with_metadata_hint<F>(
+    ctx: &Context<'_>,
+    workspace_id: &str,
+    metadata: &DocumentMetadata,
+    predicate: F,
+    error_message: &'static str,
+) -> GraphQLResult<RequestUser>
+where
+    F: Fn(&DocPermissions) -> bool,
+{
+    let state = ctx.data::<AppState>()?;
+    let workspace = fetch_workspace_record(state, workspace_id).await?;
+    require_doc_permission_with_workspace_metadata(
+        ctx,
+        &workspace,
+        metadata,
+        predicate,
+        error_message,
+    )
+    .await
 }
 
 pub(crate) fn map_anyhow(err: AnyError) -> GraphQLError {
@@ -277,6 +376,75 @@ pub(crate) fn map_app_error(err: AppError) -> GraphQLError {
 
 pub(crate) fn map_password(err: password_hash::Error) -> GraphQLError {
     graphql_error_from_app_error(AppError::internal(AnyError::new(err)))
+}
+
+async fn compute_doc_permissions(
+    state: &AppState,
+    workspace_id: &str,
+    doc_id: &str,
+    metadata_hint: Option<DocumentMetadata>,
+    user_id: &str,
+) -> Result<Option<DocPermissions>, AppError> {
+    let workspace = fetch_workspace_cached(state, workspace_id).await?;
+    let metadata = match metadata_hint {
+        Some(value) => value,
+        None => doc_metadata::fetch_required(state, workspace_id, doc_id).await?,
+    };
+
+    compute_doc_permissions_from_parts(state, workspace, metadata, user_id).await
+}
+
+async fn compute_doc_permissions_from_parts(
+    state: &AppState,
+    workspace: core_workspace::WorkspaceRecord,
+    metadata: DocumentMetadata,
+    user_id: &str,
+) -> Result<Option<DocPermissions>, AppError> {
+    let authorization =
+        doc_access::resolve_doc_authorization(state, &workspace, &metadata, Some(user_id)).await?;
+
+    Ok(authorization.permissions)
+}
+
+pub(crate) async fn doc_permissions_for_user_with_metadata(
+    state: &AppState,
+    workspace: &core_workspace::WorkspaceRecord,
+    metadata: &DocumentMetadata,
+    user_id: &str,
+) -> Result<Option<DocPermissions>, AppError> {
+    let metadata_owned = metadata.clone();
+    if let Some(caches) = request_cache::current_request_caches() {
+        let workspace_id = workspace.id.clone();
+        let doc_id = metadata_owned.id.clone();
+        return caches
+            .doc_permissions()
+            .get_or_fetch(&workspace_id, &doc_id, user_id, || {
+                let workspace = workspace.clone();
+                let metadata = metadata_owned.clone();
+                async move {
+                    compute_doc_permissions_from_parts(state, workspace, metadata, user_id).await
+                }
+            })
+            .await;
+    }
+
+    compute_doc_permissions_from_parts(state, workspace.clone(), metadata_owned, user_id).await
+}
+
+async fn fetch_workspace_cached(
+    state: &AppState,
+    workspace_id: &str,
+) -> Result<core_workspace::WorkspaceRecord, AppError> {
+    if let Some(caches) = request_cache::current_request_caches() {
+        caches
+            .workspace_records()
+            .get_or_fetch(workspace_id, || async {
+                state.workspace_service.fetch_workspace(workspace_id).await
+            })
+            .await
+    } else {
+        state.workspace_service.fetch_workspace(workspace_id).await
+    }
 }
 
 pub(crate) fn graphql_error_from_app_error(err: AppError) -> GraphQLError {
