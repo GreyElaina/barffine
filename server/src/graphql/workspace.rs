@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use barffine_core::{
     doc_store::DocumentMetadata,
     feature::FeatureNamespace,
-    notification::{CommentChangeRecord, CommentCursor, CommentStore},
+    notification::{CommentChangeRecord, CommentCursor},
     workspace,
     workspace::{WorkspaceRecord, WorkspaceStore},
 };
@@ -1432,10 +1432,10 @@ mod tests {
     use crate::{
         auth::generate_password_hash,
         graphql::{self, RequestUser},
-        testing::{insert_document, seed_workspace, setup_state},
+        testing::{insert_document, seed_workspace, setup_state, setup_state_with_rocks_doc_store},
     };
     use async_graphql::Request as GraphQLRequest;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use uuid::Uuid;
 
     #[tokio::test]
@@ -1594,6 +1594,61 @@ mod tests {
             .await
             .expect("query workspace");
         assert!(record.is_none());
+    }
+
+    #[tokio::test]
+    async fn graphql_delete_workspace_removes_docs_in_rocks_mode() {
+        let (_temp_dir, database, state) = crate::testing::setup_state_with_rocks_doc_store().await;
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+
+        // 插入一个文档，确保在 Rocks doc_store 下创建
+        let doc_id = "doc-to-delete".to_string();
+        crate::testing::insert_document(&database, &workspace_id, &doc_id, false, "page").await;
+
+        // workspace 下现在至少有一个 doc
+        let doc_store = barffine_core::doc_store::DocumentStore::new(&database);
+        let timestamps = doc_store
+            .list_doc_timestamps(&workspace_id, None)
+            .await
+            .expect("list docs before delete");
+        assert!(timestamps.contains_key(&doc_id));
+
+        let schema = graphql::build_schema(state.clone());
+        let mutation = format!(
+            r#"
+		mutation {{
+			deleteWorkspace(id: "{workspace_id}")
+		}}
+		"#
+        );
+
+        let response = schema
+            .execute(GraphQLRequest::new(mutation).data(RequestUser::new(owner_id.clone())))
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "unexpected errors: {:?}",
+            response.errors
+        );
+
+        // workspace 记录应已删除
+        let record = state
+            .workspace_store
+            .find_by_id(&workspace_id)
+            .await
+            .expect("query workspace");
+        assert!(record.is_none());
+
+        // docStore 中不应再有该文档
+        let timestamps_after = doc_store
+            .list_doc_timestamps(&workspace_id, None)
+            .await
+            .expect("list docs after delete");
+        assert!(
+            !timestamps_after.contains_key(&doc_id),
+            "doc timestamps should not contain deleted doc"
+        );
     }
 
     #[tokio::test]
@@ -1855,6 +1910,74 @@ mod tests {
         let data = response.data.into_json().expect("json data");
         assert_eq!(data["workspace"]["role"], "Owner");
         assert_eq!(data["workspace"]["team"], false);
+    }
+
+    #[tokio::test]
+    async fn graphql_workspace_docs_lists_docs_in_rocks_mode() {
+        let (_temp_dir, database, state) = setup_state_with_rocks_doc_store().await;
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+
+        // 在 Rocks doc store 模式下插入几篇文档
+        let doc_ids = vec![
+            "doc-a".to_string(),
+            "doc-b".to_string(),
+            "doc-c".to_string(),
+        ];
+        for doc_id in &doc_ids {
+            insert_document(&database, &workspace_id, doc_id, false, "page").await;
+        }
+
+        let schema = graphql::build_schema(state.clone());
+        let query = r#"
+		query WorkspaceDocs($workspaceId: ID!, $first: Int!) {
+			workspace(id: $workspaceId) {
+				docs(pagination: { first: $first }) {
+					edges {
+						node { id }
+					}
+					pageInfo {
+						hasNextPage
+						endCursor
+					}
+				}
+			}
+		}
+		"#;
+
+        let vars = async_graphql::Variables::from_json(serde_json::json!({
+            "workspaceId": workspace_id,
+            "first": 10,
+        }));
+
+        let response = schema
+            .execute(
+                async_graphql::Request::new(query)
+                    .variables(vars)
+                    .data(RequestUser::new(owner_id.clone())),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "unexpected errors: {:?}",
+            response.errors
+        );
+
+        let data = response.data.into_json().expect("json data");
+        let edges = data["workspace"]["docs"]["edges"]
+            .as_array()
+            .expect("edges array");
+        let returned_ids: HashSet<String> = edges
+            .iter()
+            .map(|edge| edge["node"]["id"].as_str().unwrap().to_string())
+            .collect();
+
+        for doc_id in &doc_ids {
+            assert!(
+                returned_ids.contains(doc_id),
+                "workspace.docs should contain {doc_id} in Rocks mode",
+            );
+        }
     }
 
     #[tokio::test]

@@ -5,10 +5,10 @@ use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use chrono::Utc;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use parking_lot::RwLock;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::RwLock;
 use url::Url;
 
 use crate::AppError;
@@ -75,19 +75,29 @@ impl AppleOAuthProvider {
     }
 
     async fn apple_keys(&self) -> Result<Arc<Vec<AppleJwk>>, AppError> {
-        if let Some(cache) = self.key_cache.read().await.clone() {
+        if let Some(cache) = self.key_cache.read().clone() {
             if cache.fetched_at.elapsed() < Duration::from_secs(3600) {
                 return Ok(cache.keys);
             }
         }
 
-        let mut writer = self.key_cache.write().await;
+        let keys = Arc::new(self.fetch_apple_keys().await?);
+
+        let mut writer = self.key_cache.write();
         if let Some(cache) = writer.clone() {
             if cache.fetched_at.elapsed() < Duration::from_secs(3600) {
                 return Ok(cache.keys);
             }
         }
 
+        *writer = Some(AppleKeyCache {
+            fetched_at: Instant::now(),
+            keys: keys.clone(),
+        });
+        Ok(keys)
+    }
+
+    async fn fetch_apple_keys(&self) -> Result<Vec<AppleJwk>, AppError> {
         let response = self
             .client
             .get(APPLE_KEYS_URL)
@@ -115,12 +125,7 @@ impl AppleOAuthProvider {
             .context("decode apple signing keys")
             .map_err(AppError::from_anyhow)?;
 
-        let keys = Arc::new(payload.keys);
-        *writer = Some(AppleKeyCache {
-            fetched_at: Instant::now(),
-            keys: keys.clone(),
-        });
-        Ok(keys)
+        Ok(payload.keys)
     }
 }
 

@@ -30,7 +30,6 @@ use crate::{
 use barffine_core::{
     blob::{BlobDescriptor, BlobMetadata},
     comment_attachment::CommentAttachmentUpsert,
-    notification::CommentStore,
     user_settings::UserNotificationSettingsUpdate,
 };
 use chrono::{DateTime, Utc};
@@ -1588,6 +1587,23 @@ impl MutationRoot {
         require_workspace_permission(ctx, workspace_id, Permission::Owner).await?;
 
         let state = ctx.data::<AppState>()?;
+        // Best-effort cleanup of workspace-scoped documents before removing the
+        // workspace record itself. This keeps Rocks-backed doc snapshots,
+        // history, logs and share links in sync with SQL metadata and also
+        // clears doc-level roles.
+        let doc_ids = state
+            .document_store
+            .delete_all_docs_in_workspace(workspace_id)
+            .await
+            .map_err(map_anyhow)?;
+        for doc_id in doc_ids {
+            state
+                .doc_role_store
+                .remove_all_for_doc(workspace_id, &doc_id)
+                .await
+                .map_err(map_anyhow)?;
+        }
+
         let deleted = state
             .workspace_store
             .delete(workspace_id)
@@ -2739,6 +2755,12 @@ impl MutationRoot {
             )));
         }
 
+        state
+            .doc_role_store
+            .remove_all_for_doc(&workspace_id, &doc_id)
+            .await
+            .map_err(map_anyhow)?;
+
         Ok(true)
     }
 
@@ -3076,7 +3098,6 @@ mod tests {
         password_hash::{PasswordHash, PasswordVerifier},
     };
     use async_graphql::Request as GraphQLRequest;
-    use barffine_core::notification::CommentStore;
     use serde_json::Value as JsonValue;
     use uuid::Uuid;
 
@@ -3096,7 +3117,7 @@ mod tests {
 
     #[tokio::test]
     async fn graphql_change_password_revokes_sessions() {
-        let (_temp_dir, database, state) = setup_state().await;
+        let (_temp_dir, _database, state) = setup_state().await;
         let password_hash = generate_password_hash("old-secret").expect("hash password");
         let user = state
             .user_store
@@ -3156,7 +3177,7 @@ mod tests {
 
     #[tokio::test]
     async fn graphql_update_user_allows_admin_changes() {
-        let (_temp_dir, database, state) = setup_state().await;
+        let (_temp_dir, _database, state) = setup_state().await;
         let password_hash = generate_password_hash("secret").expect("hash password");
         let admin = state
             .user_store
@@ -3219,7 +3240,7 @@ mod tests {
 
     #[tokio::test]
     async fn graphql_update_user_settings_persists_preferences() {
-        let (_temp_dir, database, state) = setup_state().await;
+        let (_temp_dir, _database, state) = setup_state().await;
         let password_hash = generate_password_hash("secret").expect("hash password");
         let user = state
             .user_store
@@ -4309,7 +4330,7 @@ mod tests {
 
     #[tokio::test]
     async fn graphql_create_session_rejects_disabled_user() {
-        let (_temp_dir, database, state) = setup_state().await;
+        let (_temp_dir, _database, state) = setup_state().await;
         let password_hash = generate_password_hash("secret").expect("hash password");
         let user = state
             .user_store

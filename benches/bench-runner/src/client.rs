@@ -1,13 +1,13 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
+use parking_lot::Mutex;
 use reqwest::{
     Client, StatusCode,
     header::{CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
 use tracing::instrument;
 
 use crate::config::TargetConfig;
@@ -94,11 +94,11 @@ impl BenchClient {
         if let Some(query) = query {
             req = req.query(query);
         }
-        if let Some(cookie_header) = self.cookie_header().await? {
+        if let Some(cookie_header) = self.cookie_header()? {
             req = req.header(COOKIE, cookie_header);
         }
         let res = req.send().await?;
-        self.capture_cookies(res.headers()).await?;
+        self.capture_cookies(res.headers())?;
         let status = res.status();
         let body = res.bytes().await?.to_vec();
         Ok((status, body))
@@ -111,16 +111,16 @@ impl BenchClient {
             .post(url)
             .header(CONTENT_TYPE, "application/json")
             .body(payload.to_string());
-        if let Some(cookie_header) = self.cookie_header().await? {
+        if let Some(cookie_header) = self.cookie_header()? {
             req = req.header(COOKIE, cookie_header);
         }
         let res = req.send().await?;
-        self.capture_cookies(res.headers()).await?;
+        self.capture_cookies(res.headers())?;
         Ok(res.text().await?)
     }
 
-    async fn cookie_header(&self) -> Result<Option<HeaderValue>> {
-        let store = self.cookies.lock().await;
+    fn cookie_header(&self) -> Result<Option<HeaderValue>> {
+        let store = self.cookies.lock();
         if let Some(value) = store.serialize() {
             match HeaderValue::from_str(&value) {
                 Ok(header) => Ok(Some(header)),
@@ -134,8 +134,8 @@ impl BenchClient {
         }
     }
 
-    async fn capture_cookies(&self, headers: &HeaderMap) -> Result<()> {
-        let mut store = self.cookies.lock().await;
+    fn capture_cookies(&self, headers: &HeaderMap) -> Result<()> {
+        let mut store = self.cookies.lock();
         store.ingest(headers);
         Ok(())
     }

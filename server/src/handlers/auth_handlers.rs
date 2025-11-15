@@ -419,7 +419,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_session_sets_cookies() {
-        let (_temp_dir, database, state) = setup_state().await;
+        let (_temp_dir, _database, state) = setup_state().await;
         let password_hash = generate_password_hash("secret").expect("hash password");
         let user = state
             .user_store

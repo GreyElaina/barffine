@@ -1,9 +1,11 @@
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 use anyhow::Result;
-use y_octo::{Doc, StateVector, merge_updates_v1};
+use yrs::updates::decoder::Decode;
+use yrs::{Doc, ReadTxn, StateVector, Transact, Update, merge_updates_v1};
 
-/// Lightweight wrapper around `y-octo::Doc` for local-first document handling.
+/// Lightweight wrapper around `yrs::Doc` for local-first document handling.
 pub struct DocEngine {
     doc: Arc<Mutex<Doc>>,
 }
@@ -26,14 +28,13 @@ impl DocEngine {
     /// Merge incremental document updates into a single binary payload
     /// compatible with the JavaScript client.
     pub fn merge_updates(&self, updates: &[Vec<u8>]) -> Result<Vec<u8>> {
-        let merged = merge_updates_v1(updates)?;
-        merged.encode_v1().map_err(Into::into)
+        merge_updates_v1(updates).map_err(Into::into)
     }
 
     pub fn snapshot(&self) -> Result<Vec<u8>> {
-        let doc = self.doc.lock().expect("doc poisoned");
-        doc.encode_state_as_update_v1(&StateVector::default())
-            .map_err(Into::into)
+        let doc = self.doc.lock();
+        let txn = doc.transact();
+        Ok(txn.encode_state_as_update_v1(&StateVector::default()))
     }
 
     pub fn doc(&self) -> Arc<Mutex<Doc>> {
@@ -46,19 +47,29 @@ impl DocEngine {
         snapshot: Option<&[u8]>,
         updates: &[Vec<u8>],
     ) -> Result<Vec<u8>> {
-        let mut doc = if let Some(snapshot) = snapshot {
-            Doc::try_from_binary_v1(snapshot)?
-        } else {
-            Doc::new()
-        };
-
-        for update in updates {
-            doc.apply_update_from_binary_v1(update)?;
+        let doc = Doc::new();
+        if let Some(snapshot) = snapshot {
+            apply_update_bytes(&doc, snapshot)?;
         }
 
-        doc.encode_state_as_update_v1(&StateVector::default())
-            .map_err(Into::into)
+        if !updates.is_empty() {
+            let mut txn = doc.transact_mut();
+            for update in updates {
+                let decoded = Update::decode_v1(update)?;
+                txn.apply_update(decoded)?;
+            }
+        }
+
+        let txn = doc.transact();
+        Ok(txn.encode_state_as_update_v1(&StateVector::default()))
     }
+}
+
+fn apply_update_bytes(doc: &Doc, bytes: &[u8]) -> Result<()> {
+    let update = Update::decode_v1(bytes)?;
+    let mut txn = doc.transact_mut();
+    txn.apply_update(update)?;
+    Ok(())
 }
 
 impl Default for DocEngine {

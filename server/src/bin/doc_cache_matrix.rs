@@ -21,7 +21,7 @@ use pprof::ProfilerGuardBuilder;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 use uuid::Uuid;
-use y_octo::{Doc, StateVector};
+use yrs::{Doc, ReadTxn, StateVector, Text, Transact};
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -567,18 +567,14 @@ impl UpdateGenerator {
     }
 
     fn next_update(&mut self, content: &str) -> Result<Vec<u8>> {
-        let mut text = self
+        let text = self
             .doc
-            .get_or_create_text(&self.text_name)
-            .context("get text type")?;
-        let len = text.len();
-        text.insert(len, content).context("insert text")?;
-
-        let update = self
-            .doc
-            .encode_state_as_update_v1(&self.state_vector)
-            .context("encode update")?;
-        self.state_vector = self.doc.get_state_vector();
+            .get_or_insert_text(*Arc::new(self.text_name.as_str()));
+        let mut txn = self.doc.transact_mut();
+        let len = text.len(&txn);
+        text.insert(&mut txn, len, content);
+        let update = txn.encode_state_as_update_v1(&self.state_vector);
+        self.state_vector = txn.state_vector();
         Ok(update)
     }
 }

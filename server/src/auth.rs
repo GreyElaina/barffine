@@ -13,12 +13,48 @@ use chrono::DateTime;
 
 use crate::{
     cookies::{clear_session_cookie, clear_user_cookie, extract_session_token},
+    doc::service::DocAccessService,
     error::AppError,
     graphql::{Permission, workspace_role_from_str},
-    state::AppState,
+    state::{AppState, SocketRuntimeState},
     types::{AuthenticatedRestSession, RestDocAccess, SessionLookup, WorkspaceAccess},
-    workspace::service::{AccessTokenContext, AccessTokenVerification},
+    user::service::UserService,
+    workspace::service::{AccessTokenContext, AccessTokenVerification, WorkspaceService},
 };
+
+pub(crate) trait AuthState: Send + Sync {
+    fn user_service(&self) -> &UserService;
+    fn workspace_service(&self) -> &WorkspaceService;
+    fn doc_access_service(&self) -> &DocAccessService;
+}
+
+impl AuthState for AppState {
+    fn user_service(&self) -> &UserService {
+        self.user_service.as_ref()
+    }
+
+    fn workspace_service(&self) -> &WorkspaceService {
+        self.workspace_service.as_ref()
+    }
+
+    fn doc_access_service(&self) -> &DocAccessService {
+        self.doc_access_service.as_ref()
+    }
+}
+
+impl AuthState for SocketRuntimeState {
+    fn user_service(&self) -> &UserService {
+        self.user_service.as_ref()
+    }
+
+    fn workspace_service(&self) -> &WorkspaceService {
+        self.workspace_service.as_ref()
+    }
+
+    fn doc_access_service(&self) -> &DocAccessService {
+        self.doc_access_service.as_ref()
+    }
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RpcAccessRequirement {
@@ -42,20 +78,29 @@ impl DocAccessIntent {
     }
 }
 
-pub(crate) async fn authenticate_rest_request(
-    state: &AppState,
+pub(crate) async fn authenticate_rest_request<S>(
+    state: &S,
     headers: &HeaderMap,
-) -> Result<AuthenticatedRestSession, AppError> {
-    state.user_service.authenticate_rest_request(headers).await
+) -> Result<AuthenticatedRestSession, AppError>
+where
+    S: AuthState,
+{
+    state
+        .user_service()
+        .authenticate_rest_request(headers)
+        .await
 }
 
-pub(crate) async fn resolve_workspace_access(
-    state: &AppState,
+pub(crate) async fn resolve_workspace_access<S>(
+    state: &S,
     headers: &HeaderMap,
     workspace_id: &str,
-) -> Result<WorkspaceAccess, AppError> {
+) -> Result<WorkspaceAccess, AppError>
+where
+    S: AuthState,
+{
     let workspace = state
-        .workspace_service
+        .workspace_service()
         .fetch_workspace(workspace_id)
         .await?;
 
@@ -84,7 +129,7 @@ pub(crate) async fn resolve_workspace_access(
     }
 
     let has_access = state
-        .workspace_service
+        .workspace_service()
         .has_workspace_read_access(&workspace, user.as_ref().map(|record| record.id.as_str()))
         .await?;
 
@@ -96,10 +141,10 @@ pub(crate) async fn resolve_workspace_access(
     if let Some(user_record) = user.as_ref() {
         if user_record.id == workspace.owner_id {
             workspace_role = Some(Permission::Owner);
-        } else if state.workspace_service.is_admin(&user_record.id).await? {
+        } else if state.workspace_service().is_admin(&user_record.id).await? {
             workspace_role = Some(Permission::Admin);
         } else if let Some(role) = state
-            .workspace_service
+            .workspace_service()
             .find_active_member_role(&workspace.id, &user_record.id)
             .await?
         {
@@ -119,25 +164,28 @@ pub(crate) async fn resolve_workspace_access(
     })
 }
 
-pub(crate) async fn resolve_doc_access(
-    state: &AppState,
+pub(crate) async fn resolve_doc_access<S>(
+    state: &S,
     headers: &HeaderMap,
     workspace_id: &str,
     doc_id: &str,
     rpc_requirement: RpcAccessRequirement,
     intent: DocAccessIntent,
-) -> Result<RestDocAccess, AppError> {
+) -> Result<RestDocAccess, AppError>
+where
+    S: AuthState,
+{
     let workspace = state
-        .workspace_service
+        .workspace_service()
         .fetch_workspace(workspace_id)
         .await?;
 
     let metadata = state
-        .doc_access_service
+        .doc_access_service()
         .ensure_metadata(&workspace, doc_id)
         .await?;
 
-    let token_status = state.workspace_service.verify_rpc_access_token(
+    let token_status = state.workspace_service().verify_rpc_access_token(
         headers,
         doc_id,
         &AccessTokenContext {
@@ -190,7 +238,7 @@ pub(crate) async fn resolve_doc_access(
     }
 
     let authorization = state
-        .doc_access_service
+        .doc_access_service()
         .resolve_doc_authorization(
             &workspace,
             &metadata,

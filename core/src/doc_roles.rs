@@ -1,19 +1,26 @@
+pub mod backend;
+
 use anyhow::{Result, anyhow};
 use chrono::Utc;
-use std::{pin::Pin, time::Duration};
+use serde::{Deserialize, Serialize};
+use std::{pin::Pin, sync::Arc, time::Duration};
 use tokio::{
     sync::{mpsc, oneshot},
     time::{Sleep, sleep},
 };
 use tracing::{error, warn};
 
-use crate::db::{Database, doc_role_repo::DocRoleRepositoryRef};
+use crate::{
+    config::DocStoreBackend,
+    db::{Database, rocks::doc_role_backend::RocksDocRoleBackend},
+};
+use backend::{DocRoleBackendRef, SqlDocRoleBackend};
 
 const ROLE_UPSERT_CHANNEL_CAPACITY: usize = 512;
 const ROLE_UPSERT_BATCH_SIZE: usize = 32;
 const ROLE_UPSERT_FLUSH_DELAY_MS: u64 = 5;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentRoleRecord {
     pub workspace_id: String,
     pub doc_id: String,
@@ -30,21 +37,31 @@ pub struct DocumentRoleCursor {
 
 #[derive(Clone)]
 pub struct DocumentRoleStore {
-    doc_role_repo: DocRoleRepositoryRef,
+    backend: DocRoleBackendRef,
     upsert_tx: mpsc::Sender<QueuedRoleUpsert>,
 }
 
 impl DocumentRoleStore {
     pub fn new(database: &Database) -> Self {
-        Self::with_repo(database.repositories().doc_role_repo())
+        let backend = match database.doc_store_backend() {
+            DocStoreBackend::Sql => {
+                let repo = database.repositories().doc_role_repo();
+                let sql_backend = SqlDocRoleBackend::new(repo);
+                Arc::new(sql_backend) as DocRoleBackendRef
+            }
+            DocStoreBackend::RocksDb => {
+                let store = database
+                    .doc_data_store()
+                    .expect("Rocks doc store requires Rocks doc data backend");
+                Arc::new(RocksDocRoleBackend::new(store)) as DocRoleBackendRef
+            }
+        };
+        Self::with_backend(backend)
     }
 
-    pub(crate) fn with_repo(doc_role_repo: DocRoleRepositoryRef) -> Self {
-        let upsert_tx = spawn_upsert_worker(doc_role_repo.clone());
-        Self {
-            doc_role_repo,
-            upsert_tx,
-        }
+    pub(crate) fn with_backend(backend: DocRoleBackendRef) -> Self {
+        let upsert_tx = spawn_upsert_worker(backend.clone());
+        Self { backend, upsert_tx }
     }
 
     pub async fn list_for_doc(
@@ -52,7 +69,7 @@ impl DocumentRoleStore {
         workspace_id: &str,
         doc_id: &str,
     ) -> Result<Vec<DocumentRoleRecord>> {
-        self.doc_role_repo.list_for_doc(workspace_id, doc_id).await
+        self.backend.list_for_doc(workspace_id, doc_id).await
     }
 
     pub async fn find_for_user(
@@ -61,7 +78,7 @@ impl DocumentRoleStore {
         doc_id: &str,
         user_id: &str,
     ) -> Result<Option<DocumentRoleRecord>> {
-        self.doc_role_repo
+        self.backend
             .find_for_user(workspace_id, doc_id, user_id)
             .await
     }
@@ -74,13 +91,13 @@ impl DocumentRoleStore {
         offset: i64,
         cursor: Option<&DocumentRoleCursor>,
     ) -> Result<Vec<DocumentRoleRecord>> {
-        self.doc_role_repo
+        self.backend
             .paginate_for_doc(workspace_id, doc_id, limit, offset, cursor)
             .await
     }
 
     pub async fn count_for_doc(&self, workspace_id: &str, doc_id: &str) -> Result<i64> {
-        self.doc_role_repo.count_for_doc(workspace_id, doc_id).await
+        self.backend.count_for_doc(workspace_id, doc_id).await
     }
 
     pub async fn owners_for_doc(
@@ -88,9 +105,7 @@ impl DocumentRoleStore {
         workspace_id: &str,
         doc_id: &str,
     ) -> Result<Vec<DocumentRoleRecord>> {
-        self.doc_role_repo
-            .owners_for_doc(workspace_id, doc_id)
-            .await
+        self.backend.owners_for_doc(workspace_id, doc_id).await
     }
 
     pub async fn upsert(
@@ -122,7 +137,7 @@ impl DocumentRoleStore {
                     warn!(
                         "doc role upsert worker dropped before ack; falling back to direct write"
                     );
-                    self.doc_role_repo
+                    self.backend
                         .upsert_roles(std::slice::from_ref(&fallback_record))
                         .await
                 }
@@ -131,15 +146,19 @@ impl DocumentRoleStore {
                 warn!("doc role upsert queue closed; falling back to direct write");
                 let mut single = Vec::with_capacity(1);
                 single.push(err.0.record);
-                self.doc_role_repo.upsert_roles(&single).await
+                self.backend.upsert_roles(&single).await
             }
         }
     }
 
     pub async fn remove(&self, workspace_id: &str, doc_id: &str, user_id: &str) -> Result<()> {
-        self.doc_role_repo
+        self.backend
             .remove_role(workspace_id, doc_id, user_id)
             .await
+    }
+
+    pub async fn remove_all_for_doc(&self, workspace_id: &str, doc_id: &str) -> Result<()> {
+        self.backend.remove_doc_roles(workspace_id, doc_id).await
     }
 }
 
@@ -148,14 +167,14 @@ struct QueuedRoleUpsert {
     responder: oneshot::Sender<Result<()>>,
 }
 
-fn spawn_upsert_worker(doc_role_repo: DocRoleRepositoryRef) -> mpsc::Sender<QueuedRoleUpsert> {
+fn spawn_upsert_worker(doc_role_repo: DocRoleBackendRef) -> mpsc::Sender<QueuedRoleUpsert> {
     let (tx, rx) = mpsc::channel(ROLE_UPSERT_CHANNEL_CAPACITY);
     tokio::spawn(run_upsert_worker(doc_role_repo, rx));
     tx
 }
 
 async fn run_upsert_worker(
-    doc_role_repo: DocRoleRepositoryRef,
+    doc_role_repo: DocRoleBackendRef,
     mut rx: mpsc::Receiver<QueuedRoleUpsert>,
 ) {
     let mut pending: Vec<QueuedRoleUpsert> = Vec::with_capacity(ROLE_UPSERT_BATCH_SIZE);
@@ -193,7 +212,7 @@ async fn run_upsert_worker(
     }
 }
 
-async fn flush_pending(doc_role_repo: &DocRoleRepositoryRef, pending: &mut Vec<QueuedRoleUpsert>) {
+async fn flush_pending(doc_role_repo: &DocRoleBackendRef, pending: &mut Vec<QueuedRoleUpsert>) {
     if pending.is_empty() {
         return;
     }
@@ -228,11 +247,12 @@ fn new_flush_deadline() -> Pin<Box<Sleep>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::doc_role_repo::{DocRoleRepository, DocRoleRepositoryRef};
     use async_trait::async_trait;
     use futures::future::join_all;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    use crate::doc_roles::backend::{DocRoleBackend, DocRoleBackendRef};
 
     #[derive(Default)]
     struct MockDocRoleRepo {
@@ -246,7 +266,8 @@ mod tests {
     }
 
     #[async_trait]
-    impl DocRoleRepository for MockDocRoleRepo {
+    #[async_trait]
+    impl DocRoleBackend for MockDocRoleRepo {
         async fn list_for_doc(
             &self,
             _workspace_id: &str,
@@ -318,13 +339,17 @@ mod tests {
         ) -> Result<()> {
             Ok(())
         }
+
+        async fn remove_doc_roles(&self, _workspace_id: &str, _doc_id: &str) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn batches_pending_upserts_before_flush() {
         let mock_repo = Arc::new(MockDocRoleRepo::default());
-        let repo_ref: DocRoleRepositoryRef = mock_repo.clone();
-        let store = DocumentRoleStore::with_repo(repo_ref);
+        let backend_ref: DocRoleBackendRef = mock_repo.clone();
+        let store = DocumentRoleStore::with_backend(backend_ref);
 
         let futures = (0..3).map(|i| {
             let store = store.clone();

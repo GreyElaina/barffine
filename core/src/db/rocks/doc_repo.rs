@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use rocksdb::{Direction, IteratorMode};
+use rocksdb::{Direction, IteratorMode, WriteBatch};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -164,6 +164,33 @@ impl RocksDocRepository {
             records.push(record);
         }
         Ok(records)
+    }
+
+    fn delete_doc_history(&self, workspace_id: &str, doc_id: &str) -> Result<()> {
+        let prefix = Self::history_prefix(workspace_id, doc_id);
+        let cf = self.store.history_cf();
+        let db = self.store.db();
+        let mut batch = WriteBatch::default();
+        let mut touched = false;
+        let iter = db.iterator_cf(
+            cf,
+            IteratorMode::From(prefix.as_bytes(), Direction::Forward),
+        );
+        for item in iter {
+            let (key, _) = item?;
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            batch.delete_cf(cf, &key);
+            touched = true;
+        }
+
+        if touched {
+            db.write(batch)
+                .with_context(|| "failed to purge Rocks doc history entries")?;
+        }
+
+        Ok(())
     }
 
     fn history_key(workspace_id: &str, doc_id: &str, id: i64) -> String {
@@ -410,6 +437,15 @@ impl DocRepository for RocksDocRepository {
 
     async fn delete_doc_entry(&self, workspace_id: &str, doc_id: &str) -> Result<u64> {
         let deleted = self.delete_record(workspace_id, doc_id)?;
+        if deleted {
+            // Ensure any lingering public link entries and history/log
+            // records are removed now that the document has been deleted.
+            self.links.delete_link(workspace_id, doc_id).await?;
+            self.delete_doc_history(workspace_id, doc_id)?;
+            self.logs
+                .delete_doc_logs(crate::doc_store::SPACE_TYPE_WORKSPACE, workspace_id, doc_id)
+                .await?;
+        }
         Ok(if deleted { 1 } else { 0 })
     }
 
@@ -1346,5 +1382,104 @@ mod tests {
             .unwrap()
             .expect("history snapshot present");
         assert_eq!(snapshot, b"v1".to_vec());
+    }
+
+    #[tokio::test]
+    async fn delete_doc_cleans_history_entries() {
+        let dir = TempDir::new().expect("create temp dir");
+        let store = Arc::new(DocDataStore::open(dir.path().join("doc-kv")).unwrap());
+        let logs = Arc::new(
+            crate::db::rocks::doc_update_log_store::RocksDocUpdateLogStore::new(store.clone()),
+        );
+        // Use a no-op public link store; this test focuses on history/log
+        // cleanup rather than SQL doc_public_links behavior.
+        use crate::db::doc_public_link_store::{DocPublicLinkRecord, DocPublicLinkStore};
+        use async_trait::async_trait;
+
+        struct NoopPublicLinkStore;
+
+        #[async_trait]
+        impl DocPublicLinkStore for NoopPublicLinkStore {
+            async fn insert_link(
+                &self,
+                _workspace_id: &str,
+                _doc_id: &str,
+                _token: &str,
+                _created_at: i64,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn delete_link(&self, _workspace_id: &str, _doc_id: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn list_links_for_user(
+                &self,
+                _user_id: &str,
+            ) -> anyhow::Result<Vec<DocPublicLinkRecord>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let repo = RocksDocRepository::new(store, logs, Arc::new(NoopPublicLinkStore));
+
+        repo.insert_doc_record(InsertDocRecordParams {
+            workspace_id: "ws-del".to_string(),
+            doc_id: "doc-del".to_string(),
+            snapshot: b"base".to_vec(),
+            owner_id: "owner".to_string(),
+            title: Some("Doc".to_string()),
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+
+        repo.upsert_snapshot_with_updates(SnapshotUpsertParams {
+            workspace_id: "ws-del".to_string(),
+            doc_id: "doc-del".to_string(),
+            snapshot: b"v2".to_vec(),
+            created_at: 1,
+            updated_at: 2,
+            title: None,
+            summary: None,
+            creator_id: None,
+            updater_id: Some("user".to_string()),
+            default_role: "manager".to_string(),
+            mode: "page".to_string(),
+            history_entry: Some(HistorySnapshotInsert {
+                snapshot: b"base".to_vec(),
+                created_at: 3,
+            }),
+            new_document: false,
+            doc_updates: Vec::new(),
+            log_editor_id: None,
+            log_timestamp: 2,
+            log_limit: 10,
+        })
+        .await
+        .unwrap();
+
+        let history = repo
+            .list_history_entries("ws-del", "doc-del", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            history.len(),
+            1,
+            "history snapshot should exist before delete"
+        );
+
+        let deleted = repo.delete_doc_entry("ws-del", "doc-del").await.unwrap();
+        assert_eq!(deleted, 1);
+
+        let history_after = repo
+            .list_history_entries("ws-del", "doc-del", 10)
+            .await
+            .unwrap();
+        assert!(
+            history_after.is_empty(),
+            "history entries should be removed"
+        );
     }
 }

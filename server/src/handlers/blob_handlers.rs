@@ -28,7 +28,8 @@ pub(crate) async fn get_workspace_blob_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let access = resolve_workspace_access(&state, &headers, &workspace_id).await?;
+    let runtime = state.runtime();
+    let access = resolve_workspace_access(runtime.as_ref(), &headers, &workspace_id).await?;
 
     let descriptor = BlobDescriptor::new(&workspace_id, &blob_name);
     let download = state

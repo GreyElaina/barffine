@@ -206,4 +206,14 @@ impl DocRoleRepository for PostgresDocRoleRepository {
 
         Ok(())
     }
+
+    async fn remove_doc_roles(&self, workspace_id: &str, doc_id: &str) -> Result<()> {
+        pg_query!("DELETE FROM doc_user_roles WHERE workspace_id = ? AND doc_id = ?",)
+            .bind(workspace_id)
+            .bind(doc_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
 }

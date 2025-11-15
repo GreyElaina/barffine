@@ -12,7 +12,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use barffine_core::blob::BlobDescriptor;
-use y_octo::{Doc as YoctoDoc, StateVector as YoctoStateVector};
+use yrs::updates::decoder::Decode;
+use yrs::{Doc as YrsDoc, ReadTxn, StateVector, Transact, Update};
 
 use crate::{
     auth::{DocAccessIntent, RpcAccessRequirement, parse_history_timestamp, resolve_doc_access},
@@ -362,19 +363,20 @@ async fn doc_diff_response(
     let (snapshot, updated_at) =
         workspace_snapshot_or_not_found(state, workspace_id, doc_id).await?;
 
-    let doc = YoctoDoc::try_from_binary_v1(&snapshot)
-        .map_err(|err| AppError::internal(AnyError::new(err)))?;
+    let doc = doc_from_snapshot_bytes(&snapshot).map_err(AppError::internal)?;
 
     let state_vector = if body.is_empty() {
-        YoctoStateVector::default()
+        StateVector::default()
     } else {
         decode_state_vector(&body)?
     };
 
-    let missing = doc
-        .encode_state_as_update_v1(&state_vector)
-        .map_err(|err| AppError::internal(AnyError::new(err)))?;
-    let new_state = doc.get_state_vector();
+    let (missing, new_state): (Vec<u8>, StateVector) = {
+        let txn = doc.transact();
+        let diff = txn.encode_state_as_update_v1(&state_vector);
+        let state = txn.state_vector();
+        (diff, state)
+    };
     let state_bytes = encode_state_vector(&new_state)?;
 
     let mut payload = missing.clone();
@@ -417,6 +419,16 @@ fn finalize_doc_response(
     append_doc_access_headers(&mut response, access)?;
     append_set_cookie_headers(&mut response, &access.set_cookies)?;
     Ok(response)
+}
+
+fn doc_from_snapshot_bytes(bytes: &[u8]) -> Result<YrsDoc, AnyError> {
+    let doc = YrsDoc::new();
+    if !bytes.is_empty() {
+        let update = Update::decode_v1(bytes).map_err(AnyError::new)?;
+        let mut txn = doc.transact_mut();
+        txn.apply_update(update).map_err(AnyError::new)?;
+    }
+    Ok(doc)
 }
 
 fn append_doc_access_headers(
@@ -559,12 +571,11 @@ mod tests {
     use barffine_core::{
         blob::{BlobDescriptor, BlobMetadata},
         comment_attachment::CommentAttachmentUpsert,
-        db::doc_repo::{HistorySnapshotInsert, ReplaceDocSnapshotParams},
     };
     use chrono::Utc;
     use serde_json::Value as JsonValue;
     use uuid::Uuid;
-    use y_octo::Doc as YoctoDoc;
+    use yrs::{Doc as YrsDoc, StateVector, Transact};
 
     use crate::{
         AppState,
@@ -828,9 +839,15 @@ mod tests {
         let mut request_headers = HeaderMap::new();
         request_headers.insert(COOKIE, session_cookie_value(&session.id, None));
 
-        let yocto_doc = YoctoDoc::new();
-        let snapshot = yocto_doc.encode_update_v1().expect("encode snapshot");
-        let state_bytes = encode_state_vector(&yocto_doc.get_state_vector()).expect("encode state");
+        let doc = YrsDoc::new();
+        let (snapshot, state_vector) = {
+            let txn = doc.transact();
+            (
+                txn.encode_state_as_update_v1(&StateVector::default()),
+                txn.state_vector(),
+            )
+        };
+        let state_bytes = encode_state_vector(&state_vector).expect("encode state");
         let updated_at = Utc::now().timestamp();
 
         database

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use barffine_core::notification::{CommentRecord, CommentReplyRecord, CommentStore};
+use barffine_core::notification::{CommentRecord, CommentReplyRecord};
 use serde_json::json;
 
 use crate::{AppError, AppState, doc::roles, graphql::doc_permissions_for_user_internal};

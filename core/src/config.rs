@@ -165,10 +165,6 @@ fn default_blob_store_path() -> String {
     default_child_path_for_database(&base, "blob-store")
 }
 
-fn default_child_path(base: &str, child: &str) -> String {
-    Path::new(base).join(child).to_string_lossy().into_owned()
-}
-
 fn default_child_path_for_database(base: &str, child: &str) -> String {
     let root = database_root_dir(base);
     root.join(child).to_string_lossy().into_owned()
@@ -277,9 +273,7 @@ impl FromStr for BlobStoreBackend {
 
     fn from_str(s: &str) -> Result<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "sql" | "sqlite" | "postgres" | "postgresql" | "pg" => {
-                Ok(BlobStoreBackend::Sql)
-            }
+            "sql" | "sqlite" | "postgres" | "postgresql" | "pg" => Ok(BlobStoreBackend::Sql),
             "rocks" | "rocksdb" => Ok(BlobStoreBackend::Rocks),
             other => Err(anyhow::anyhow!(
                 "unsupported blob store backend '{other}' (expected 'sql' or 'rocks')"

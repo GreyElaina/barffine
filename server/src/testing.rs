@@ -7,13 +7,12 @@ use crate::{
     state::{AppState, build_state},
 };
 use anyhow::{Context, Result};
-use barffine_core::config::DatabaseBackend;
 use barffine_core::{
-    config::{AppConfig, BlobStoreBackend, DocDataBackend},
+    config::{AppConfig, BlobStoreBackend, DatabaseBackend, DocDataBackend, DocStoreBackend},
     db::Database,
 };
 use chrono::Utc;
-use sqlx::{Executor, postgres::PgPoolOptions};
+use sqlx::postgres::PgPoolOptions;
 use tempfile::TempDir;
 use url::Url;
 use uuid::Uuid;
@@ -39,6 +38,40 @@ pub(crate) async fn setup_state() -> (TempDir, Database, AppState) {
 
     let database = Database::connect(&config).await.expect("connect database");
 
+    let state = build_state(&database, &config);
+    state
+        .workspace_store
+        .normalize_member_statuses()
+        .await
+        .expect("normalize member statuses");
+
+    (temp_dir, database, state)
+}
+
+/// Variant of `setup_state` that uses RocksDb as the primary doc store
+/// backend. This exercises the Rocks-backed `DocRepository` and related
+/// services (history, roles, public links) in server-level tests.
+pub(crate) async fn setup_state_with_rocks_doc_store() -> (TempDir, Database, AppState) {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let mut config = AppConfig::default();
+    let db_path = temp_dir.path().join("test.db");
+    config.database_path = db_path.to_string_lossy().into_owned();
+    configure_test_database_backend(&mut config).await;
+    config.doc_data_backend = DocDataBackend::RocksDb;
+    config.doc_data_path = temp_dir
+        .path()
+        .join("doc-kv")
+        .to_string_lossy()
+        .into_owned();
+    config.doc_store_backend = DocStoreBackend::RocksDb;
+    config.blob_store_backend = BlobStoreBackend::Rocks;
+    config.blob_store_path = temp_dir
+        .path()
+        .join("blob-store")
+        .to_string_lossy()
+        .into_owned();
+
+    let database = Database::connect(&config).await.expect("connect database");
     let state = build_state(&database, &config);
     state
         .workspace_store
@@ -145,7 +178,7 @@ async fn configure_test_database_backend(config: &mut AppConfig) {
         );
     }
 
-    if configure_backend_choice(config, DatabaseBackend::Postgres).await {
+    if configure_backend_choice(config, DatabaseBackend::Sqlite).await {
         return;
     }
 

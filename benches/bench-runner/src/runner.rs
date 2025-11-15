@@ -77,7 +77,7 @@ pub async fn run_scenario(client: Arc<BenchClient>, options: RunOptions) -> Resu
     let cache = WorkspaceCache::new();
     if let Some(dataset) = options.dataset.as_ref() {
         for workspace in dataset.workspaces() {
-            cache.register(workspace.workspace_id.clone()).await;
+            cache.register(workspace.workspace_id.clone());
         }
     }
 

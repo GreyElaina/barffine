@@ -64,6 +64,7 @@ Key variables:
 | `BARFFINE_DATABASE_MAX_CONNECTIONS` | `16` | Controls the metadata connection pool size. Increase for higher concurrency. |
 | `BARFFINE_DOC_DATA_BACKEND` | `sqlite` / `rocksdb` | Selects where doc updates, snapshots, notifications, and other large KV payloads live. |
 | `BARFFINE_DOC_DATA_PATH` | `./data/doc-kv` | Directory for RocksDB column families (used when `BARFFINE_DOC_DATA_BACKEND=rocksdb`). |
+| `BARFFINE_DOC_STORE_BACKEND` | unset | Selects where full document exports are stored (e.g., for downloads). |
 | `BARFFINE_NOTIFICATION_CENTER_BACKEND` | unset / `auto` | Optional override for the notification backend. See “Notification center backend” below for supported values and defaults. |
 | `BARFFINE_BASE_URL` | Derived from host/port | Used to build absolute links returned to clients. Set when exposing Barffine behind a proxy. |
 | `BARFFINE_SERVER_HOST` / `BARFFINE_SERVER_PORT` | `127.0.0.1` / `8081` | Populate compatibility metadata surfaced to AFFiNE clients / Proxy. |
@@ -78,22 +79,24 @@ Key variables:
 | `RUST_LOG` | `info` | Standard Rust log filter. |
 | `BARFFINE_TRACE_*` | unset | Control sampling behaviour for custom tracing (see `server/src/observability.rs`). |
 
-### Example `.env`
+### Example & Recommended `.env`
 
 ```dotenv
 AFFINE_VERSION=0.25.0
 DEPLOYMENT_TYPE=selfhosted
 SERVER_FLAVOR=allinone
 
-BARFFINE_DATABASE_PATH=./data
-BARFFINE_BASE_URL=http://127.0.0.1:8081
-BARFFINE_PUBLIC_BASE_URL=http://127.0.0.1:8081
 BARFFINE_SERVER_NAME="Barffine Server"
+
 BARFFINE_SERVER_HOST=127.0.0.1
 BARFFINE_SERVER_PORT=8081
+BARFFINE_BASE_URL=http://127.0.0.1:8081
 
+BARFFINE_DATABASE_PATH=./data
 BARFFINE_DOC_DATA_BACKEND=rocksdb
-BARFFINE_DOC_DATA_PATH=./data/doc-kv
+BARFFINE_DOC_STORE_BACKEND=rocksdb
+BARFFINE_BLOB_STORE_BACKEND=rocksdb
+BARFFINE_NOTIFICATION_CENTER_BACKEND=rocksdb
 
 RUST_LOG=info,tower_http=trace,axum=debug
 ```
@@ -130,18 +133,3 @@ Barffine now exposes the same `/api/oauth/*` endpoints and GraphQL metadata as t
 | Generic OIDC | `BARFFINE_OAUTH_OIDC_CLIENT_ID`, `BARFFINE_OAUTH_OIDC_CLIENT_SECRET`, `BARFFINE_OAUTH_OIDC_ISSUER` | `BARFFINE_OAUTH_OIDC_SCOPE`, `BARFFINE_OAUTH_OIDC_CLAIM_ID`, `BARFFINE_OAUTH_OIDC_CLAIM_EMAIL`, `BARFFINE_OAUTH_OIDC_CLAIM_NAME` |
 
 Use `BARFFINE_ALLOW_OAUTH_SIGNUP` (defaults to `true`) to forbid new users from being created through OAuth flows while still allowing existing linked accounts to sign in.
-
-## Doc-data backend (RocksDB)
-
-When `BARFFINE_DOC_DATA_BACKEND=rocksdb`, the server opens `BARFFINE_DOC_DATA_PATH` as a RocksDB instance with multiple column families:
-
-| Column family | Usage |
-| --- | --- |
-| `doc_logs` | Per-document Yjs update logs and sequence counters for workspace + userspace documents (used by the doc update log store). |
-| `doc_snapshots` | External storage for document and userspace snapshots referenced from the SQL metadata database via `DocSnapshotStore`. |
-| `doc_cache` | Reserved for a future persistent doc cache backend (currently unused; in-memory cache is used instead). |
-| `notifications` | Unread notification list + per-user counters (`RocksNotificationCenter`). |
-| `doc_store` | Workspace and userspace document metadata + latest snapshots when the Rocks-backed doc store is enabled. |
-| `doc_history` | Long-lived document history snapshots maintained by the Rocks-backed doc store (mirrors the `document_history` table semantics). |
-
-If the backend stays on `sqlite`, the stores fall back to inline blobs inside the existing tables; no extra setup is required. Switching to RocksDB for doc-data is incremental—new writes land in the KV store, while old rows without KV keys continue to read from SQLite until they are rewritten or deleted. Resolved notifications are deleted immediately in either backend, matching client expectations and reducing churn on SQLite.

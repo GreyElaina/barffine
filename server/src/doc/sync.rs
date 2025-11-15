@@ -1,10 +1,40 @@
 use super::cache::DocCacheApplyResult;
+use std::sync::Arc;
 
 use crate::{
-    AppError, AppState, doc::channels::doc_channel_key, socket::rooms::SpaceType,
-    state::SocketBroadcastMeta, types::SessionUser,
+    AppError, AppState,
+    doc::cache::DocCache,
+    doc::channels::doc_channel_key,
+    socket::rooms::SpaceType,
+    state::{SocketBroadcastMeta, SocketRuntimeState, SyncHub},
+    types::SessionUser,
 };
 use tracing::warn;
+
+pub(crate) trait DocUpdateState: Send + Sync {
+    fn doc_cache(&self) -> &Arc<DocCache>;
+    fn sync_hub(&self) -> &SyncHub;
+}
+
+impl DocUpdateState for AppState {
+    fn doc_cache(&self) -> &Arc<DocCache> {
+        &self.doc_cache
+    }
+
+    fn sync_hub(&self) -> &SyncHub {
+        &self.sync_hub
+    }
+}
+
+impl DocUpdateState for SocketRuntimeState {
+    fn doc_cache(&self) -> &Arc<DocCache> {
+        &self.doc_cache
+    }
+
+    fn sync_hub(&self) -> &SyncHub {
+        &self.sync_hub
+    }
+}
 
 /// Controls whether the cache should be refreshed from storage before broadcasting a snapshot.
 #[derive(Clone, Copy, Debug)]
@@ -103,16 +133,19 @@ pub(crate) struct UpdateBroadcastContext<'a> {
     pub editor_user: Option<&'a SessionUser>,
 }
 
-pub async fn apply_doc_updates(
-    state: &AppState,
+pub async fn apply_doc_updates<S>(
+    state: &S,
     space_type: SpaceType,
     workspace_id: &str,
     doc_id: &str,
     updates: Vec<Vec<u8>>,
     context: UpdateBroadcastContext<'_>,
-) -> Result<DocCacheApplyResult, AppError> {
+) -> Result<DocCacheApplyResult, AppError>
+where
+    S: DocUpdateState,
+{
     let cache_result = state
-        .doc_cache
+        .doc_cache()
         .apply_updates(
             space_type,
             workspace_id,
@@ -134,10 +167,10 @@ pub async fn apply_doc_updates(
     );
 
     state
-        .sync_hub
+        .sync_hub()
         .publish_updates(&channel_key, &updates, Some(meta));
     state
-        .sync_hub
+        .sync_hub()
         .publish_snapshot(&channel_key, cache_result.snapshot.clone());
 
     Ok(cache_result)

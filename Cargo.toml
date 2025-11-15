@@ -60,3 +60,12 @@ rocksdb = { version = "0.24.0", default-features = false, features = ["lz4"] }
 bincode = { version = "2.0.1", features = ["serde"] }
 yrs = "0.24.0"
 futures = "0.3"
+mimalloc = { version = "*", features = ["secure", "v3"] }
+parking_lot = "0.12"
+
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+debug = 0

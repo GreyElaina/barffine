@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use barffine_core::notification::{CommentReplyRecord, CommentStore};
+use barffine_core::notification::CommentReplyRecord;
 
 use crate::{AppError, AppState};
 

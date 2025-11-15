@@ -3,10 +3,10 @@ use std::sync::Arc;
 use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use chrono::Utc;
+use parking_lot::RwLock;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
-use tokio::sync::RwLock;
 use url::Url;
 
 use crate::AppError;
@@ -42,15 +42,20 @@ impl OidcOAuthProvider {
     }
 
     async fn configuration(&self) -> Result<Arc<OidcConfiguration>, AppError> {
-        if let Some(current) = self.endpoints.read().await.clone() {
+        if let Some(current) = self.endpoints.read().clone() {
             return Ok(current);
         }
 
-        let mut writer = self.endpoints.write().await;
+        let fetched = Arc::new(self.fetch_configuration().await?);
+        let mut writer = self.endpoints.write();
         if let Some(current) = writer.clone() {
             return Ok(current);
         }
+        *writer = Some(fetched.clone());
+        Ok(fetched)
+    }
 
+    async fn fetch_configuration(&self) -> Result<OidcConfiguration, AppError> {
         let mut issuer = self.config.issuer.clone();
         if !issuer.ends_with('/') {
             issuer.push('/');
@@ -83,9 +88,7 @@ impl OidcOAuthProvider {
             .context("decode oidc discovery document")
             .map_err(AppError::from_anyhow)?;
 
-        let shared = Arc::new(config);
-        *writer = Some(shared.clone());
-        Ok(shared)
+        Ok(config)
     }
 
     fn resolve_claim<'a>(

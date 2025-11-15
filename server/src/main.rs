@@ -29,6 +29,11 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::registry::Registry;
 use uuid::Uuid;
 
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 static TRACING_FALLBACK_GUARD: OnceLock<non_blocking::WorkerGuard> = OnceLock::new();
 
 #[derive(Parser, Debug)]

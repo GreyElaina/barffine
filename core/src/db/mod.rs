@@ -1,12 +1,10 @@
-use std::{fs, fs::File, path::PathBuf, sync::Arc};
 use self::postgres::{
     access_token_repo::PostgresAccessTokenRepository, blob_repo::PostgresBlobRepository,
     comment_attachment_repo::PostgresCommentAttachmentRepository,
     comment_repo::PostgresCommentRepository, connection as postgres_connection,
-    doc_public_link_store::PostgresDocPublicLinkStore, doc_repo::PostgresDocRepository,
-    doc_role_repo::PostgresDocRoleRepository, doc_update_log_store::PostgresDocUpdateLogStore,
-    user_doc_repo::PostgresUserDocRepository, user_repo::PostgresUserRepository,
-    user_settings_repo::PostgresUserSettingsRepository,
+    doc_repo::PostgresDocRepository, doc_role_repo::PostgresDocRoleRepository,
+    doc_update_log_store::PostgresDocUpdateLogStore, user_doc_repo::PostgresUserDocRepository,
+    user_repo::PostgresUserRepository, user_settings_repo::PostgresUserSettingsRepository,
     workspace_feature_repo::PostgresWorkspaceFeatureRepository,
     workspace_repo::PostgresWorkspaceRepository,
 };
@@ -18,14 +16,15 @@ use self::{
     doc_public_link_store::DocPublicLinkStoreRef,
     doc_repo::DocRepositoryRef,
     doc_role_repo::DocRoleRepositoryRef,
+    rocks::doc_public_link_store::RocksDocPublicLinkStore,
     sqlite::{
         access_token_repo::SqliteAccessTokenRepository, blob_repo::SqliteBlobRepository,
         comment_attachment_repo::SqliteCommentAttachmentRepository,
         comment_repo::SqliteCommentRepository, connection as sqlite_connection,
-        doc_data::SqliteDocDataStore, doc_public_link_store::SqliteDocPublicLinkStore,
-        doc_repo::SqliteDocRepository, doc_role_repo::SqliteDocRoleRepository,
-        doc_update_log_store::SqliteDocUpdateLogStore, user_doc_repo::SqliteUserDocRepository,
-        user_repo::SqliteUserRepository, user_settings_repo::SqliteUserSettingsRepository,
+        doc_data::SqliteDocDataStore, doc_repo::SqliteDocRepository,
+        doc_role_repo::SqliteDocRoleRepository, doc_update_log_store::SqliteDocUpdateLogStore,
+        user_doc_repo::SqliteUserDocRepository, user_repo::SqliteUserRepository,
+        user_settings_repo::SqliteUserSettingsRepository,
         workspace_feature_repo::SqliteWorkspaceFeatureRepository,
         workspace_repo::SqliteWorkspaceRepository,
     },
@@ -42,6 +41,7 @@ use crate::{
     doc_update_log::DocUpdateLogReaderRef,
 };
 use anyhow::{Context, Result};
+use std::{fs, fs::File, path::PathBuf, sync::Arc};
 
 pub mod access_token_repo;
 pub mod blob_repo;
@@ -164,6 +164,7 @@ pub struct Database {
     doc_data: Option<Arc<RocksDocDataStore>>,
     doc_snapshots: Arc<DocSnapshotStore>,
     backend: DatabaseBackend,
+    doc_store_backend: DocStoreBackend,
 }
 
 impl Database {
@@ -222,6 +223,9 @@ impl Database {
         ));
         let doc_snapshots = Arc::new(DocSnapshotStore::new(doc_snapshots_backend.clone()));
 
+        let workspace_repo_ref =
+            Arc::new(SqliteWorkspaceRepository::new(pool.clone())) as WorkspaceRepositoryRef;
+
         let (doc_update_logs, doc_repo, user_doc_repo): (
             DocUpdateLogReaderRef,
             DocRepositoryRef,
@@ -252,8 +256,10 @@ impl Database {
                         rocks_store.clone(),
                     ),
                 );
-                let links: DocPublicLinkStoreRef =
-                    Arc::new(SqliteDocPublicLinkStore::new(pool.clone()));
+                let links: DocPublicLinkStoreRef = Arc::new(RocksDocPublicLinkStore::new(
+                    rocks_store.clone(),
+                    workspace_repo_ref.clone(),
+                ));
                 let doc_update_logs: DocUpdateLogReaderRef = rocks_doc_logs.clone();
                 let doc_repo = Arc::new(crate::db::rocks::doc_repo::RocksDocRepository::new(
                     rocks_store.clone(),
@@ -269,8 +275,6 @@ impl Database {
                 (doc_update_logs, doc_repo, user_doc_repo)
             }
         };
-        let workspace_repo =
-            Arc::new(SqliteWorkspaceRepository::new(pool.clone())) as WorkspaceRepositoryRef;
         let user_repo = Arc::new(SqliteUserRepository::new(pool.clone())) as UserRepositoryRef;
         let doc_role_repo =
             Arc::new(SqliteDocRoleRepository::new(pool.clone())) as DocRoleRepositoryRef;
@@ -287,7 +291,7 @@ impl Database {
             Arc::new(SqliteUserSettingsRepository::new(pool.clone())) as UserSettingsRepositoryRef;
         let repositories = Arc::new(RepositoryRegistry::new(
             doc_repo,
-            workspace_repo,
+            workspace_repo_ref,
             user_repo,
             doc_role_repo,
             comment_repo,
@@ -307,6 +311,7 @@ impl Database {
             doc_data,
             doc_snapshots,
             backend: DatabaseBackend::Sqlite,
+            doc_store_backend: config.doc_store_backend,
         })
     }
 
@@ -346,6 +351,10 @@ impl Database {
 
     pub fn backend(&self) -> DatabaseBackend {
         self.backend
+    }
+
+    pub fn doc_store_backend(&self) -> DocStoreBackend {
+        self.doc_store_backend
     }
 
     fn resolve_database_paths(path: &str) -> Result<(PathBuf, PathBuf)> {
@@ -400,6 +409,9 @@ impl Database {
         ));
         let doc_snapshots = Arc::new(DocSnapshotStore::new(doc_data_backend.clone()));
 
+        let workspace_repo_ref =
+            Arc::new(PostgresWorkspaceRepository::new(pool.clone())) as WorkspaceRepositoryRef;
+
         let (doc_update_logs, doc_repo, user_doc_repo): (
             DocUpdateLogReaderRef,
             DocRepositoryRef,
@@ -430,8 +442,10 @@ impl Database {
                         rocks_store.clone(),
                     ),
                 );
-                let links: DocPublicLinkStoreRef =
-                    Arc::new(PostgresDocPublicLinkStore::new(pool.clone()));
+                let links: DocPublicLinkStoreRef = Arc::new(RocksDocPublicLinkStore::new(
+                    rocks_store.clone(),
+                    workspace_repo_ref.clone(),
+                ));
                 let doc_update_logs: DocUpdateLogReaderRef = rocks_doc_logs.clone();
                 let doc_repo = Arc::new(crate::db::rocks::doc_repo::RocksDocRepository::new(
                     rocks_store.clone(),
@@ -447,8 +461,6 @@ impl Database {
                 (doc_update_logs, doc_repo, user_doc_repo)
             }
         };
-        let workspace_repo =
-            Arc::new(PostgresWorkspaceRepository::new(pool.clone())) as WorkspaceRepositoryRef;
         let user_repo = Arc::new(PostgresUserRepository::new(pool.clone())) as UserRepositoryRef;
         let doc_role_repo =
             Arc::new(PostgresDocRoleRepository::new(pool.clone())) as DocRoleRepositoryRef;
@@ -467,7 +479,7 @@ impl Database {
 
         let repositories = Arc::new(RepositoryRegistry::new(
             doc_repo,
-            workspace_repo,
+            workspace_repo_ref,
             user_repo,
             doc_role_repo,
             comment_repo,
@@ -487,6 +499,7 @@ impl Database {
             doc_data,
             doc_snapshots,
             backend: DatabaseBackend::Postgres,
+            doc_store_backend: config.doc_store_backend,
         })
     }
 }

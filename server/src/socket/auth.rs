@@ -1,4 +1,4 @@
-use std::{borrow::Cow, future::Future, pin::Pin, str, sync::Arc};
+use std::{borrow::Cow, str, sync::Arc};
 
 use axum::http::{
     HeaderMap, HeaderName, HeaderValue,
@@ -17,11 +17,14 @@ use crate::{
     cookies::{SESSION_COOKIE_NAME, USER_COOKIE_NAME},
     error::AppError,
     socket::types::{SocketRequestContext, SocketSpanRegistry, SocketUserContext},
-    state::AppState,
+    state::{AppState, SocketRuntimeState},
 };
 
-pub(crate) fn build_socket(state: AppState) -> (SocketIoLayer, SocketIo) {
-    let mut builder = SocketIo::builder().with_state(state.clone());
+pub(crate) fn build_socket(
+    state: Arc<AppState>,
+    runtime: Arc<SocketRuntimeState>,
+) -> (SocketIoLayer, SocketIo) {
+    let mut builder = SocketIo::builder().with_state(runtime.clone());
 
     if let Some(prefix) = state.server_path.as_deref() {
         let path: Cow<'static, str> = Cow::Owned(format!("{prefix}/socket.io"));
@@ -36,12 +39,13 @@ pub(crate) fn build_socket(state: AppState) -> (SocketIoLayer, SocketIo) {
 
 #[derive(Clone)]
 pub(crate) struct SocketAuthMiddleware {
-    state: AppState,
+    state: Arc<AppState>,
+    runtime: Arc<SocketRuntimeState>,
 }
 
 impl SocketAuthMiddleware {
-    pub fn new(state: AppState) -> Self {
-        Self { state }
+    pub fn new(state: Arc<AppState>, runtime: Arc<SocketRuntimeState>) -> Self {
+        Self { state, runtime }
     }
 
     fn build_header_map(
@@ -132,9 +136,11 @@ where
         &'a self,
         socket: Arc<socketioxide::socket::Socket<A>>,
         _auth: &'a Option<Value>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::fmt::Display + Send>>> + Send + 'a>>
-    {
+    ) -> impl futures_util::Future<
+        Output = Result<(), Box<dyn std::fmt::Display + std::marker::Send + 'static>>,
+    > + std::marker::Send {
         let state = self.state.clone();
+        let runtime = self.runtime.clone();
 
         Box::pin(async move {
             let parts = socket.req_parts();
@@ -201,7 +207,7 @@ where
                 }
             }
 
-            let auth = match authenticate_rest_request(&state, &headers).await {
+            let auth = match authenticate_rest_request(state.as_ref(), &headers).await {
                 Ok(session) => session,
                 Err(err) => {
                     warn!(error = %err, "socket authenticate request refused");
@@ -212,6 +218,7 @@ where
 
             let socket_ref = socketioxide::extract::SocketRef::from(socket.clone());
             socket_ref.extensions.insert(request_context.clone());
+            socket_ref.extensions.insert(runtime.clone());
             socket_ref.extensions.insert(SocketUserContext::new(
                 &auth,
                 merged_cookie,
@@ -236,7 +243,7 @@ where
                 );
             });
 
-            state.socket_metrics.inc_connections();
+            runtime.socket_metrics.inc_connections();
 
             Ok(())
         })

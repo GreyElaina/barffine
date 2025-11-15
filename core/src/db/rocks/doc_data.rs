@@ -72,6 +72,12 @@ impl DocDataStore {
     /// Column family used by Rocks-backed doc store implementations for
     /// workspace and userspace document metadata and snapshots.
     pub const DOC_STORE_CF: &'static str = "doc_store";
+    /// Column family storing per-document role assignments when operating
+    /// in Rocks-backed doc store mode.
+    pub const DOC_ROLES_CF: &'static str = "doc_roles";
+    /// Column family storing document public link metadata (share tokens)
+    /// in Rocks-backed doc store mode.
+    pub const DOC_PUBLIC_LINKS_CF: &'static str = "doc_public_links";
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -99,7 +105,9 @@ impl DocDataStore {
             ColumnFamilyDescriptor::new(Self::DOC_CACHE_CF, cf_opts.clone()),
             ColumnFamilyDescriptor::new(Self::NOTIFICATION_CF, cf_opts.clone()),
             ColumnFamilyDescriptor::new(Self::DOC_STORE_CF, cf_opts.clone()),
-            ColumnFamilyDescriptor::new(Self::DOC_HISTORY_CF, cf_opts),
+            ColumnFamilyDescriptor::new(Self::DOC_HISTORY_CF, cf_opts.clone()),
+            ColumnFamilyDescriptor::new(Self::DOC_ROLES_CF, cf_opts.clone()),
+            ColumnFamilyDescriptor::new(Self::DOC_PUBLIC_LINKS_CF, cf_opts),
         ];
 
         let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors).with_context(|| {
@@ -157,6 +165,18 @@ impl DocDataStore {
         self.db
             .cf_handle(Self::DOC_HISTORY_CF)
             .expect("doc_history column family present")
+    }
+
+    pub fn doc_roles_cf(&self) -> &ColumnFamily {
+        self.db
+            .cf_handle(Self::DOC_ROLES_CF)
+            .expect("doc_roles column family present")
+    }
+
+    pub fn doc_public_links_cf(&self) -> &ColumnFamily {
+        self.db
+            .cf_handle(Self::DOC_PUBLIC_LINKS_CF)
+            .expect("doc_public_links column family present")
     }
 
     pub fn put_snapshot(&self, key: &str, bytes: &[u8]) -> Result<()> {

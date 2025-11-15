@@ -1,8 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
-use y_octo::{Any, Doc as YoctoDoc, Map, Value};
+use serde_json::{Map as JsonMap, Value as JsonValue};
+use yrs::types::ToJson;
+use yrs::updates::decoder::Decode;
+use yrs::{Any, Doc as YrsDoc, Map, ReadTxn, Transact, Update};
 
 const DEFAULT_SUMMARY_LIMIT: usize = 150;
+
+type BlockMap = JsonMap<String, JsonValue>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SnapshotPageContent {
@@ -110,27 +115,37 @@ impl MarkdownState {
 }
 
 struct DocBlocks {
-    blocks: HashMap<String, Map>,
+    blocks: HashMap<String, BlockMap>,
     root_id: String,
     title: String,
 }
 
 impl DocBlocks {
     fn build(snapshot: &[u8]) -> Option<Self> {
-        let doc = YoctoDoc::try_from_binary_v1(snapshot).ok()?;
-        let blocks_map = doc.get_map("blocks").ok()?;
+        let doc = YrsDoc::new();
+        if !snapshot.is_empty() {
+            let update = Update::decode_v1(snapshot).ok()?;
+            let mut txn = doc.transact_mut();
+            txn.apply_update(update).ok()?;
+        }
+
+        let txn = doc.transact();
+        let blocks_map = txn.get_map("blocks")?;
 
         let mut blocks = HashMap::new();
         let mut root_id: Option<String> = None;
         let mut first_id: Option<String> = None;
         let mut title = String::new();
 
-        for (_, value) in blocks_map.iter() {
-            let Some(map) = value.to_map() else {
+        for (_, value) in blocks_map.iter(&txn) {
+            let json_any: Any = value.to_json(&txn);
+            let json_value = serde_json::to_value(&json_any).ok()?;
+            let Some(map) = json_value.as_object() else {
                 continue;
             };
+            let block_map = map.clone();
 
-            let Some(id) = get_string(&map, "sys:id") else {
+            let Some(id) = get_string(&block_map, "sys:id") else {
                 continue;
             };
 
@@ -139,15 +154,15 @@ impl DocBlocks {
             }
 
             if root_id.is_none() {
-                if let Some(flavour) = get_string(&map, "sys:flavour") {
+                if let Some(flavour) = get_string(&block_map, "sys:flavour") {
                     if flavour == "affine:page" {
                         root_id = Some(id.clone());
-                        title = block_prop_string(&map, "title").unwrap_or_default();
+                        title = block_prop_string(&block_map, "title").unwrap_or_default();
                     }
                 }
             }
 
-            blocks.insert(id, map);
+            blocks.insert(id, block_map);
         }
 
         let root_id = root_id.or(first_id)?;
@@ -164,11 +179,11 @@ impl DocBlocks {
         })
     }
 
-    fn block(&self, id: &str) -> Option<&Map> {
+    fn block(&self, id: &str) -> Option<&BlockMap> {
         self.blocks.get(id)
     }
 
-    fn root_block(&self) -> Option<&Map> {
+    fn root_block(&self) -> Option<&BlockMap> {
         self.block(&self.root_id)
     }
 }
@@ -290,104 +305,85 @@ fn append_block_markdown(
     }
 }
 
-fn push_children(block: &Map, queue: &mut Vec<String>) {
+fn push_children(block: &BlockMap, queue: &mut Vec<String>) {
     let mut children = block_children(block);
     while let Some(child) = children.pop() {
         queue.push(child);
     }
 }
 
-fn block_children(block: &Map) -> Vec<String> {
-    match block.get("sys:children") {
-        Some(Value::Array(array)) => array
-            .iter()
-            .filter_map(|value| value_to_string(&value))
-            .collect(),
-        Some(Value::Any(Any::Array(values))) => values.iter().filter_map(any_to_string).collect(),
-        _ => Vec::new(),
-    }
+fn block_children(block: &BlockMap) -> Vec<String> {
+    block
+        .get("sys:children")
+        .and_then(JsonValue::as_array)
+        .map(|array| array.iter().filter_map(value_to_string).collect::<Vec<_>>())
+        .unwrap_or_default()
 }
 
-fn block_flavour(block: &Map) -> String {
+fn block_flavour(block: &BlockMap) -> String {
     get_string(block, "sys:flavour").unwrap_or_default()
 }
 
-fn block_prop_string(block: &Map, prop: &str) -> Option<String> {
+fn block_prop_string(block: &BlockMap, prop: &str) -> Option<String> {
     let key = format!("prop:{prop}");
-    block.get(&key).and_then(|value| value_to_string(&value))
+    block.get(&key).and_then(value_to_string)
 }
 
-fn block_prop_bool(block: &Map, prop: &str) -> Option<bool> {
+fn block_prop_bool(block: &BlockMap, prop: &str) -> Option<bool> {
     let key = format!("prop:{prop}");
-    block.get(&key).and_then(|value| value_to_bool(&value))
+    block.get(&key).and_then(value_to_bool)
 }
 
-fn get_string(block: &Map, key: &str) -> Option<String> {
-    block.get(key).and_then(|value| value_to_string(&value))
+fn get_string(block: &BlockMap, key: &str) -> Option<String> {
+    block.get(key).and_then(value_to_string)
 }
 
-fn value_to_string(value: &Value) -> Option<String> {
+fn value_to_string(value: &JsonValue) -> Option<String> {
     match value {
-        Value::Text(text) => Some(text.to_string()),
-        Value::Any(any) => any_to_string(any),
-        Value::Array(array) => {
-            let joined: Vec<_> = array
-                .iter()
-                .filter_map(|value| value_to_string(&value))
-                .collect();
-            if joined.is_empty() {
+        JsonValue::String(text) => Some(text.clone()),
+        JsonValue::Number(num) => Some(num.to_string()),
+        JsonValue::Bool(flag) => Some(flag.to_string()),
+        JsonValue::Array(values) => {
+            let mut parts = Vec::new();
+            for value in values {
+                if let Some(part) = value_to_string(value) {
+                    parts.push(part);
+                }
+            }
+            if parts.is_empty() {
                 None
             } else {
-                Some(joined.join(""))
+                Some(parts.join(""))
             }
         }
         _ => None,
     }
 }
 
-fn value_to_bool(value: &Value) -> Option<bool> {
+fn value_to_bool(value: &JsonValue) -> Option<bool> {
     match value {
-        Value::Any(Any::True) => Some(true),
-        Value::Any(Any::False) => Some(false),
-        Value::Any(Any::Integer(int)) => Some(*int != 0),
-        Value::Any(Any::BigInt64(int)) => Some(*int != 0),
-        Value::Any(Any::Float32(float)) => Some(float.into_inner() != 0.0),
-        Value::Any(Any::Float64(float)) => Some(float.into_inner() != 0.0),
-        Value::Any(Any::String(value)) => Some(value.eq_ignore_ascii_case("true")),
-        _ => None,
-    }
-}
-
-fn any_to_string(any: &Any) -> Option<String> {
-    match any {
-        Any::String(value) => Some(value.clone()),
-        Any::Integer(value) => Some(value.to_string()),
-        Any::Float32(value) => Some(value.into_inner().to_string()),
-        Any::Float64(value) => Some(value.into_inner().to_string()),
-        Any::BigInt64(value) => Some(value.to_string()),
-        Any::True => Some("true".into()),
-        Any::False => Some("false".into()),
-        Any::Array(values) => {
-            let joined: Vec<_> = values.iter().filter_map(any_to_string).collect();
-            if joined.is_empty() {
-                None
+        JsonValue::Bool(flag) => Some(*flag),
+        JsonValue::Number(num) => {
+            if let Some(int) = num.as_i64() {
+                Some(int != 0)
+            } else if let Some(float) = num.as_f64() {
+                Some(float != 0.0)
             } else {
-                Some(joined.join(""))
+                None
             }
         }
+        JsonValue::String(text) => Some(text.eq_ignore_ascii_case("true")),
         _ => None,
     }
 }
 
-fn append_table_contents(block: &Map, summary: &mut String) {
+fn append_table_contents(block: &BlockMap, summary: &mut String) {
     let mut parts = Vec::new();
-    for key in block.keys() {
+    for (key, value) in block.iter() {
         if key.starts_with("prop:cells.") && key.ends_with(".text") {
-            if let Some(value) = block.get(key) {
-                if let Some(text) = value_to_string(&value) {
-                    if !text.is_empty() {
-                        parts.push(text);
-                    }
+            if let Some(text) = value_to_string(value) {
+                if !text.is_empty() {
+                    parts.push(text);
                 }
             }
         }

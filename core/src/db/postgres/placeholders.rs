@@ -1,17 +1,18 @@
 use once_cell::sync::Lazy;
-use std::{collections::HashMap, sync::RwLock};
+use parking_lot::RwLock;
+use std::collections::HashMap;
 
 static CACHE: Lazy<RwLock<HashMap<&'static str, &'static str>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
 pub(crate) fn convert(sql: &'static str) -> &'static str {
-    if let Some(existing) = CACHE.read().unwrap().get(sql).copied() {
+    if let Some(existing) = CACHE.read().get(sql).copied() {
         return existing;
     }
 
     let rewritten = rewrite(sql);
     let leaked: &'static str = Box::leak(rewritten.into_boxed_str());
-    CACHE.write().unwrap().insert(sql, leaked);
+    CACHE.write().insert(sql, leaked);
     leaked
 }
 

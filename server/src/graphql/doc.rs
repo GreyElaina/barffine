@@ -1001,7 +1001,7 @@ mod tests {
     use crate::{
         auth::generate_password_hash,
         graphql::{self, RequestUser},
-        testing::{insert_document, seed_workspace, setup_state},
+        testing::{insert_document, seed_workspace, setup_state, setup_state_with_rocks_doc_store},
     };
     use async_graphql::Request as GraphQLRequest;
     use serde_json::to_value;
@@ -1284,6 +1284,72 @@ mod tests {
             .await
             .expect("query doc role");
         assert!(record.is_none());
+    }
+
+    #[tokio::test]
+    async fn graphql_duplicate_doc_in_rocks_mode_matches_sql_semantics() {
+        let (_temp_dir, database, state) = setup_state_with_rocks_doc_store().await;
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+
+        // 在 Rocks doc store 模式下插入一个源文档
+        let source_doc_id = Uuid::new_v4().to_string();
+        insert_document(&database, &workspace_id, &source_doc_id, false, "page").await;
+
+        let schema = graphql::build_schema(state.clone());
+        let new_title = "Rocks duplicated";
+        let mutation = r#"
+		mutation DuplicateDoc($input: DuplicateDocInput!) {
+			duplicateDoc(input: $input) {
+				id
+				workspaceId
+				title
+			}
+		}
+		"#;
+
+        let vars = async_graphql::Variables::from_json(serde_json::json!({
+            "input": {
+                "workspaceId": workspace_id,
+                "docId": source_doc_id,
+                "title": new_title,
+            }
+        }));
+
+        let response = schema
+            .execute(
+                async_graphql::Request::new(mutation)
+                    .variables(vars)
+                    .data(RequestUser::new(owner_id.clone())),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "unexpected errors: {:?}",
+            response.errors
+        );
+
+        let data = response.data.into_json().expect("valid json");
+        let duplicated = &data["duplicateDoc"];
+
+        let duplicated_id = duplicated["id"].as_str().expect("duplicated id");
+        assert_ne!(duplicated_id, source_doc_id);
+        assert_eq!(
+            duplicated["workspaceId"].as_str(),
+            Some(workspace_id.as_str())
+        );
+        assert_eq!(duplicated["title"].as_str(), Some(new_title));
+
+        // 通过 DocumentStore 读取，确认 Rocks 模式下元数据完整
+        let doc_store = barffine_core::doc_store::DocumentStore::new(&database);
+        let metadata = doc_store
+            .find_metadata(&workspace_id, duplicated_id)
+            .await
+            .expect("fetch metadata")
+            .expect("duplicated doc metadata");
+        assert_eq!(metadata.id, duplicated_id);
+        assert_eq!(metadata.workspace_id, workspace_id);
+        assert_eq!(metadata.title.as_deref(), Some(new_title));
     }
 
     #[tokio::test]

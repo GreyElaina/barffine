@@ -48,6 +48,8 @@ pub trait DocRoleRepository: Send + Sync {
     ) -> Result<()>;
 
     async fn remove_role(&self, workspace_id: &str, doc_id: &str, user_id: &str) -> Result<()>;
+
+    async fn remove_doc_roles(&self, workspace_id: &str, doc_id: &str) -> Result<()>;
 }
 
 pub type DocRoleRepositoryRef = Arc<dyn DocRoleRepository>;

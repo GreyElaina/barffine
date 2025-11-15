@@ -22,6 +22,8 @@ set +a
 
 ADMIN_EMAIL="${BARFFINE_ADMIN_EMAIL:-admin@example.com}"
 ADMIN_PASSWORD="${BARFFINE_ADMIN_PASSWORD:-password}"
+DATABASE_BACKEND="${BARFFINE_DATABASE_BACKEND:-sqlite}"
+DATABASE_BACKEND="${DATABASE_BACKEND,,}"
 DATA_ROOT="${BARFFINE_DATABASE_PATH:-/tmp/barffine_bench}"
 DATA_ROOT="${DATA_ROOT%/}"
 DATABASE_PATH="$DATA_ROOT/barffine.db"
@@ -36,7 +38,52 @@ if [[ -f "bench-results/dataset.json" ]]; then
   rm -f "bench-results/dataset.json"
 fi
 
+SQLX_CMD=()
+function resolve_sqlx() {
+  if [[ ${#SQLX_CMD[@]} -gt 0 ]]; then
+    return
+  fi
+  if command -v sqlx >/dev/null 2>&1; then
+    SQLX_CMD=(sqlx)
+  elif command -v cargo >/dev/null 2>&1; then
+    SQLX_CMD=(cargo sqlx)
+  else
+    echo "[bench] sqlx CLI is required to reset the postgres database" >&2
+    exit 1
+  fi
+}
+
+function run_sqlx() {
+  resolve_sqlx
+  "${SQLX_CMD[@]}" "$@"
+}
+
+function is_postgres_backend() {
+  case "$DATABASE_BACKEND" in
+    postgres|postgresql|pg) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+function stop_running_server() {
+  if pgrep -f "barffine-server" >/dev/null 2>&1; then
+    echo "[bench] killing existing barffine-server"
+    pkill -f "barffine-server" || true
+    sleep 2
+  fi
+}
+
 if [[ "${BARFFINE_BENCH_RESET_DB:-1}" == "1" ]]; then
+  stop_running_server
+  if is_postgres_backend; then
+    if [[ -z "${BARFFINE_DATABASE_URL:-}" ]]; then
+      echo "[bench] BARFFINE_DATABASE_URL must be set when using postgres backend" >&2
+      exit 1
+    fi
+    echo "[bench] resetting postgres database at $BARFFINE_DATABASE_URL"
+    run_sqlx database drop -y --database-url "$BARFFINE_DATABASE_URL" || true
+    run_sqlx database create --database-url "$BARFFINE_DATABASE_URL"
+  fi
   if [[ -e "$DATABASE_PATH" || -e "${DATABASE_PATH}-wal" || -e "${DATABASE_PATH}-shm" || -d "$DOC_KV_DIR" || -d "$BLOB_STORE_DIR" ]]; then
     echo "[bench] deleting existing bench data under $DATA_ROOT"
   fi
@@ -58,11 +105,7 @@ function cleanup() {
 }
 trap cleanup EXIT
 
-if pgrep -f "barffine-server" >/dev/null 2>&1; then
-  echo "[bench] killing existing barffine-server"
-  pkill -f "barffine-server" || true
-  sleep 2
-fi
+stop_running_server
 
 echo "[bench] creating admin $ADMIN_EMAIL"
 BARFFINE_ENV_FILE="$ENV_FILE" \

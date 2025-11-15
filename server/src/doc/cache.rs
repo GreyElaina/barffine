@@ -17,7 +17,9 @@ use serde_json::Value as JsonValue;
 use snap::raw::{Decoder as SnapDecoder, Encoder as SnapEncoder};
 use tokio::{sync::Mutex, time::sleep};
 use tracing::{debug, warn};
-use y_octo::{Doc as YoctoDoc, StateVector as YoctoStateVector};
+use yrs::types::ToJson;
+use yrs::updates::decoder::Decode;
+use yrs::{Doc as YrsDoc, Map, ReadTxn, StateVector as YrsStateVector, Transact, Update};
 
 use barffine_core::{
     doc_data::DocDataBackend,
@@ -192,6 +194,28 @@ impl DocCachePersistedState {
     }
 }
 
+fn doc_from_snapshot(bytes: &[u8]) -> DocCacheResult<YrsDoc> {
+    let doc = YrsDoc::new();
+    if !bytes.is_empty() {
+        let update = Update::decode_v1(bytes).context("decode snapshot as yrs update")?;
+        let mut txn = doc.transact_mut();
+        txn.apply_update(update)
+            .context("apply snapshot update to yrs doc")?;
+    }
+    Ok(doc)
+}
+
+fn decode_update_bytes(bytes: &[u8]) -> DocCacheResult<Update> {
+    Update::decode_v1(bytes).context("decode yrs update for doc cache")
+}
+
+fn encode_doc_snapshot(doc: &YrsDoc) -> (Vec<u8>, YrsStateVector) {
+    let txn = doc.transact();
+    let snapshot = txn.encode_state_as_update_v1(&YrsStateVector::default());
+    let state_vector = txn.state_vector();
+    (snapshot, state_vector)
+}
+
 #[async_trait]
 trait DocCacheBackend: Send + Sync {
     async fn load(&self, key: &str) -> DocCacheResult<Option<DocCachePersistedState>>;
@@ -221,52 +245,10 @@ impl DocCacheBackend for InMemoryDocCacheBackend {
     }
 }
 
-struct RocksDocCacheBackend {
-    store: Arc<dyn DocDataBackend>,
-}
-
-impl RocksDocCacheBackend {
-    fn new(store: Arc<dyn DocDataBackend>) -> Self {
-        Self { store }
-    }
-}
-
-#[async_trait]
-impl DocCacheBackend for RocksDocCacheBackend {
-    async fn load(&self, key: &str) -> DocCacheResult<Option<DocCachePersistedState>> {
-        let bytes = self.store.get_cache_entry(key)?;
-        if let Some(bytes) = bytes {
-            let state: DocCachePersistedState =
-                bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-                    .context("deserialize doc cache entry from rocksdb")?
-                    .0;
-            Ok(Some(state))
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn store(&self, key: &str, state: &DocCachePersistedState) -> DocCacheResult<()> {
-        let bytes = bincode::serde::encode_to_vec(state, bincode::config::standard())
-            .context("serialize doc cache entry for rocksdb")?;
-        self.store
-            .put_cache_entry(key, &bytes)
-            .context("write doc cache entry to rocksdb")?;
-        Ok(())
-    }
-
-    async fn remove(&self, key: &str) -> DocCacheResult<()> {
-        self.store
-            .delete_cache_entry(key)
-            .context("delete doc cache entry from rocksdb")?;
-        Ok(())
-    }
-}
-
 struct DocState {
-    doc: YoctoDoc,
+    doc: YrsDoc,
     snapshot: SnapshotEntry,
-    state_vector: YoctoStateVector,
+    state_vector: YrsStateVector,
     timestamp: i64,
     pending: VecDeque<Vec<u8>>,
     pending_bytes: usize,
@@ -402,7 +384,7 @@ impl DocCacheBuilder {
     pub fn new(
         workspace_store: DocumentStore,
         userspace_store: UserDocStore,
-        persistence_store: Option<Arc<dyn DocDataBackend>>,
+        _persistence_store: Option<Arc<dyn DocDataBackend>>,
     ) -> Self {
         Self {
             config: DocCacheConfig::default(),
@@ -805,93 +787,96 @@ impl DocCache {
             .await?;
         handle.touch_access();
 
-        let mut state = handle.inner.lock().await;
-        let prev_snapshot = state.snapshot.clone();
-        let prev_snapshot_plain = prev_snapshot.to_plain_vec()?;
-        let prev_state_vector = state.state_vector.clone();
-        let prev_pending_bytes = state.pending_bytes;
-        let prev_pending_len = state.pending.len();
-        let prev_last_editor = state.last_editor_id.clone();
-
-        let mut appended_bytes = 0usize;
-        let update_count = updates.len();
-        for update in &updates {
-            state.doc.apply_update_from_binary_v1(update)?;
-            state.pending.push_back(update.clone());
-            appended_bytes += update.len();
+        struct FlushPlan {
+            result: DocCacheApplyResult,
+            should_flush_now: bool,
+            flush_delay: Option<Duration>,
         }
-        state.pending_bytes += appended_bytes;
-        state.state_vector = state.doc.get_state_vector();
-        self.metrics.observe_pending_bytes(state.pending_bytes);
 
-        let snapshot = match state
-            .doc
-            .encode_state_as_update_v1(&YoctoStateVector::default())
-        {
-            Ok(snapshot) => snapshot,
-            Err(err) => {
-                state.pending_bytes = prev_pending_bytes;
-                while state.pending.len() > prev_pending_len {
-                    state.pending.pop_back();
+        let plan = {
+            let mut state = handle.inner.lock().await;
+            let update_count = updates.len();
+            let mut decoded_updates = Vec::with_capacity(update_count);
+            for update in &updates {
+                decoded_updates.push(decode_update_bytes(update)?);
+            }
+            {
+                let mut txn = state.doc.transact_mut();
+                for decoded in decoded_updates.drain(..) {
+                    txn.apply_update(decoded)?;
                 }
-                self.metrics.observe_pending_bytes(state.pending_bytes);
-                state.doc = YoctoDoc::try_from_binary_v1(&prev_snapshot_plain)
-                    .context("restore document snapshot after failed encode")?;
-                state.snapshot = prev_snapshot;
-                state.state_vector = prev_state_vector;
-                state.last_editor_id = prev_last_editor;
-                handle.update_estimated_bytes(&state);
-                return Err(err.into());
+            }
+            let mut appended_bytes = 0usize;
+            for update in &updates {
+                state.pending.push_back(update.clone());
+                appended_bytes += update.len();
+            }
+            state.pending_bytes += appended_bytes;
+            self.metrics.observe_pending_bytes(state.pending_bytes);
+
+            let (snapshot, state_vector) = encode_doc_snapshot(&state.doc);
+            let timestamp = extract_doc_updated_at(&state.doc, &handle.descriptor.doc_id)
+                .unwrap_or_else(current_time_millis);
+            state
+                .snapshot
+                .replace(snapshot.clone(), self.config.snapshot_mode)?;
+            state.state_vector = state_vector;
+            state.timestamp = timestamp;
+            state.last_editor_id = editor_id.map(str::to_owned);
+            state.content_cache_partial = None;
+            state.content_cache_full = None;
+            state.markdown_cache = None;
+            let now_ms = current_time_millis();
+            if let Some(adaptive) = &self.config.adaptive {
+                state.stats.record_updates(
+                    update_count,
+                    appended_bytes,
+                    now_ms,
+                    adaptive.ema_alpha,
+                );
+                handle.adaptive.refresh_thresholds(adaptive, &state.stats);
+            }
+            handle.update_estimated_bytes(&state);
+            debug!(
+                space_type = ?handle.descriptor.space_type,
+                space_id = %handle.descriptor.space_id,
+                doc_id = %handle.descriptor.doc_id,
+                pending_bytes = state.pending_bytes,
+                "buffered document updates via cache",
+            );
+
+            let pending_limit = handle.adaptive.pending_limit();
+            let should_flush_now = handle.adaptive.should_force_flush(
+                state.pending_bytes,
+                now_ms,
+                self.config.adaptive_force_flush_bytes,
+                self.config.adaptive_max_flush_interval,
+            ) || state.pending_bytes >= pending_limit;
+            let flush_delay = if should_flush_now {
+                None
+            } else {
+                Some(handle.adaptive.current_flush_delay(self.config.flush_delay))
+            };
+            let result = DocCacheApplyResult {
+                snapshot,
+                timestamp,
+            };
+            FlushPlan {
+                result,
+                should_flush_now,
+                flush_delay,
             }
         };
-        let timestamp = extract_doc_updated_at(&state.doc, &handle.descriptor.doc_id)
-            .unwrap_or_else(current_time_millis);
-        state
-            .snapshot
-            .replace(snapshot.clone(), self.config.snapshot_mode)?;
-        state.timestamp = timestamp;
-        state.last_editor_id = editor_id.map(str::to_owned);
-        state.content_cache_partial = None;
-        state.content_cache_full = None;
-        state.markdown_cache = None;
-        let now_ms = current_time_millis();
-        if let Some(adaptive) = &self.config.adaptive {
-            state
-                .stats
-                .record_updates(update_count, appended_bytes, now_ms, adaptive.ema_alpha);
-            handle.adaptive.refresh_thresholds(adaptive, &state.stats);
-        }
-        handle.update_estimated_bytes(&state);
-        debug!(
-            space_type = ?handle.descriptor.space_type,
-            space_id = %handle.descriptor.space_id,
-            doc_id = %handle.descriptor.doc_id,
-            pending_bytes = state.pending_bytes,
-            "buffered document updates via cache",
-        );
 
-        let pending_limit = handle.adaptive.pending_limit();
-        let should_flush_now = handle.adaptive.should_force_flush(
-            state.pending_bytes,
-            now_ms,
-            self.config.adaptive_force_flush_bytes,
-            self.config.adaptive_max_flush_interval,
-        ) || state.pending_bytes >= pending_limit;
-        let result = DocCacheApplyResult {
-            snapshot,
-            timestamp,
-        };
-        drop(state);
         self.persist_handle_state(&key, &handle).await?;
 
-        if should_flush_now {
+        if plan.should_flush_now {
             handle
                 .flush_if_needed(&self.workspace_store, &self.userspace_store, &self.metrics)
                 .await?;
-        } else {
-            let flush_delay = handle.adaptive.current_flush_delay(self.config.flush_delay);
+        } else if let Some(delay) = plan.flush_delay {
             handle.schedule_flush(
-                flush_delay,
+                delay,
                 self.workspace_store.clone(),
                 self.userspace_store.clone(),
                 self.metrics.clone(),
@@ -900,7 +885,7 @@ impl DocCache {
 
         self.maybe_evict_idle(space_type, space_id, doc_id, &handle)
             .await;
-        Ok(result)
+        Ok(plan.result)
     }
 
     pub async fn open_session(
@@ -1147,13 +1132,8 @@ impl DocHandle {
         config: &DocCacheConfig,
     ) -> DocCacheResult<Self> {
         let doc_bytes = snapshot_entry.to_plain_vec()?;
-        let doc = if doc_bytes.is_empty() {
-            YoctoDoc::new()
-        } else {
-            YoctoDoc::try_from_binary_v1(&doc_bytes)
-                .context("decode yocto snapshot for cache entry")?
-        };
-        let state_vector = doc.get_state_vector();
+        let doc = doc_from_snapshot(&doc_bytes)?;
+        let state_vector = doc.transact().state_vector();
         let pending = VecDeque::new();
         let estimated_bytes = snapshot_entry.len();
         let now = current_time_millis();
@@ -1588,10 +1568,12 @@ impl DocAdaptiveState {
     }
 }
 
-fn extract_doc_updated_at(doc: &YoctoDoc, doc_id: &str) -> Option<i64> {
-    let map = doc.get_map("meta").ok()?;
-    let value = map.get("pages")?;
-    let json = serde_json::to_value(&value).ok()?;
+fn extract_doc_updated_at(doc: &YrsDoc, doc_id: &str) -> Option<i64> {
+    let txn = doc.transact();
+    let meta = txn.get_map("meta")?;
+    let value = meta.get(&txn, "pages")?;
+    let json_any = value.to_json(&txn);
+    let json = serde_json::to_value(&json_any).ok()?;
     parse_updated_at(&json, doc_id)
 }
 

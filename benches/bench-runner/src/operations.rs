@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
+use parking_lot::RwLock;
 use rand::rng;
 use serde_json::json;
-use tokio::sync::RwLock;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -24,8 +24,8 @@ impl WorkspaceCache {
         })
     }
 
-    pub async fn register(&self, id: String) {
-        let mut guard = self.inner.write().await;
+    pub fn register(&self, id: String) {
+        let mut guard = self.inner.write();
         if !guard.iter().any(|existing| existing == &id) {
             guard.push(id);
         }
@@ -36,7 +36,7 @@ impl WorkspaceCache {
         client: &Arc<BenchClient>,
     ) -> Result<String, OperationError> {
         {
-            let guard = self.inner.read().await;
+            let guard = self.inner.read();
             if !guard.is_empty() {
                 let idx = fastrand::usize(..guard.len());
                 return Ok(guard[idx].clone());
@@ -50,7 +50,7 @@ impl WorkspaceCache {
             return Err(OperationError::MissingWorkspace);
         }
         {
-            let mut guard = self.inner.write().await;
+            let mut guard = self.inner.write();
             guard.clear();
             guard.extend(ids.iter().cloned());
         }
@@ -120,7 +120,7 @@ pub async fn execute(
                 )
                 .await?;
             if let Some(id) = data["createWorkspace"]["id"].as_str() {
-                ctx.cache.register(id.to_string()).await;
+                ctx.cache.register(id.to_string());
             }
             Ok(Completion::Success)
         }

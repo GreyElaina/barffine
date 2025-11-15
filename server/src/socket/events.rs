@@ -2,17 +2,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::Error as AnyError;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use socketioxide::{
     SocketIo,
-    extract::{AckSender, Data, Extension, SocketRef, State},
+    extract::{AckSender, Data, Extension, SocketRef},
     handler::ConnectHandler,
 };
 use tracing::Instrument;
 use tracing::{Span, debug, info, warn};
-use y_octo::{Doc as YoctoDoc, StateVector as YoctoStateVector};
+use yrs::updates::decoder::Decode;
+use yrs::{Doc as YrsDoc, ReadTxn, StateVector, Transact, Update};
 
 use crate::{
     auth::{DocAccessIntent, RpcAccessRequirement, resolve_doc_access, resolve_workspace_access},
@@ -28,51 +30,47 @@ use crate::{
         rooms::{RoomKind, SpaceType, space_room_name},
         types::{SocketRequestContext, SocketSpanRegistry, SocketUserContext},
     },
-    state::{AppState, DocSessionKey, SocketBroadcastMeta},
+    state::{AppState, DocSessionKey, SocketBroadcastMeta, SocketRuntimeState},
     types::RestDocAccess,
     utils::crdt::{decode_state_vector, encode_state_vector},
 };
 
-use tokio::sync::Mutex;
+use dashmap::DashMap;
 
 const DOC_ACCESS_CACHE_TTL: Duration = Duration::from_secs(2);
 
-#[derive(Clone)]
 struct SocketDocAccessCache {
-    inner: Arc<Mutex<HashMap<(String, String), CachedDocAccess>>>,
+    inner: DashMap<(String, String), CachedDocAccess>,
 }
 
 impl SocketDocAccessCache {
     fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
+            inner: DashMap::new(),
         }
     }
 
-    async fn get(&self, workspace_id: &str, doc_id: &str) -> Option<RestDocAccess> {
-        let mut guard = self.inner.lock().await;
+    fn get(&self, workspace_id: &str, doc_id: &str) -> Option<RestDocAccess> {
         let key = (workspace_id.to_string(), doc_id.to_string());
-        if let Some(entry) = guard.get_mut(&key) {
+        if let Some(mut entry) = self.inner.get_mut(&key) {
             if entry.is_valid() {
                 entry.refresh();
                 return Some(entry.access.clone());
             }
         }
-        guard.remove(&key);
+        self.inner.remove(&key);
         None
     }
 
-    async fn insert(&self, workspace_id: &str, doc_id: &str, access: RestDocAccess) {
+    fn insert(&self, workspace_id: &str, doc_id: &str, access: RestDocAccess) {
         let key = (workspace_id.to_string(), doc_id.to_string());
         let cached = CachedDocAccess::new(access);
-        let mut guard = self.inner.lock().await;
-        guard.insert(key, cached);
+        self.inner.insert(key, cached);
     }
 
-    async fn remove(&self, workspace_id: &str, doc_id: &str) {
+    fn remove(&self, workspace_id: &str, doc_id: &str) {
         let key = (workspace_id.to_string(), doc_id.to_string());
-        let mut guard = self.inner.lock().await;
-        guard.remove(&key);
+        self.inner.remove(&key);
     }
 }
 
@@ -82,7 +80,7 @@ impl Default for SocketDocAccessCache {
     }
 }
 
-async fn finalize_doc_session(state: &AppState, key: &DocSessionKey) {
+async fn finalize_doc_session(state: &SocketRuntimeState, key: &DocSessionKey) {
     state
         .doc_cache
         .close_session(key.space_type, &key.space_id, &key.doc_id)
@@ -91,6 +89,7 @@ async fn finalize_doc_session(state: &AppState, key: &DocSessionKey) {
     state.sync_hub.remove_channel(&channel_key);
 }
 
+#[derive(Clone)]
 struct CachedDocAccess {
     access: RestDocAccess,
     expires_at: Instant,
@@ -186,7 +185,7 @@ fn ensure_space_span(
     Some(span)
 }
 
-fn ensure_workspace_embedding_initialized(state: &AppState, workspace_id: &str) {
+fn ensure_workspace_embedding_initialized(state: &SocketRuntimeState, workspace_id: &str) {
     if !state.workspace_embedding_files.contains_key(workspace_id) {
         state
             .workspace_embedding_files
@@ -203,6 +202,18 @@ fn ensure_workspace_embedding_initialized(state: &AppState, workspace_id: &str) 
         .or_default();
 
     state.emit_workspace_embedding(workspace_id, None);
+}
+
+fn doc_from_snapshot_bytes(bytes: &[u8]) -> Result<YrsDoc, AppError> {
+    let doc = YrsDoc::new();
+    if !bytes.is_empty() {
+        let update =
+            Update::decode_v1(bytes).map_err(|err| AppError::from_anyhow(AnyError::new(err)))?;
+        let mut txn = doc.transact_mut();
+        txn.apply_update(update)
+            .map_err(|err| AppError::from_anyhow(AnyError::new(err)))?;
+    }
+    Ok(doc)
 }
 
 fn socket_in_room(socket: &SocketRef, room: &str) -> bool {
@@ -273,19 +284,19 @@ fn ensure_doc_delete_permission(access: &RestDocAccess) -> Result<(), AppError> 
 }
 
 async fn resolve_doc_access_cached(
-    state: &AppState,
+    runtime: &SocketRuntimeState,
     cache: &SocketDocAccessCache,
     user: &SocketUserContext,
     workspace_id: &str,
     doc_id: &str,
 ) -> Result<RestDocAccess, AppError> {
-    if let Some(access) = cache.get(workspace_id, doc_id).await {
+    if let Some(access) = cache.get(workspace_id, doc_id) {
         return Ok(access);
     }
 
     let headers = user.header_map()?;
     let access = resolve_doc_access(
-        state,
+        runtime,
         &headers,
         workspace_id,
         doc_id,
@@ -293,7 +304,7 @@ async fn resolve_doc_access_cached(
         DocAccessIntent::Standard,
     )
     .await?;
-    cache.insert(workspace_id, doc_id, access.clone()).await;
+    cache.insert(workspace_id, doc_id, access.clone());
     Ok(access)
 }
 
@@ -315,7 +326,7 @@ fn attach_editor_metadata(payload: &mut JsonValue, user: &SocketUserContext) {
 }
 
 async fn ensure_socket_space_access(
-    state: &AppState,
+    state: &SocketRuntimeState,
     user: &SocketUserContext,
     space_type: SpaceType,
     space_id: &str,
@@ -330,13 +341,19 @@ async fn ensure_socket_space_access(
     }
 }
 
-pub(crate) fn register_namespace(io: &SocketIo, state: AppState) {
-    let middleware = SocketAuthMiddleware::new(state);
+pub(crate) fn register_namespace(
+    io: &SocketIo,
+    state: Arc<AppState>,
+    runtime: Arc<SocketRuntimeState>,
+) {
+    let middleware = SocketAuthMiddleware::new(state, runtime);
     let _ = io.ns("/", on_connect.with(middleware));
 }
 
 async fn on_connect(socket: SocketRef) {
-    socket.extensions.insert(SocketDocAccessCache::default());
+    socket
+        .extensions
+        .insert(Arc::new(SocketDocAccessCache::default()));
     socket.on("space:join", handle_space_join);
     socket.on("space:leave", handle_space_leave);
     socket.on("space:load-doc", handle_space_load_doc);
@@ -376,8 +393,7 @@ async fn handle_space_join(
     ack: AckSender,
     Extension(user): Extension<SocketUserContext>,
     Extension(request): Extension<SocketRequestContext>,
-    Extension(_doc_access_cache): Extension<SocketDocAccessCache>,
-    State(state): State<AppState>,
+    Extension(runtime): Extension<Arc<SocketRuntimeState>>,
 ) {
     let span = start_socket_span(
         "space:join",
@@ -431,7 +447,8 @@ async fn handle_space_join(
                 }
             };
 
-            if let Err(err) = resolve_workspace_access(&state, &header_map, &payload.space_id).await
+            if let Err(err) =
+                resolve_workspace_access(runtime.as_ref(), &header_map, &payload.space_id).await
             {
                 warn!(
                     request_id = %request_id_owned,
@@ -442,7 +459,7 @@ async fn handle_space_join(
                 ack_error::<JoinSpaceResponse>(ack, err, Some(&request.request_id));
                 return;
             }
-            ensure_workspace_embedding_initialized(&state, &payload.space_id);
+            ensure_workspace_embedding_initialized(runtime.as_ref(), &payload.space_id);
         } else if user.user_id != payload.space_id {
             warn!(
                 request_id = %request_id_owned,
@@ -494,7 +511,7 @@ async fn handle_space_leave(
     socket: SocketRef,
     Data(payload): Data<LeaveSpaceRequest>,
     ack: AckSender,
-    State(state): State<AppState>,
+    Extension(runtime): Extension<Arc<SocketRuntimeState>>,
 ) {
     let span = start_socket_span(
         "space:leave",
@@ -535,13 +552,13 @@ async fn handle_space_leave(
             "socket space:leave success"
         );
 
-        let stale_docs = state
-            .doc_sessions
-            .remove_by_space(&socket_id, payload.space_type, &payload.space_id)
-            .await;
+        let stale_docs =
+            runtime
+                .doc_sessions
+                .remove_by_space(&socket_id, payload.space_type, &payload.space_id);
 
         for key in stale_docs {
-            finalize_doc_session(&state, &key).await;
+            finalize_doc_session(runtime.as_ref(), &key).await;
         }
 
         if let Some(registry) = socket.extensions.get::<SocketSpanRegistry>() {
@@ -576,8 +593,7 @@ async fn handle_space_load_doc(
     ack: AckSender,
     Extension(user): Extension<SocketUserContext>,
     Extension(request): Extension<SocketRequestContext>,
-    Extension(doc_access_cache): Extension<SocketDocAccessCache>,
-    State(state): State<AppState>,
+    Extension(runtime): Extension<Arc<SocketRuntimeState>>,
 ) {
     let span = start_socket_span(
         "space:load-doc",
@@ -614,11 +630,21 @@ async fn handle_space_load_doc(
             return;
         }
 
+        let Some(doc_access_cache) = socket.extensions.get::<Arc<SocketDocAccessCache>>() else {
+            warn!("socket space:load-doc missing doc access cache");
+            ack_error::<LoadDocResponse>(
+                ack,
+                AppError::internal(AnyError::msg("missing doc access cache")),
+                Some(&request.request_id),
+            );
+            return;
+        };
+
         let (snapshot_bytes, timestamp) = match payload.space_type {
             SpaceType::Workspace => {
                 if let Err(err) = resolve_doc_access_cached(
-                    &state,
-                    &doc_access_cache,
+                    runtime.as_ref(),
+                    doc_access_cache.as_ref(),
                     &user,
                     &payload.space_id,
                     &payload.doc_id,
@@ -636,7 +662,7 @@ async fn handle_space_load_doc(
                     return;
                 }
 
-                match state
+                match runtime
                     .doc_cache
                     .clone()
                     .snapshot(SpaceType::Workspace, &payload.space_id, &payload.doc_id)
@@ -659,7 +685,7 @@ async fn handle_space_load_doc(
                     return;
                 }
 
-                match state
+                match runtime
                     .doc_cache
                     .clone()
                     .snapshot(SpaceType::Userspace, &payload.space_id, &payload.doc_id)
@@ -678,7 +704,7 @@ async fn handle_space_load_doc(
             }
         };
 
-        let doc = match YoctoDoc::try_from_binary_v1(&snapshot_bytes) {
+        let doc = match doc_from_snapshot_bytes(&snapshot_bytes) {
             Ok(doc) => doc,
             Err(err) => {
                 warn!(
@@ -688,11 +714,7 @@ async fn handle_space_load_doc(
                     error = %err,
                     "socket space:load-doc failed to decode snapshot"
                 );
-                ack_error::<LoadDocResponse>(
-                    ack,
-                    AppError::from_anyhow(err.into()),
-                    Some(&request.request_id),
-                );
+                ack_error::<LoadDocResponse>(ack, err, Some(&request.request_id));
                 return;
             }
         };
@@ -724,27 +746,17 @@ async fn handle_space_load_doc(
                     return;
                 }
             },
-            _ => YoctoStateVector::default(),
+            _ => StateVector::default(),
         };
 
-        let missing_bytes = match doc.encode_state_as_update_v1(&state_vector) {
-            Ok(data) => data,
-            Err(err) => {
-                warn!(
-                    request_id = %request_id_owned,
-                    error = %err,
-                    "socket space:load-doc failed to compute diff"
-                );
-                ack_error::<LoadDocResponse>(
-                    ack,
-                    AppError::from_anyhow(err.into()),
-                    Some(&request.request_id),
-                );
-                return;
-            }
+        let (missing_bytes, next_state_vector) = {
+            let txn = doc.transact();
+            let diff = txn.encode_state_as_update_v1(&state_vector);
+            let state = txn.state_vector();
+            (diff, state)
         };
 
-        let state_bytes = match encode_state_vector(&doc.get_state_vector()) {
+        let state_bytes = match encode_state_vector(&next_state_vector) {
             Ok(bytes) => bytes,
             Err(err) => {
                 warn!(
@@ -762,9 +774,9 @@ async fn handle_space_load_doc(
             space_id_owned.clone(),
             doc_id_owned.clone(),
         );
-        let first_session = state.doc_sessions.register(&socket_id, session_key).await;
+        let first_session = runtime.doc_sessions.register(&socket_id, session_key);
         if first_session {
-            if let Err(err) = state
+            if let Err(err) = runtime
                 .doc_cache
                 .open_session(payload.space_type, &space_id_owned, &doc_id_owned)
                 .await
@@ -843,8 +855,7 @@ async fn handle_space_push_doc_update(
     ack: AckSender,
     Extension(user): Extension<SocketUserContext>,
     Extension(request): Extension<SocketRequestContext>,
-    Extension(doc_access_cache): Extension<SocketDocAccessCache>,
-    State(state): State<AppState>,
+    Extension(runtime): Extension<Arc<SocketRuntimeState>>,
 ) {
     let span = start_socket_span(
         "space:push-doc-update",
@@ -856,6 +867,16 @@ async fn handle_space_push_doc_update(
     );
 
     async move {
+        let Some(doc_access_cache) = socket.extensions.get::<Arc<SocketDocAccessCache>>() else {
+            warn!("socket push-doc-update missing doc access cache");
+            ack_error::<PushDocUpdateResponse>(
+                ack,
+                AppError::internal(AnyError::msg("missing doc access cache")),
+                Some(&request.request_id),
+            );
+            return;
+        };
+
         debug!(
             request_id = request.request_id.as_str(),
             space_id = payload.space_id.as_str(),
@@ -894,7 +915,7 @@ async fn handle_space_push_doc_update(
         // reuse the previous timestamp and return to avoid reapplying the exact same logical update
         // (e.g., due to client retries or network replay).
         // (e.g., due to client retries or network replay).
-        if let Some(prev_timestamp) = state.request_deduper.check(
+        if let Some(prev_timestamp) = runtime.request_deduper.check(
             payload.space_type,
             &payload.space_id,
             &payload.doc_id,
@@ -907,8 +928,8 @@ async fn handle_space_push_doc_update(
         match payload.space_type {
             SpaceType::Workspace => {
                 let mut access = match resolve_doc_access_cached(
-                    &state,
-                    &doc_access_cache,
+                    runtime.as_ref(),
+                    doc_access_cache.as_ref(),
                     &user,
                     &payload.space_id,
                     &payload.doc_id,
@@ -937,7 +958,7 @@ async fn handle_space_push_doc_update(
                 }
 
                 let cache_result = match apply_doc_updates(
-                    &state,
+                    runtime.as_ref(),
                     SpaceType::Workspace,
                     &payload.space_id,
                     &payload.doc_id,
@@ -957,12 +978,10 @@ async fn handle_space_push_doc_update(
                 };
 
                 access.metadata.updated_at = cache_result.timestamp;
-                doc_access_cache
-                    .insert(&payload.space_id, &payload.doc_id, access)
-                    .await;
+                doc_access_cache.insert(&payload.space_id, &payload.doc_id, access);
 
                 let timestamp = Some(cache_result.timestamp);
-                state.request_deduper.store(
+                runtime.request_deduper.store(
                     payload.space_type,
                     &payload.space_id,
                     &payload.doc_id,
@@ -978,7 +997,7 @@ async fn handle_space_push_doc_update(
                 }
 
                 let cache_result = match apply_doc_updates(
-                    &state,
+                    runtime.as_ref(),
                     SpaceType::Userspace,
                     &payload.space_id,
                     &payload.doc_id,
@@ -998,7 +1017,7 @@ async fn handle_space_push_doc_update(
                 };
 
                 let timestamp = Some(cache_result.timestamp);
-                state.request_deduper.store(
+                runtime.request_deduper.store(
                     payload.space_type,
                     &payload.space_id,
                     &payload.doc_id,
@@ -1019,8 +1038,7 @@ async fn handle_space_push_doc_updates(
     ack: AckSender,
     Extension(user): Extension<SocketUserContext>,
     Extension(request): Extension<SocketRequestContext>,
-    Extension(doc_access_cache): Extension<SocketDocAccessCache>,
-    State(state): State<AppState>,
+    Extension(runtime): Extension<Arc<SocketRuntimeState>>,
 ) {
     let span = start_socket_span(
         "space:push-doc-updates",
@@ -1038,6 +1056,16 @@ async fn handle_space_push_doc_updates(
         updates,
     } = payload;
     async move {
+        let Some(doc_access_cache) = socket.extensions.get::<Arc<SocketDocAccessCache>>() else {
+            warn!("socket push-doc-updates missing doc access cache");
+            ack_error::<PushDocUpdateResponse>(
+                ack,
+                AppError::internal(AnyError::msg("missing doc access cache")),
+                Some(&request.request_id),
+            );
+            return;
+        };
+
         if updates.is_empty() {
             ack_error::<PushDocUpdateResponse>(
                 ack,
@@ -1055,7 +1083,7 @@ async fn handle_space_push_doc_updates(
         // Repeated batch update requests for the same space/document/requestId will reuse
         // the previous result.
         if let Some(prev_timestamp) =
-            state
+            runtime
                 .request_deduper
                 .check(space_type, &space_id, &doc_id, &request.request_id)
         {
@@ -1087,8 +1115,8 @@ async fn handle_space_push_doc_updates(
         match space_type {
             SpaceType::Workspace => {
                 let mut access = match resolve_doc_access_cached(
-                    &state,
-                    &doc_access_cache,
+                    runtime.as_ref(),
+                    doc_access_cache.as_ref(),
                     &user,
                     &space_id,
                     &doc_id,
@@ -1116,7 +1144,7 @@ async fn handle_space_push_doc_updates(
                     return;
                 }
 
-                let cache_result = match state
+                let cache_result = match runtime
                     .doc_cache
                     .clone()
                     .apply_updates(
@@ -1140,10 +1168,10 @@ async fn handle_space_push_doc_updates(
                 };
 
                 access.metadata.updated_at = cache_result.timestamp;
-                doc_access_cache.insert(&space_id, &doc_id, access).await;
+                doc_access_cache.insert(&space_id, &doc_id, access);
 
                 let timestamp = Some(cache_result.timestamp);
-                state.request_deduper.store(
+                runtime.request_deduper.store(
                     space_type,
                     &space_id,
                     &doc_id,
@@ -1151,7 +1179,7 @@ async fn handle_space_push_doc_updates(
                     timestamp,
                 );
                 let channel_key = doc_channel_key(&space_id, &doc_id);
-                state.sync_hub.publish_updates(
+                runtime.sync_hub.publish_updates(
                     &channel_key,
                     &update_bytes,
                     Some(SocketBroadcastMeta::new(
@@ -1163,7 +1191,7 @@ async fn handle_space_push_doc_updates(
                         timestamp,
                     )),
                 );
-                state
+                runtime
                     .sync_hub
                     .publish_snapshot(&channel_key, cache_result.snapshot.clone());
 
@@ -1196,7 +1224,7 @@ async fn handle_space_push_doc_updates(
                     return;
                 }
 
-                let cache_result = match state
+                let cache_result = match runtime
                     .doc_cache
                     .clone()
                     .apply_updates(
@@ -1220,7 +1248,7 @@ async fn handle_space_push_doc_updates(
                 };
 
                 let timestamp = Some(cache_result.timestamp);
-                state.request_deduper.store(
+                runtime.request_deduper.store(
                     space_type,
                     &space_id,
                     &doc_id,
@@ -1228,7 +1256,7 @@ async fn handle_space_push_doc_updates(
                     timestamp,
                 );
                 let channel_key = doc_channel_key(&space_id, &doc_id);
-                state.sync_hub.publish_updates(
+                runtime.sync_hub.publish_updates(
                     &channel_key,
                     &update_bytes,
                     Some(SocketBroadcastMeta::new(
@@ -1240,7 +1268,7 @@ async fn handle_space_push_doc_updates(
                         timestamp,
                     )),
                 );
-                state
+                runtime
                     .sync_hub
                     .publish_snapshot(&channel_key, cache_result.snapshot.clone());
 
@@ -1291,8 +1319,7 @@ async fn handle_space_delete_doc(
     ack: AckSender,
     Extension(user): Extension<SocketUserContext>,
     Extension(request): Extension<SocketRequestContext>,
-    Extension(doc_access_cache): Extension<SocketDocAccessCache>,
-    State(state): State<AppState>,
+    Extension(runtime): Extension<Arc<SocketRuntimeState>>,
 ) {
     let span = start_socket_span(
         "space:delete-doc",
@@ -1304,6 +1331,16 @@ async fn handle_space_delete_doc(
     );
 
     async move {
+        let Some(doc_access_cache) = socket.extensions.get::<Arc<SocketDocAccessCache>>() else {
+            warn!("socket delete-doc missing doc access cache");
+            ack_error::<DeleteDocResponse>(
+                ack,
+                AppError::internal(AnyError::msg("missing doc access cache")),
+                Some(&request.request_id),
+            );
+            return;
+        };
+
         if let Err(err) = ensure_socket_joined_room(&socket, payload.space_type, &payload.space_id)
         {
             ack_error::<DeleteDocResponse>(ack, err, Some(&request.request_id));
@@ -1313,8 +1350,8 @@ async fn handle_space_delete_doc(
         match payload.space_type {
             SpaceType::Workspace => {
                 let access = match resolve_doc_access_cached(
-                    &state,
-                    &doc_access_cache,
+                    runtime.as_ref(),
+                    doc_access_cache.as_ref(),
                     &user,
                     &payload.space_id,
                     &payload.doc_id,
@@ -1342,25 +1379,24 @@ async fn handle_space_delete_doc(
                     return;
                 }
 
-                match state
+                match runtime
                     .document_store
                     .delete_doc(&payload.space_id, &payload.doc_id)
                     .await
                 {
                     Ok(true) => {
-                        doc_access_cache
-                            .remove(&payload.space_id, &payload.doc_id)
-                            .await;
-                        state
+                        doc_access_cache.remove(&payload.space_id, &payload.doc_id);
+                        runtime
                             .doc_cache
                             .clone()
                             .invalidate(SpaceType::Workspace, &payload.space_id, &payload.doc_id)
                             .await;
-                        state
-                            .doc_sessions
-                            .remove_doc(SpaceType::Workspace, &payload.space_id, &payload.doc_id)
-                            .await;
-                        state
+                        runtime.doc_sessions.remove_doc(
+                            SpaceType::Workspace,
+                            &payload.space_id,
+                            &payload.doc_id,
+                        );
+                        runtime
                             .sync_hub
                             .remove_channel(&doc_channel_key(&payload.space_id, &payload.doc_id));
                         ack_ok(ack, DeleteDocResponse { success: true });
@@ -1387,22 +1423,23 @@ async fn handle_space_delete_doc(
                     return;
                 }
 
-                match state
+                match runtime
                     .user_doc_store
                     .delete_doc(&payload.space_id, &payload.doc_id)
                     .await
                 {
                     Ok(true) => {
-                        state
+                        runtime
                             .doc_cache
                             .clone()
                             .invalidate(SpaceType::Userspace, &payload.space_id, &payload.doc_id)
                             .await;
-                        state
-                            .doc_sessions
-                            .remove_doc(SpaceType::Userspace, &payload.space_id, &payload.doc_id)
-                            .await;
-                        state
+                        runtime.doc_sessions.remove_doc(
+                            SpaceType::Userspace,
+                            &payload.space_id,
+                            &payload.doc_id,
+                        );
+                        runtime
                             .sync_hub
                             .remove_channel(&doc_channel_key(&payload.space_id, &payload.doc_id));
                         ack_ok(ack, DeleteDocResponse { success: true });
@@ -1440,7 +1477,7 @@ async fn handle_space_load_doc_timestamps(
     ack: AckSender,
     Extension(user): Extension<SocketUserContext>,
     Extension(request): Extension<SocketRequestContext>,
-    State(state): State<AppState>,
+    Extension(runtime): Extension<Arc<SocketRuntimeState>>,
 ) {
     let span = start_socket_span(
         "space:load-doc-timestamps",
@@ -1462,8 +1499,9 @@ async fn handle_space_load_doc_timestamps(
             SpaceType::Workspace => {
                 async {
                     let header_map = user.header_map()?;
-                    resolve_workspace_access(&state, &header_map, &payload.space_id).await?;
-                    state
+                    resolve_workspace_access(runtime.as_ref(), &header_map, &payload.space_id)
+                        .await?;
+                    runtime
                         .document_store
                         .list_doc_timestamps(&payload.space_id, payload.timestamp)
                         .await
@@ -1474,7 +1512,7 @@ async fn handle_space_load_doc_timestamps(
             SpaceType::Userspace => {
                 async {
                     ensure_userspace_owner(&user, &payload.space_id)?;
-                    state
+                    runtime
                         .user_doc_store
                         .timestamps_since(&payload.space_id, payload.timestamp)
                         .await
@@ -1527,7 +1565,7 @@ async fn handle_space_join_awareness(
     ack: AckSender,
     Extension(user): Extension<SocketUserContext>,
     Extension(request): Extension<SocketRequestContext>,
-    State(state): State<AppState>,
+    Extension(runtime): Extension<Arc<SocketRuntimeState>>,
 ) {
     let span = start_socket_span(
         "space:join-awareness",
@@ -1539,8 +1577,13 @@ async fn handle_space_join_awareness(
     );
 
     async move {
-        if let Err(err) =
-            ensure_socket_space_access(&state, &user, payload.space_type, &payload.space_id).await
+        if let Err(err) = ensure_socket_space_access(
+            runtime.as_ref(),
+            &user,
+            payload.space_type,
+            &payload.space_id,
+        )
+        .await
         {
             ack_error::<AwarenessResponse>(ack, err, Some(&request.request_id));
             return;
@@ -1566,12 +1609,11 @@ async fn handle_space_join_awareness(
             payload.space_id.clone(),
             payload.doc_id.clone(),
         );
-        let first_session = state
+        let first_session = runtime
             .doc_sessions
-            .register(&socket.id.to_string(), doc_key)
-            .await;
+            .register(&socket.id.to_string(), doc_key);
         if first_session {
-            if let Err(err) = state
+            if let Err(err) = runtime
                 .doc_cache
                 .open_session(payload.space_type, &payload.space_id, &payload.doc_id)
                 .await
@@ -1595,7 +1637,7 @@ async fn handle_space_leave_awareness(
     Data(payload): Data<AwarenessRequest>,
     ack: AckSender,
     Extension(request): Extension<SocketRequestContext>,
-    State(state): State<AppState>,
+    Extension(runtime): Extension<Arc<SocketRuntimeState>>,
 ) {
     let span = start_socket_span(
         "space:leave-awareness",
@@ -1633,17 +1675,16 @@ async fn handle_space_leave_awareness(
             },
         );
 
-        if state
+        if runtime
             .doc_sessions
             .remove_doc(payload.space_type, &payload.space_id, &payload.doc_id)
-            .await
         {
             let key = DocSessionKey::new(
                 payload.space_type,
                 payload.space_id.clone(),
                 payload.doc_id.clone(),
             );
-            finalize_doc_session(&state, &key).await;
+            finalize_doc_session(runtime.as_ref(), &key).await;
         }
     }
     .instrument(span)
@@ -1664,7 +1705,7 @@ async fn handle_space_update_awareness(
     Data(payload): Data<UpdateAwarenessRequest>,
     ack: AckSender,
     Extension(request): Extension<SocketRequestContext>,
-    State(state): State<AppState>,
+    Extension(runtime): Extension<Arc<SocketRuntimeState>>,
 ) {
     let span = start_socket_span(
         "space:update-awareness",
@@ -1686,7 +1727,7 @@ async fn handle_space_update_awareness(
             return;
         }
 
-        state.socket_metrics.inc_awareness_messages();
+        runtime.socket_metrics.inc_awareness_messages();
 
         let room = space_room_name(
             payload.space_type,
@@ -1790,14 +1831,17 @@ async fn handle_space_load_awarenesses(
     .await;
 }
 
-async fn handle_disconnect(socket: SocketRef, State(state): State<AppState>) {
+async fn handle_disconnect(
+    socket: SocketRef,
+    Extension(runtime): Extension<Arc<SocketRuntimeState>>,
+) {
     let socket_id = socket.id.to_string();
     socket.extensions.remove::<SocketSpanRegistry>();
-    let stale_docs = state.doc_sessions.remove_all(&socket_id).await;
+    let stale_docs = runtime.doc_sessions.remove_all(&socket_id);
     for key in stale_docs {
-        finalize_doc_session(&state, &key).await;
+        finalize_doc_session(runtime.as_ref(), &key).await;
     }
-    state.socket_metrics.dec_connections();
+    runtime.socket_metrics.dec_connections();
 }
 
 #[cfg(test)]
@@ -1963,13 +2007,10 @@ mod tests {
                 .snapshot(SpaceType::Workspace, &workspace.id, &doc_id)
                 .await
                 .expect("cache snapshot");
-            let first_session = state
-                .doc_sessions
-                .register(
-                    socket_id,
-                    DocSessionKey::new(SpaceType::Workspace, workspace.id.clone(), doc_id.clone()),
-                )
-                .await;
+            let first_session = state.doc_sessions.register(
+                socket_id,
+                DocSessionKey::new(SpaceType::Workspace, workspace.id.clone(), doc_id.clone()),
+            );
             if first_session {
                 state
                     .doc_cache
@@ -1995,16 +2036,17 @@ mod tests {
         assert_eq!(state.doc_sessions.tracked_doc_count(), doc_total);
         assert_eq!(state.doc_cache.debug_entry_count().await, doc_total as u64);
 
+        let runtime = state.runtime();
         for idx in 0..doc_total {
             let doc_id = format!("doc-{idx}");
-            let removed = state
-                .doc_sessions
-                .remove_doc(SpaceType::Workspace, &workspace.id, &doc_id)
-                .await;
+            let removed =
+                state
+                    .doc_sessions
+                    .remove_doc(SpaceType::Workspace, &workspace.id, &doc_id);
             assert!(removed, "doc should be removed on awareness leave");
             let key =
                 DocSessionKey::new(SpaceType::Workspace, workspace.id.clone(), doc_id.clone());
-            finalize_doc_session(&state, &key).await;
+            finalize_doc_session(runtime.as_ref(), &key).await;
         }
 
         assert_eq!(state.doc_sessions.tracked_doc_count(), 0);

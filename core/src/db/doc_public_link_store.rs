@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 /// A minimal view of a row in the `doc_public_links` table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocPublicLinkRecord {
     pub workspace_id: String,
     pub doc_id: String,

@@ -762,6 +762,29 @@ impl DocumentStore {
         Ok(affected > 0)
     }
 
+    /// Delete all workspace-scoped documents for the given workspace and
+    /// return the IDs that were processed.
+    ///
+    /// This is primarily used when a workspace is being deleted to ensure that
+    /// Rocks-backed doc metadata, history and logs are cleaned up alongside any
+    /// SQL state. Callers that also manage doc-scoped state (e.g. roles) can
+    /// use the returned IDs for additional cleanup.
+    pub async fn delete_all_docs_in_workspace(&self, workspace_id: &str) -> Result<Vec<String>> {
+        let entries = self
+            .doc_repo
+            .list_doc_timestamps(workspace_id, None)
+            .await?;
+        let mut doc_ids = Vec::with_capacity(entries.len());
+        for (doc_id, _) in entries {
+            let _ = self
+                .doc_repo
+                .delete_doc_entry(workspace_id, &doc_id)
+                .await?;
+            doc_ids.push(doc_id);
+        }
+        Ok(doc_ids)
+    }
+
     pub async fn restore_doc_history(
         &self,
         workspace_id: &str,
@@ -894,30 +917,7 @@ pub(crate) struct ParsedDocMeta {
 }
 
 pub(crate) fn extract_doc_meta(snapshot: &[u8], doc_id: &str) -> ParsedDocMeta {
-    if let Some(parsed) = try_extract_doc_meta_with_yrs(snapshot, doc_id) {
-        return parsed;
-    }
-
-    use y_octo::Doc;
-
-    let doc = match Doc::try_from_binary_v1(snapshot) {
-        Ok(doc) => doc,
-        Err(_) => return ParsedDocMeta::default(),
-    };
-
-    let map = match doc.get_map("meta") {
-        Ok(map) => map,
-        Err(_) => return ParsedDocMeta::default(),
-    };
-
-    let Some(pages_value) = map.get("pages") else {
-        return ParsedDocMeta::default();
-    };
-
-    match serde_json::to_value(&pages_value) {
-        Ok(json) => parse_meta_from_json(json, doc_id),
-        Err(_) => ParsedDocMeta::default(),
-    }
+    try_extract_doc_meta_with_yrs(snapshot, doc_id).unwrap_or_default()
 }
 
 fn try_extract_doc_meta_with_yrs(snapshot: &[u8], doc_id: &str) -> Option<ParsedDocMeta> {

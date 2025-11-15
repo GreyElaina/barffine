@@ -13,7 +13,7 @@ use serde::Serialize;
 use socketioxide::SocketIo;
 use tokio::{
     spawn,
-    sync::{Mutex, broadcast},
+    sync::broadcast,
     time::{Duration, sleep},
 };
 use tracing::{info, warn};
@@ -97,11 +97,12 @@ pub struct AppState {
     pub doc_token_signer: Arc<DocTokenSigner>,
     pub server_path: Option<String>,
     pub base_url: String,
-    pub socket_io: Arc<OnceCell<SocketIo>>,
+    pub socket_io: Arc<OnceCell<Arc<SocketIo>>>,
     pub socket_metrics: Arc<SocketMetrics>,
     pub workspace_embedding_events: broadcast::Sender<WorkspaceEmbeddingEvent>,
     pub oauth: Arc<OAuthService>,
     pub request_deduper: Arc<SocketRequestDeduper>,
+    pub socket_runtime: Arc<SocketRuntimeState>,
 }
 
 #[derive(Clone, Default)]
@@ -118,13 +119,89 @@ pub(crate) struct WorkspaceEmbeddingFileRecord {
 #[derive(Clone)]
 pub(crate) struct SyncHub {
     channels: Arc<DashMap<String, broadcast::Sender<SyncEvent>>>,
-    socket_io: Arc<OnceCell<SocketIo>>,
+    socket_io: Arc<OnceCell<Arc<SocketIo>>>,
     socket_metrics: Arc<SocketMetrics>,
+}
+
+#[derive(Clone)]
+pub struct SocketRuntimeState {
+    pub doc_cache: Arc<DocCache>,
+    pub doc_sessions: Arc<DocSessionManager>,
+    pub sync_hub: SyncHub,
+    pub request_deduper: Arc<SocketRequestDeduper>,
+    pub socket_metrics: Arc<SocketMetrics>,
+    pub workspace_embedding_files:
+        Arc<DashMap<String, HashMap<String, WorkspaceEmbeddingFileRecord>>>,
+    pub workspace_embedding_ignored_docs: Arc<DashMap<String, HashSet<String>>>,
+    pub workspace_embedding_events: broadcast::Sender<WorkspaceEmbeddingEvent>,
+    pub user_service: Arc<UserService>,
+    pub workspace_service: Arc<WorkspaceService>,
+    pub doc_access_service: Arc<DocAccessService>,
+    pub workspace_store: WorkspaceStore,
+    pub document_store: DocumentStore,
+    pub user_doc_store: UserDocStore,
+}
+
+impl SocketRuntimeState {
+    pub fn new(
+        doc_cache: Arc<DocCache>,
+        doc_sessions: Arc<DocSessionManager>,
+        sync_hub: SyncHub,
+        request_deduper: Arc<SocketRequestDeduper>,
+        socket_metrics: Arc<SocketMetrics>,
+        workspace_embedding_files: Arc<
+            DashMap<String, HashMap<String, WorkspaceEmbeddingFileRecord>>,
+        >,
+        workspace_embedding_ignored_docs: Arc<DashMap<String, HashSet<String>>>,
+        workspace_embedding_events: broadcast::Sender<WorkspaceEmbeddingEvent>,
+        user_service: Arc<UserService>,
+        workspace_service: Arc<WorkspaceService>,
+        doc_access_service: Arc<DocAccessService>,
+        workspace_store: WorkspaceStore,
+        document_store: DocumentStore,
+        user_doc_store: UserDocStore,
+    ) -> Self {
+        Self {
+            doc_cache,
+            doc_sessions,
+            sync_hub,
+            request_deduper,
+            socket_metrics,
+            workspace_embedding_files,
+            workspace_embedding_ignored_docs,
+            workspace_embedding_events,
+            user_service,
+            workspace_service,
+            doc_access_service,
+            workspace_store,
+            document_store,
+            user_doc_store,
+        }
+    }
+
+    pub fn emit_workspace_embedding(&self, workspace_id: &str, enable_doc_embedding: Option<bool>) {
+        let event = WorkspaceEmbeddingEvent {
+            workspace_id: workspace_id.to_string(),
+            enable_doc_embedding,
+        };
+
+        if let Err(err) = self.workspace_embedding_events.send(event) {
+            warn!(
+                %workspace_id,
+                ?err,
+                "failed to emit workspace embedding event"
+            );
+        }
+    }
+
+    pub fn subscribe_workspace_embedding(&self) -> broadcast::Receiver<WorkspaceEmbeddingEvent> {
+        self.workspace_embedding_events.subscribe()
+    }
 }
 
 impl SyncHub {
     pub(crate) fn new(
-        socket_io: Arc<OnceCell<SocketIo>>,
+        socket_io: Arc<OnceCell<Arc<SocketIo>>>,
         socket_metrics: Arc<SocketMetrics>,
     ) -> Self {
         Self {
@@ -267,30 +344,31 @@ impl DocSessionKey {
 
 #[derive(Clone)]
 pub(crate) struct DocSessionManager {
-    sockets: Arc<Mutex<HashMap<String, HashSet<DocSessionKey>>>>,
+    sockets: Arc<DashMap<String, HashSet<DocSessionKey>>>,
     doc_counts: Arc<DashMap<DocSessionKey, usize>>,
 }
 
 impl Default for DocSessionManager {
     fn default() -> Self {
         Self {
-            sockets: Arc::new(Mutex::new(HashMap::new())),
+            sockets: Arc::new(DashMap::new()),
             doc_counts: Arc::new(DashMap::new()),
         }
     }
 }
 
 impl DocSessionManager {
-    pub(crate) async fn register(&self, socket_id: &str, key: DocSessionKey) -> bool {
-        let mut guard = self.sockets.lock().await;
-        let entry = guard
+    pub(crate) fn register(&self, socket_id: &str, key: DocSessionKey) -> bool {
+        let mut entry = self
+            .sockets
             .entry(socket_id.to_string())
             .or_insert_with(HashSet::new);
-        if !entry.insert(key.clone()) {
+        let inserted = entry.insert(key.clone());
+        drop(entry);
+        if !inserted {
             return false;
         }
 
-        drop(guard);
         match self.doc_counts.entry(key) {
             Entry::Occupied(mut occ) => {
                 *occ.get_mut() += 1;
@@ -303,19 +381,18 @@ impl DocSessionManager {
         }
     }
 
-    pub(crate) async fn remove_by_space(
+    pub(crate) fn remove_by_space(
         &self,
         socket_id: &str,
         space_type: SpaceType,
         space_id: &str,
     ) -> Vec<DocSessionKey> {
-        let mut guard = self.sockets.lock().await;
-        let Some(set) = guard.get_mut(socket_id) else {
+        let Some(mut entry) = self.sockets.get_mut(socket_id) else {
             return Vec::new();
         };
 
         let mut removed = Vec::new();
-        set.retain(|key| {
+        entry.retain(|key| {
             let keep = key.space_type != space_type || key.space_id != space_id;
             if !keep {
                 removed.push(key.clone());
@@ -323,45 +400,38 @@ impl DocSessionManager {
             keep
         });
 
-        if set.is_empty() {
-            guard.remove(socket_id);
+        if entry.is_empty() {
+            drop(entry);
+            self.sockets.remove(socket_id);
+        } else {
+            drop(entry);
         }
 
-        drop(guard);
         self.process_removed(removed)
     }
 
-    pub(crate) async fn remove_all(&self, socket_id: &str) -> Vec<DocSessionKey> {
-        let mut guard = self.sockets.lock().await;
-        let removed = guard
+    pub(crate) fn remove_all(&self, socket_id: &str) -> Vec<DocSessionKey> {
+        let removed = self
+            .sockets
             .remove(socket_id)
-            .map(|set| set.into_iter().collect::<Vec<_>>())
+            .map(|(_, set)| set.into_iter().collect::<Vec<_>>())
             .unwrap_or_default();
-        drop(guard);
         self.process_removed(removed)
     }
 
-    pub(crate) async fn remove_doc(
-        &self,
-        space_type: SpaceType,
-        space_id: &str,
-        doc_id: &str,
-    ) -> bool {
+    pub(crate) fn remove_doc(&self, space_type: SpaceType, space_id: &str, doc_id: &str) -> bool {
         let target = DocSessionKey::new(space_type, space_id.to_string(), doc_id.to_string());
-        let mut guard = self.sockets.lock().await;
         let mut empty_sockets = Vec::new();
 
-        for (socket_id, set) in guard.iter_mut() {
-            if set.remove(&target) && set.is_empty() {
-                empty_sockets.push(socket_id.clone());
+        for mut entry in self.sockets.iter_mut() {
+            if entry.value_mut().remove(&target) && entry.value().is_empty() {
+                empty_sockets.push(entry.key().clone());
             }
         }
 
         for socket_id in empty_sockets {
-            guard.remove(&socket_id);
+            self.sockets.remove(&socket_id);
         }
-
-        drop(guard);
         self.doc_counts.remove(&target).is_some()
     }
 
@@ -402,29 +472,22 @@ impl DocSessionManager {
 }
 
 impl AppState {
+    pub fn runtime(&self) -> Arc<SocketRuntimeState> {
+        self.socket_runtime.clone()
+    }
     pub(crate) fn emit_workspace_embedding(
         &self,
         workspace_id: &str,
         enable_doc_embedding: Option<bool>,
     ) {
-        let event = WorkspaceEmbeddingEvent {
-            workspace_id: workspace_id.to_string(),
-            enable_doc_embedding,
-        };
-
-        if let Err(err) = self.workspace_embedding_events.send(event) {
-            warn!(
-                %workspace_id,
-                ?err,
-                "failed to emit workspace embedding event"
-            );
-        }
+        self.socket_runtime
+            .emit_workspace_embedding(workspace_id, enable_doc_embedding);
     }
 
     pub(crate) fn subscribe_workspace_embedding(
         &self,
     ) -> broadcast::Receiver<WorkspaceEmbeddingEvent> {
-        self.workspace_embedding_events.subscribe()
+        self.socket_runtime.subscribe_workspace_embedding()
     }
 }
 
@@ -682,6 +745,22 @@ pub fn build_state_with_config(
     let doc_sessions = Arc::new(DocSessionManager::default());
     let sync_hub = SyncHub::new(socket_io.clone(), socket_metrics.clone());
     let request_deduper = Arc::new(SocketRequestDeduper::default());
+    let socket_runtime = Arc::new(SocketRuntimeState::new(
+        doc_cache.clone(),
+        doc_sessions.clone(),
+        sync_hub.clone(),
+        request_deduper.clone(),
+        socket_metrics.clone(),
+        workspace_embedding_files.clone(),
+        workspace_embedding_ignored_docs.clone(),
+        workspace_embedding_events.clone(),
+        user_service.clone(),
+        workspace_service.clone(),
+        doc_access_service.clone(),
+        workspace_store.clone(),
+        document_store.clone(),
+        user_doc_store.clone(),
+    ));
 
     let state = AppState {
         user_store,
@@ -714,6 +793,7 @@ pub fn build_state_with_config(
         workspace_embedding_events,
         oauth,
         request_deduper,
+        socket_runtime,
     };
 
     spawn_background_tasks(&state);
