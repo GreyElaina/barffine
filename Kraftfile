@@ -2,3 +2,5 @@ spec: v0.6
 runtime: base:latest
 rootfs: ./Dockerfile
 cmd: ["/usr/local/bin/barffine"]
+targets:
+  - qemu/x86_64
