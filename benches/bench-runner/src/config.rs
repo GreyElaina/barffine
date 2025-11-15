@@ -198,7 +198,7 @@ impl ScenarioSpec {
                 ],
             },
             ScenarioKind::WriteHeavy => ScenarioSpec {
-                concurrency: 32,
+                concurrency: 64,
                 think_time_ms: 100,
                 duration_secs: Some(20),
                 operations: vec![

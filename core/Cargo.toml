@@ -24,3 +24,8 @@ parking_lot.workspace = true
 [dev-dependencies]
 tokio.workspace = true
 tempfile = "3"
+criterion = "0.7"
+
+[[bench]]
+name = "doc_engine"
+harness = false

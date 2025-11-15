@@ -24,6 +24,13 @@ pub struct UserDocumentSnapshot {
 }
 
 #[derive(Clone)]
+pub struct UserDocCompactionJob {
+    pub user_id: String,
+    pub doc_id: String,
+    pub source: UserDocCompactionSource,
+}
+
+#[derive(Clone)]
 pub struct UserDocStore {
     repo: UserDocRepositoryRef,
     doc_logs: DocUpdateLogReaderRef,
@@ -183,47 +190,12 @@ impl UserDocStore {
     }
 
     pub async fn compact_doc(&self, user_id: &str, doc_id: &str) -> Result<()> {
-        let Some(source) = self.repo.load_compaction_source(user_id, doc_id).await? else {
+        let Some(job) = self.prepare_compaction_job(user_id, doc_id).await? else {
             return Ok(());
         };
 
-        if source.logs.is_empty() {
-            return Ok(());
-        }
-
-        let UserDocCompactionSource {
-            base_snapshot,
-            logs,
-            doc_updated_at: _,
-        } = source;
-
-        let updates = logs
-            .iter()
-            .map(|log| log.update.clone())
-            .collect::<Vec<_>>();
-        let SnapshotComputation {
-            snapshot: merged_snapshot,
-            meta,
-            mut updated_at,
-            ..
-        } = build_snapshot_from_updates(doc_id, Some(&base_snapshot), &updates, Self::now_millis)
-            .context("merge userspace doc updates during compaction")?;
-        if meta.updated_at.is_none() {
-            if let Some(last) = logs.last() {
-                updated_at = last.created_at;
-            }
-        }
-
-        self.repo
-            .apply_compaction_result(UserDocCompactionApplyParams {
-                user_id: user_id.to_owned(),
-                doc_id: doc_id.to_owned(),
-                snapshot: merged_snapshot,
-                updated_at,
-                editor_id: meta.updater_id,
-                last_log_id: logs.last().map(|log| log.id),
-            })
-            .await
+        let params = Self::compute_compaction_plan(job)?;
+        self.apply_compaction_plan(params).await
     }
 
     pub async fn delete_doc(&self, user_id: &str, doc_id: &str) -> Result<bool> {
@@ -259,5 +231,66 @@ impl UserDocStore {
         limit: i64,
     ) -> Result<Vec<(String, String)>> {
         self.repo.docs_requiring_compaction(threshold, limit).await
+    }
+
+    pub async fn prepare_compaction_job(
+        &self,
+        user_id: &str,
+        doc_id: &str,
+    ) -> Result<Option<UserDocCompactionJob>> {
+        let Some(source) = self.repo.load_compaction_source(user_id, doc_id).await? else {
+            return Ok(None);
+        };
+
+        if source.logs.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(UserDocCompactionJob {
+            user_id: user_id.to_owned(),
+            doc_id: doc_id.to_owned(),
+            source,
+        }))
+    }
+
+    pub fn compute_compaction_plan(
+        job: UserDocCompactionJob,
+    ) -> Result<UserDocCompactionApplyParams> {
+        let updates = job
+            .source
+            .logs
+            .iter()
+            .map(|log| log.update.clone())
+            .collect::<Vec<_>>();
+        let SnapshotComputation {
+            snapshot: merged_snapshot,
+            meta,
+            mut updated_at,
+            ..
+        } = build_snapshot_from_updates(
+            &job.doc_id,
+            Some(&job.source.base_snapshot),
+            &updates,
+            Self::now_millis,
+        )
+        .context("merge userspace doc updates during compaction")?;
+        if meta.updated_at.is_none() {
+            if let Some(last) = job.source.logs.last() {
+                updated_at = last.created_at;
+            }
+        }
+
+        Ok(UserDocCompactionApplyParams {
+            user_id: job.user_id,
+            doc_id: job.doc_id,
+            snapshot: merged_snapshot,
+            updated_at,
+            editor_id: meta.updater_id,
+            last_log_id: job.source.logs.last().map(|log| log.id),
+        })
+    }
+
+    pub async fn apply_compaction_plan(&self, params: UserDocCompactionApplyParams) -> Result<()> {
+        self.repo.apply_compaction_result(params).await
     }
 }

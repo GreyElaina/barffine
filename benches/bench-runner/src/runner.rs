@@ -61,6 +61,10 @@ pub struct ResourceSummary {
     pub rss_p95_mb: f64,
     pub virtual_peak_mb: f64,
     pub cpu_avg_percent: f64,
+    pub io_read_total_mb: f64,
+    pub io_write_total_mb: f64,
+    pub io_read_p95_mb_s: f64,
+    pub io_write_p95_mb_s: f64,
 }
 
 pub async fn run_scenario(client: Arc<BenchClient>, options: RunOptions) -> Result<RunArtifacts> {
@@ -187,12 +191,18 @@ fn compute_resource_summary(samples: &[ProcessSample]) -> ResourceSummary {
             / samples.len() as f64
     };
 
+    let (read_rates, write_rates, total_read, total_write) = io_stats(samples);
+
     ResourceSummary {
         sample_count: samples.len(),
         rss_peak_mb: bytes_to_mb(rss_peak),
         rss_p95_mb: bytes_to_mb(rss_p95),
         virtual_peak_mb: bytes_to_mb(virtual_peak),
         cpu_avg_percent: cpu_avg,
+        io_read_total_mb: bytes_to_mb(total_read),
+        io_write_total_mb: bytes_to_mb(total_write),
+        io_read_p95_mb_s: percentile_f64(&read_rates, 95.0),
+        io_write_p95_mb_s: percentile_f64(&write_rates, 95.0),
     }
 }
 
@@ -206,6 +216,50 @@ fn percentile_u64(values: &[u64], percentile: f64) -> u64 {
     }
     let rank = ((percentile / 100.0) * (values.len() as f64 - 1.0)).round() as usize;
     values[rank]
+}
+
+fn percentile_f64(values: &[f64], percentile: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let rank = ((percentile / 100.0) * (sorted.len() as f64 - 1.0)).round() as usize;
+    sorted[rank]
+}
+
+fn io_stats(samples: &[ProcessSample]) -> (Vec<f64>, Vec<f64>, u64, u64) {
+    if samples.len() < 2 {
+        return (Vec::new(), Vec::new(), 0, 0);
+    }
+    let mut read_rates = Vec::with_capacity(samples.len());
+    let mut write_rates = Vec::with_capacity(samples.len());
+    let first = samples.first().unwrap();
+    let last = samples.last().unwrap();
+    let total_read = last.total_read_bytes.saturating_sub(first.total_read_bytes);
+    let total_write = last
+        .total_written_bytes
+        .saturating_sub(first.total_written_bytes);
+    for window in samples.windows(2) {
+        if let [prev, curr] = window {
+            let dt_ms = curr.timestamp_ms.saturating_sub(prev.timestamp_ms).max(1);
+            let read_delta = curr.total_read_bytes.saturating_sub(prev.total_read_bytes);
+            let write_delta = curr
+                .total_written_bytes
+                .saturating_sub(prev.total_written_bytes);
+            read_rates.push(bytes_per_second(read_delta, dt_ms));
+            write_rates.push(bytes_per_second(write_delta, dt_ms));
+        }
+    }
+    (read_rates, write_rates, total_read, total_write)
+}
+
+fn bytes_per_second(delta_bytes: u64, delta_ms: u64) -> f64 {
+    if delta_ms == 0 {
+        return 0.0;
+    }
+    let per_second = delta_bytes as f64 * 1000.0 / delta_ms as f64;
+    per_second / (1024.0 * 1024.0)
 }
 
 struct ProgressReporter {

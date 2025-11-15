@@ -10,6 +10,8 @@ pub struct ProcessSample {
     pub rss_bytes: u64,
     pub virtual_bytes: u64,
     pub cpu_percent: f32,
+    pub total_read_bytes: u64,
+    pub total_written_bytes: u64,
 }
 
 pub struct SamplerHandle {
@@ -33,11 +35,14 @@ pub fn spawn(pid: i32, interval: Duration, start: Instant) -> SamplerHandle {
                 _ = ticker.tick() => {
                     sys.refresh_process(pid);
                     if let Some(process) = sys.process(pid) {
+                        let disk = process.disk_usage();
                         samples.push(ProcessSample {
                             timestamp_ms: start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
                             rss_bytes: process.memory() * 1024,
                             virtual_bytes: process.virtual_memory() * 1024,
                             cpu_percent: process.cpu_usage(),
+                            total_read_bytes: disk.total_read_bytes,
+                            total_written_bytes: disk.total_written_bytes,
                         });
                     }
                 }

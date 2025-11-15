@@ -7,13 +7,17 @@ use std::sync::{
 };
 
 use anyhow::Result as AnyResult;
+use crossbeam_channel::unbounded;
 use dashmap::{DashMap, mapref::entry::Entry};
+use futures_util::stream::{self, StreamExt};
 use once_cell::sync::OnceCell;
+use rayon::prelude::*;
 use serde::Serialize;
 use socketioxide::SocketIo;
 use tokio::{
     spawn,
     sync::broadcast,
+    task::spawn_blocking,
     time::{Duration, sleep},
 };
 use tracing::{info, warn};
@@ -1000,6 +1004,8 @@ fn start_doc_cache_reaper(doc_cache: Arc<DocCache>) {
 
 const DOC_COMPACTION_INTERVAL: Duration = Duration::from_secs(60);
 const DOC_COMPACTION_BATCH_LIMIT: i64 = 64;
+const DOC_COMPACTION_FETCH_CONCURRENCY: usize = 8;
+const DOC_COMPACTION_APPLY_CONCURRENCY: usize = 8;
 const DOC_CACHE_REAPER_INTERVAL: Duration = Duration::from_secs(120);
 const DOC_CACHE_IDLE_AFTER: Duration = Duration::from_secs(300);
 
@@ -1020,16 +1026,80 @@ async fn compact_workspace_docs(document_store: &DocumentStore) -> AnyResult<()>
         .docs_requiring_compaction(DOC_UPDATE_LOG_LIMIT, DOC_COMPACTION_BATCH_LIMIT)
         .await?;
 
-    for (space_id, doc_id) in targets {
-        if let Err(err) = document_store.compact_doc(&space_id, &doc_id).await {
-            warn!(
-                workspace_id = %space_id,
-                doc_id = %doc_id,
-                error = %err,
-                "failed to compact workspace document",
-            );
-        }
+    if targets.is_empty() {
+        return Ok(());
     }
+
+    let (job_tx, job_rx) = unbounded();
+
+    stream::iter(targets.into_iter())
+        .for_each_concurrent(
+            Some(DOC_COMPACTION_FETCH_CONCURRENCY),
+            |(space_id, doc_id)| {
+                let job_tx = job_tx.clone();
+                let store = document_store.clone();
+                async move {
+                    match store.prepare_compaction_job(&space_id, &doc_id).await {
+                        Ok(Some(job)) => {
+                            let _ = job_tx.send(job);
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            warn!(
+                                workspace_id = %space_id,
+                                doc_id = %doc_id,
+                                error = %err,
+                                "failed to prepare workspace doc compaction job",
+                            );
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+    drop(job_tx);
+
+    let plans = spawn_blocking(move || {
+        job_rx
+            .into_iter()
+            .par_bridge()
+            .filter_map(|job| {
+                let workspace_id = job.workspace_id.clone();
+                let doc_id = job.doc_id.clone();
+                match DocumentStore::compute_compaction_plan(job) {
+                    Ok(plan) => Some(plan),
+                    Err(err) => {
+                        warn!(
+                            workspace_id = %workspace_id,
+                            doc_id = %doc_id,
+                            error = %err,
+                            "failed to merge workspace doc logs",
+                        );
+                        None
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+    })
+    .await?;
+
+    stream::iter(plans.into_iter())
+        .for_each_concurrent(Some(DOC_COMPACTION_APPLY_CONCURRENCY), |plan| {
+            let store = document_store.clone();
+            async move {
+                let workspace_id = plan.workspace_id.clone();
+                let doc_id = plan.doc_id.clone();
+                if let Err(err) = store.apply_compaction_plan(plan).await {
+                    warn!(
+                        workspace_id = %workspace_id,
+                        doc_id = %doc_id,
+                        error = %err,
+                        "failed to compact workspace document",
+                    );
+                }
+            }
+        })
+        .await;
 
     Ok(())
 }
@@ -1039,16 +1109,80 @@ async fn compact_user_docs(user_doc_store: &UserDocStore) -> AnyResult<()> {
         .docs_requiring_compaction(DOC_UPDATE_LOG_LIMIT, DOC_COMPACTION_BATCH_LIMIT)
         .await?;
 
-    for (user_id, doc_id) in targets {
-        if let Err(err) = user_doc_store.compact_doc(&user_id, &doc_id).await {
-            warn!(
-                user_id = %user_id,
-                doc_id = %doc_id,
-                error = %err,
-                "failed to compact userspace document",
-            );
-        }
+    if targets.is_empty() {
+        return Ok(());
     }
+
+    let (job_tx, job_rx) = unbounded();
+
+    stream::iter(targets.into_iter())
+        .for_each_concurrent(
+            Some(DOC_COMPACTION_FETCH_CONCURRENCY),
+            |(user_id, doc_id)| {
+                let store = user_doc_store.clone();
+                let job_tx = job_tx.clone();
+                async move {
+                    match store.prepare_compaction_job(&user_id, &doc_id).await {
+                        Ok(Some(job)) => {
+                            let _ = job_tx.send(job);
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            warn!(
+                                user_id = %user_id,
+                                doc_id = %doc_id,
+                                error = %err,
+                                "failed to prepare userspace compaction job",
+                            );
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+    drop(job_tx);
+
+    let plans = spawn_blocking(move || {
+        job_rx
+            .into_iter()
+            .par_bridge()
+            .filter_map(|job| {
+                let user_id = job.user_id.clone();
+                let doc_id = job.doc_id.clone();
+                match UserDocStore::compute_compaction_plan(job) {
+                    Ok(plan) => Some(plan),
+                    Err(err) => {
+                        warn!(
+                            user_id = %user_id,
+                            doc_id = %doc_id,
+                            error = %err,
+                            "failed to merge userspace doc logs",
+                        );
+                        None
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+    })
+    .await?;
+
+    stream::iter(plans.into_iter())
+        .for_each_concurrent(Some(DOC_COMPACTION_APPLY_CONCURRENCY), |plan| {
+            let store = user_doc_store.clone();
+            async move {
+                let user_id = plan.user_id.clone();
+                let doc_id = plan.doc_id.clone();
+                if let Err(err) = store.apply_compaction_plan(plan).await {
+                    warn!(
+                        user_id = %user_id,
+                        doc_id = %doc_id,
+                        error = %err,
+                        "failed to compact userspace document",
+                    );
+                }
+            }
+        })
+        .await;
 
     Ok(())
 }

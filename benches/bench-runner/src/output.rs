@@ -8,6 +8,7 @@ use chrono::Utc;
 use serde::Serialize;
 
 use crate::runner::{LatencyStats, ResourceSummary, RunArtifacts, RunSummary};
+use crate::sampler::ProcessSample;
 
 pub fn persist_results(base_dir: &Path, artifacts: &RunArtifacts) -> Result<PathBuf> {
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
@@ -30,15 +31,42 @@ fn write_samples(path: &Path, artifacts: &RunArtifacts) -> Result<()> {
     if artifacts.samples.is_empty() {
         return Ok(());
     }
-    let mut writer = String::from("timestamp_ms,rss_mb,virtual_mb,cpu_percent\n");
+    let mut writer = String::from(
+        "timestamp_ms,rss_mb,virtual_mb,cpu_percent,read_total_mb,write_total_mb,read_mb_per_s,write_mb_per_s\n",
+    );
+    let mut prev: Option<&ProcessSample> = None;
     for sample in &artifacts.samples {
+        let (read_rate, write_rate) = if let Some(prev) = prev {
+            let dt_ms = sample.timestamp_ms.saturating_sub(prev.timestamp_ms).max(1);
+            (
+                bytes_per_second(
+                    sample
+                        .total_read_bytes
+                        .saturating_sub(prev.total_read_bytes),
+                    dt_ms,
+                ),
+                bytes_per_second(
+                    sample
+                        .total_written_bytes
+                        .saturating_sub(prev.total_written_bytes),
+                    dt_ms,
+                ),
+            )
+        } else {
+            (0.0, 0.0)
+        };
         writer.push_str(&format!(
-            "{},{:.2},{:.2},{:.2}\n",
+            "{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}\n",
             sample.timestamp_ms,
             sample.rss_bytes as f64 / (1024.0 * 1024.0),
             sample.virtual_bytes as f64 / (1024.0 * 1024.0),
             sample.cpu_percent,
+            sample.total_read_bytes as f64 / (1024.0 * 1024.0),
+            sample.total_written_bytes as f64 / (1024.0 * 1024.0),
+            read_rate,
+            write_rate,
         ));
+        prev = Some(sample);
     }
     fs::write(path, writer).with_context(|| format!("failed to write memory samples {path:?}"))?;
     Ok(())
@@ -72,6 +100,10 @@ struct ResourceRecord {
     rss_p95_mb: f64,
     virtual_peak_mb: f64,
     cpu_avg_percent: f64,
+    io_read_total_mb: f64,
+    io_write_total_mb: f64,
+    io_read_p95_mb_s: f64,
+    io_write_p95_mb_s: f64,
 }
 
 impl From<&RunSummary> for SummaryRecord {
@@ -109,6 +141,18 @@ impl From<&ResourceSummary> for ResourceRecord {
             rss_p95_mb: res.rss_p95_mb,
             virtual_peak_mb: res.virtual_peak_mb,
             cpu_avg_percent: res.cpu_avg_percent,
+            io_read_total_mb: res.io_read_total_mb,
+            io_write_total_mb: res.io_write_total_mb,
+            io_read_p95_mb_s: res.io_read_p95_mb_s,
+            io_write_p95_mb_s: res.io_write_p95_mb_s,
         }
     }
+}
+
+fn bytes_per_second(delta_bytes: u64, delta_ms: u64) -> f64 {
+    if delta_ms == 0 {
+        return 0.0;
+    }
+    let per_second = delta_bytes as f64 * 1000.0 / delta_ms as f64;
+    per_second / (1024.0 * 1024.0)
 }

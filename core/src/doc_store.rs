@@ -12,8 +12,8 @@ use crate::{
     db::{
         Database,
         doc_repo::{
-            AppendDocUpdatesParams, CompactionApplyParams, DocRepositoryRef, DocumentListOrder,
-            DuplicateDocParams, HistorySnapshotInsert, InsertDocRecordParams,
+            AppendDocUpdatesParams, CompactionApplyParams, CompactionSource, DocRepositoryRef,
+            DocumentListOrder, DuplicateDocParams, HistorySnapshotInsert, InsertDocRecordParams,
             MetadataBackfillParams, ReplaceDocSnapshotParams, SnapshotUpsertParams,
         },
     },
@@ -106,6 +106,13 @@ pub struct UserShareTokenRecord {
 pub struct DocumentCursor {
     pub timestamp: i64,
     pub id: String,
+}
+
+#[derive(Clone)]
+pub struct DocumentCompactionJob {
+    pub workspace_id: String,
+    pub doc_id: String,
+    pub source: CompactionSource,
 }
 
 #[derive(Clone)]
@@ -343,48 +350,11 @@ impl DocumentStore {
     }
 
     pub async fn compact_doc(&self, workspace_id: &str, doc_id: &str) -> Result<()> {
-        let Some(source) = self
-            .doc_repo
-            .load_compaction_source(workspace_id, doc_id)
-            .await?
-        else {
+        let Some(job) = self.prepare_compaction_job(workspace_id, doc_id).await? else {
             return Ok(());
         };
-
-        if source.logs.is_empty() {
-            return Ok(());
-        }
-
-        let updates = source
-            .logs
-            .iter()
-            .map(|log| log.update.clone())
-            .collect::<Vec<_>>();
-        let merged_snapshot =
-            DocEngine::apply_updates_to_snapshot(Some(&source.base_snapshot), &updates)
-                .context("merge doc updates during compaction")?;
-        let meta = extract_doc_meta(&merged_snapshot, doc_id);
-        let updated_at = meta
-            .updated_at
-            .or_else(|| source.logs.last().map(|log| log.created_at))
-            .unwrap_or_else(Self::now_millis);
-
-        self.doc_repo
-            .apply_compaction_result(CompactionApplyParams {
-                workspace_id: workspace_id.to_owned(),
-                doc_id: doc_id.to_owned(),
-                snapshot: merged_snapshot,
-                updated_at,
-                title: meta.title,
-                summary: meta.summary,
-                creator_id: meta.creator_id,
-                updater_id: meta.updater_id,
-                last_log_id: source.logs.last().map(|log| log.id),
-                expected_updated_at: source.doc_updated_at,
-            })
-            .await?;
-
-        Ok(())
+        let params = Self::compute_compaction_plan(job)?;
+        self.apply_compaction_plan(params).await
     }
 
     pub async fn ensure_doc_record(
@@ -900,6 +870,64 @@ impl DocumentStore {
         self.doc_logs
             .fetch_logs(SPACE_TYPE_WORKSPACE, workspace_id, doc_id)
             .await
+    }
+
+    pub async fn prepare_compaction_job(
+        &self,
+        workspace_id: &str,
+        doc_id: &str,
+    ) -> Result<Option<DocumentCompactionJob>> {
+        let Some(source) = self
+            .doc_repo
+            .load_compaction_source(workspace_id, doc_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        if source.logs.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(DocumentCompactionJob {
+            workspace_id: workspace_id.to_owned(),
+            doc_id: doc_id.to_owned(),
+            source,
+        }))
+    }
+
+    pub fn compute_compaction_plan(job: DocumentCompactionJob) -> Result<CompactionApplyParams> {
+        let updates = job
+            .source
+            .logs
+            .iter()
+            .map(|log| log.update.clone())
+            .collect::<Vec<_>>();
+        let merged_snapshot =
+            DocEngine::apply_updates_to_snapshot(Some(&job.source.base_snapshot), &updates)
+                .context("merge doc updates during compaction")?;
+        let meta = extract_doc_meta(&merged_snapshot, &job.doc_id);
+        let updated_at = meta
+            .updated_at
+            .or_else(|| job.source.logs.last().map(|log| log.created_at))
+            .unwrap_or_else(Self::now_millis);
+
+        Ok(CompactionApplyParams {
+            workspace_id: job.workspace_id,
+            doc_id: job.doc_id,
+            snapshot: merged_snapshot,
+            updated_at,
+            title: meta.title,
+            summary: meta.summary,
+            creator_id: meta.creator_id,
+            updater_id: meta.updater_id,
+            last_log_id: job.source.logs.last().map(|log| log.id),
+            expected_updated_at: job.source.doc_updated_at,
+        })
+    }
+
+    pub async fn apply_compaction_plan(&self, params: CompactionApplyParams) -> Result<()> {
+        self.doc_repo.apply_compaction_result(params).await
     }
 }
 
