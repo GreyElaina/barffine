@@ -4,3 +4,4 @@ rootfs: ./Dockerfile
 cmd: ["/usr/local/bin/barffine"]
 targets:
   - qemu/x86_64
+  - qemu/arm64

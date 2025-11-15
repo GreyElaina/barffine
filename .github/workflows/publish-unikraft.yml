@@ -26,7 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.image.outputs.name }}
-      tags: ${{ steps.tags.outputs.list }}
+      primary: ${{ steps.tags.outputs.primary }}
+      extra: ${{ steps.tags.outputs.extras }}
     steps:
       - name: Lowercase image name
         id: image
@@ -53,21 +54,20 @@ jobs:
           tags = [tag.strip() for tag in raw_tags.splitlines() if tag.strip()]
           if not tags:
               tags = [os.environ['DEFAULT_TAG']]
-          print(f"list={json.dumps(tags)}")
+          primary = next((t for t in tags if ':sha-' in t), tags[0])
+          extras = [t for t in tags if t != primary]
+          print(f"primary={primary}")
+          print(f"extras={json.dumps(extras)}")
           PY
         env:
           RAW_TAGS: ${{ steps.meta.outputs.tags }}
           DEFAULT_TAG: ${{ steps.image.outputs.name }}:${{ github.sha }}
 
   build-and-push:
-    name: Build and push (${{ matrix.tag }})
+    name: Build and push
     needs: metadata
-    if: needs.metadata.outputs.tags != ''
+    if: needs.metadata.outputs.primary != ''
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        tag: ${{ fromJson(needs.metadata.outputs.tags) }}
 
     steps:
       - name: Checkout repository
@@ -80,6 +80,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build and push unikernel image
         uses: unikraft/kraftkit@staging
         with:
@@ -88,5 +91,29 @@ jobs:
           arch: ${{ env.KRAFT_ARCH }}
           plat: ${{ env.KRAFT_PLAT }}
           name: barffine-${{ github.sha }}
-          output: oci://${{ matrix.tag }}
+          output: oci://${{ needs.metadata.outputs.primary }}
           push: true
+          before: |
+            set -euo pipefail
+            for attempt in 1 2 3; do
+              echo "Prefetching kraft packages (attempt ${attempt})"
+              if kraft pkg pull --plat "${KRAFT_PLAT}" --arch "${KRAFT_ARCH}"; then
+                break
+              fi
+              if [ "${attempt}" -eq 3 ]; then
+                echo "Failed to prefetch packages after ${attempt} attempts" >&2
+                exit 1
+              fi
+              sleep $((attempt * 5))
+            done
+
+      - name: Retag additional references
+        if: ${{ needs.metadata.outputs.extra != '[]' }}
+        env:
+          PRIMARY_TAG: ${{ needs.metadata.outputs.primary }}
+          EXTRA_TAGS: ${{ needs.metadata.outputs.extra }}
+        run: |
+          echo "${EXTRA_TAGS}" | jq -r '.[]' | while read TAG; do
+            [ -z "${TAG}" ] && continue
+            docker buildx imagetools create --tag "${TAG}" "${PRIMARY_TAG}"
+          done

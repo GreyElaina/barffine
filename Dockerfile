@@ -41,8 +41,7 @@ COPY . .
 RUN cargo fetch --locked
 
 # Build the server binary
-RUN cargo build --locked --release -p barffine-server \
- && strip target/release/barffine-server
+RUN cargo build --locked --release -p barffine-server
 
 # Prepare runtime filesystem (owned by nonroot UID 65532 used by distroless images)
 RUN mkdir -p /runtime/app/data \
