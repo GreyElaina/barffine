@@ -4,7 +4,10 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use rocksdb::{Direction, IteratorMode, WriteBatch};
 
-use crate::doc_roles::{DocumentRoleCursor, DocumentRoleRecord, backend::DocRoleBackend};
+use crate::{
+    doc_roles::{DocumentRoleCursor, DocumentRoleRecord, backend::DocRoleBackend},
+    ids::{DocId, UserId, WorkspaceId},
+};
 
 use super::doc_data::DocDataStore;
 
@@ -51,7 +54,11 @@ impl RocksDocRoleBackend {
     }
 
     fn put_role(&self, record: &DocumentRoleRecord, batch: Option<&mut WriteBatch>) -> Result<()> {
-        let key = Self::role_key(&record.workspace_id, &record.doc_id, &record.user_id);
+        let key = Self::role_key(
+            record.workspace_id.as_str(),
+            record.doc_id.as_str(),
+            record.user_id.as_str(),
+        );
         let value = Self::encode_record(record)?;
         if let Some(batch) = batch {
             batch.put_cf(self.store.doc_roles_cf(), key.as_bytes(), &value);
@@ -175,7 +182,8 @@ impl DocRoleBackend for RocksDocRoleBackend {
 
         let mut batch = WriteBatch::default();
         for role in roles {
-            let key = Self::role_key(&role.workspace_id, &role.doc_id, &role.user_id);
+            let key =
+                Self::role_key(role.workspace_id.as_str(), role.doc_id.as_str(), role.user_id.as_str());
             let value = Self::encode_record(role)?;
             batch.put_cf(self.store.doc_roles_cf(), key.as_bytes(), &value);
         }
@@ -195,9 +203,9 @@ impl DocRoleBackend for RocksDocRoleBackend {
         created_at: i64,
     ) -> Result<()> {
         let record = DocumentRoleRecord {
-            workspace_id: workspace_id.to_owned(),
-            doc_id: doc_id.to_owned(),
-            user_id: user_id.to_owned(),
+            workspace_id: WorkspaceId::from(workspace_id.to_owned()),
+            doc_id: DocId::from(doc_id.to_owned()),
+            user_id: UserId::from(user_id.to_owned()),
             role: role.to_owned(),
             created_at,
         };
@@ -246,16 +254,16 @@ mod tests {
         let (_dir, backend) = create_backend();
         let records = vec![
             DocumentRoleRecord {
-                workspace_id: "ws".into(),
-                doc_id: "doc".into(),
-                user_id: "user-a".into(),
+                workspace_id: WorkspaceId::from("ws"),
+                doc_id: DocId::from("doc"),
+                user_id: UserId::from("user-a"),
                 role: "editor".into(),
                 created_at: 3,
             },
             DocumentRoleRecord {
-                workspace_id: "ws".into(),
-                doc_id: "doc".into(),
-                user_id: "user-b".into(),
+                workspace_id: WorkspaceId::from("ws"),
+                doc_id: DocId::from("doc"),
+                user_id: UserId::from("user-b"),
                 role: "owner".into(),
                 created_at: 5,
             },
@@ -264,12 +272,12 @@ mod tests {
 
         let listed = backend.list_for_doc("ws", "doc").await.unwrap();
         assert_eq!(listed.len(), 2);
-        assert_eq!(listed[0].user_id, "user-b");
-        assert_eq!(listed[1].user_id, "user-a");
+        assert_eq!(listed[0].user_id, UserId::from("user-b"));
+        assert_eq!(listed[1].user_id, UserId::from("user-a"));
 
         let owners = backend.owners_for_doc("ws", "doc").await.unwrap();
         assert_eq!(owners.len(), 1);
-        assert_eq!(owners[0].user_id, "user-b");
+        assert_eq!(owners[0].user_id, UserId::from("user-b"));
     }
 
     #[tokio::test]
@@ -287,8 +295,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.len(), 2);
-        assert_eq!(page[0].user_id, "alice");
-        assert_eq!(page[1].user_id, "bob");
+        assert_eq!(page[0].user_id, UserId::from("alice"));
+        assert_eq!(page[1].user_id, UserId::from("bob"));
 
         let cursor = DocumentRoleCursor {
             created_at: page[1].created_at,
@@ -299,7 +307,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next.len(), 1);
-        assert_eq!(next[0].user_id, "carol");
+        assert_eq!(next[0].user_id, UserId::from("carol"));
     }
 
     #[tokio::test]

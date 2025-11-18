@@ -93,10 +93,16 @@ impl TargetConfig {
     }
 
     pub fn rest_endpoint(&self) -> String {
-        self.rest_endpoint
-            .as_deref()
-            .map(|s| s.to_owned())
-            .unwrap_or_else(|| self.base_url.trim_end_matches('/').to_owned())
+        if let Some(endpoint) = self.rest_endpoint.as_deref() {
+            return endpoint.trim_end_matches('/').to_owned();
+        }
+
+        let base = self.base_url.trim_end_matches('/');
+        if base.ends_with("/api") {
+            base.to_owned()
+        } else {
+            format!("{base}/api")
+        }
     }
 
     pub fn resolve_pid(&self) -> Option<i32> {

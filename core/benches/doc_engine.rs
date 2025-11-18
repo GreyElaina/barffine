@@ -6,7 +6,7 @@ use barffine_core::{
     doc_store::{DocumentCompactionJob, DocumentStore},
     doc_update_log::DocUpdateRecord,
 };
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use yrs::{Doc, ReadTxn, StateVector, Text, Transact};
 
 fn criterion_benchmark(c: &mut Criterion) {

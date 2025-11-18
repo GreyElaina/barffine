@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use barffine_core::{
     doc_store::DocumentMetadata,
     feature::FeatureNamespace,
+    ids::DocId,
     notification::{CommentChangeRecord, CommentCursor},
     workspace,
     workspace::{WorkspaceRecord, WorkspaceStore},
@@ -55,6 +56,12 @@ pub(crate) struct WorkspaceType {
 impl From<WorkspaceRecord> for WorkspaceType {
     fn from(record: WorkspaceRecord) -> Self {
         Self { record }
+    }
+}
+
+impl WorkspaceType {
+    pub(crate) fn id_value(&self) -> String {
+        self.record.id.to_string()
     }
 }
 
@@ -402,7 +409,7 @@ impl InviteUserType {
             email: Some(member.email.clone()),
             email_verified: Some(member.email_verified_at.is_some()),
             has_password: Some(member.has_password),
-            id: ID(member.user_id.clone()),
+            id: ID(member.user_id.to_string()),
             invite_id,
             name: Some(display_name_from_parts(
                 member.name.as_deref(),
@@ -418,7 +425,7 @@ impl InviteUserType {
 #[Object(name = "WorkspaceType")]
 impl WorkspaceType {
     async fn id(&self) -> ID {
-        ID(self.record.id.clone())
+        ID(self.record.id.to_string())
     }
 
     #[graphql(name = "createdAt")]
@@ -677,7 +684,7 @@ impl WorkspaceType {
 
         let workspace_title = WorkspaceService::normalized_workspace_title(&self.record.name);
 
-        let doc_title = if doc_id_str == self.record.id {
+        let doc_title = if doc_id_str == self.record.id.as_str() {
             workspace_title
         } else {
             None
@@ -1103,7 +1110,10 @@ impl WorkspaceType {
             if filtered.len() as i64 >= limit {
                 break;
             }
-            filtered.push(DocHistoryType::from_record(record, self.record.id.clone()));
+            filtered.push(DocHistoryType::from_record(
+                record,
+                self.record.id.to_string(),
+            ));
         }
 
         Ok(filtered)
@@ -1117,7 +1127,7 @@ impl WorkspaceType {
         &self,
         ctx: &Context<'_>,
         docs: Vec<DocumentMetadata>,
-    ) -> GraphQLResult<(Vec<DocumentMetadata>, HashMap<String, DocPermissions>)> {
+    ) -> GraphQLResult<(Vec<DocumentMetadata>, HashMap<DocId, DocPermissions>)> {
         let state = ctx.data::<AppState>()?;
         let request_user = ctx.data_opt::<RequestUser>().cloned();
 
@@ -1229,7 +1239,10 @@ impl WorkspaceType {
         offset: i64,
         total_count: i64,
     ) -> GraphQLResult<PaginatedDocType> {
-        let (mut filtered, permissions_cache) = self.filter_visible_doc_metadata(ctx, docs).await?;
+        let (mut filtered, permissions_cache): (
+            Vec<DocumentMetadata>,
+            HashMap<DocId, DocPermissions>,
+        ) = self.filter_visible_doc_metadata(ctx, docs).await?;
 
         let has_next_page = (filtered.len() as i64) > limit;
         if has_next_page {

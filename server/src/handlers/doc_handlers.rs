@@ -11,132 +11,143 @@ use axum::{
     },
     response::{IntoResponse, Response},
 };
-use barffine_core::blob::BlobDescriptor;
+use barffine_core::{
+    blob::BlobDescriptor,
+    ids::{DocId, WorkspaceId},
+};
+use serde::Deserialize;
 use yrs::updates::decoder::Decode;
 use yrs::{Doc as YrsDoc, ReadTxn, StateVector, Transact, Update};
 
 use crate::{
-    auth::{DocAccessIntent, RpcAccessRequirement, parse_history_timestamp, resolve_doc_access},
+    auth::{DocAccessIntent, RpcAccessRequirement, parse_history_timestamp},
     doc::{
-        channels::comment_attachment_blob_key, history, metadata as doc_metadata,
-        mode::DocPublishMode, sync::workspace_snapshot_or_not_found,
+        channels::comment_attachment_blob_key, context::DocAccessContext, history,
+        metadata as doc_metadata, mode::DocPublishMode,
     },
     error::AppError,
-    handlers::headers::{
-        HEADER_DOC_ID, HEADER_DOC_ROLE, HEADER_PUBLISH_MODE, HEADER_USER_ID, HEADER_WORKSPACE_ID,
-        HEADER_WORKSPACE_ROLE, doc_role_header_value, permission_header_value,
-    },
-    handlers::workspace_handlers::ensure_workspace_exists,
-    http::{append_set_cookie_headers, http_date_from_datetime},
+    handlers::headers::HEADER_PUBLISH_MODE,
+    http::append_set_cookie_headers,
     socket::rooms::SpaceType,
     state::AppState,
     types::{
         AuthenticatedRestSession, DocContentQuery, DocContentResponse, DocMarkdownResponse,
         DocumentHistoryItem, DocumentMetadataResponse, HistoryQuery, PublishDocRequest,
-        RestDocAccess,
     },
     utils::{
-        attachments::apply_attachment_headers,
+        blob_download::build_blob_download_response,
         crdt::{decode_state_vector, encode_state_vector},
     },
 };
 
+#[derive(Deserialize)]
+pub(crate) struct DocPath {
+    workspace_id: WorkspaceId,
+    doc_id: DocId,
+}
+
+impl From<(String, String)> for DocPath {
+    fn from((workspace_id, doc_id): (String, String)) -> Self {
+        Self {
+            workspace_id: WorkspaceId::from(workspace_id),
+            doc_id: DocId::from(doc_id),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct DocAttachmentPath {
+    workspace_id: WorkspaceId,
+    doc_id: DocId,
+    key: String,
+}
+
+impl From<(String, String, String)> for DocAttachmentPath {
+    fn from((workspace_id, doc_id, key): (String, String, String)) -> Self {
+        Self {
+            workspace_id: WorkspaceId::from(workspace_id),
+            doc_id: DocId::from(doc_id),
+            key,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct DocHistorySnapshotPath {
+    workspace_id: WorkspaceId,
+    doc_id: DocId,
+    timestamp: String,
+}
+
+impl From<(String, String, String)> for DocHistorySnapshotPath {
+    fn from((workspace_id, doc_id, timestamp): (String, String, String)) -> Self {
+        Self {
+            workspace_id: WorkspaceId::from(workspace_id),
+            doc_id: DocId::from(doc_id),
+            timestamp,
+        }
+    }
+}
+
 pub(crate) async fn get_doc_content_handler(
-    Path((workspace_id, doc_id)): Path<(String, String)>,
+    Path(path): Path<DocPath>,
     State(state): State<AppState>,
     Query(query): Query<DocContentQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    let response = build_doc_content_response(&state, &workspace_id, &doc_id, &query).await?;
+    let response =
+        build_doc_content_response(&state, &path.workspace_id, &path.doc_id, &query).await?;
     Ok(Json(response))
 }
 
 pub(crate) async fn get_comment_attachment_handler(
-    Path((workspace_id, doc_id, key)): Path<(String, String, String)>,
+    Path(path): Path<DocAttachmentPath>,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let access = resolve_doc_access(
-        &state,
+    let ctx = DocAccessContext::new(
+        state.clone(),
         &headers,
-        &workspace_id,
-        &doc_id,
+        path.workspace_id,
+        path.doc_id,
         RpcAccessRequirement::Optional,
         DocAccessIntent::RequireAuthenticatedRead,
     )
     .await?;
 
-    let descriptor = BlobDescriptor::new(&workspace_id, comment_attachment_blob_key(&doc_id, &key));
+    let descriptor = BlobDescriptor::new(
+        ctx.workspace_id().as_str(),
+        comment_attachment_blob_key(ctx.doc_id(), &path.key),
+    );
 
-    let download = state
+    let download = ctx
+        .state()
         .blob_store
         .get(&descriptor, true)
         .await
         .map_err(AppError::from_anyhow)?
-        .ok_or_else(|| AppError::comment_attachment_not_found(&workspace_id, &doc_id, &key))?;
+        .ok_or_else(|| {
+            AppError::comment_attachment_not_found(ctx.workspace_id(), ctx.doc_id(), &path.key)
+        })?;
 
-    if let Some(location) = download.location {
-        let response = Response::builder()
-            .status(StatusCode::FOUND)
-            .header("location", location.uri)
-            .body(Body::empty())
-            .map_err(|err| AppError::internal(AnyError::new(err)))?;
-
-        let response = finalize_doc_response(response, &access)?;
-        return Ok(response);
-    }
-
-    let bytes = download
-        .bytes
-        .ok_or_else(|| AppError::comment_attachment_not_found(&workspace_id, &doc_id, &key))?;
-
-    let mut response = Response::builder()
-        .status(StatusCode::OK)
-        .body(Body::from(bytes))
-        .map_err(|err| AppError::internal(AnyError::new(err)))?;
-
-    if let Some(metadata) = download.metadata.as_ref() {
-        if let Some(length) = metadata.content_length {
-            let value = HeaderValue::from_str(&length.to_string())
-                .map_err(|err| AppError::internal(AnyError::new(err)))?;
-            response
-                .headers_mut()
-                .insert(HeaderName::from_static("content-length"), value);
-        }
-
-        if let Some(last_modified) = metadata.last_modified {
-            if let Some(formatted) = http_date_from_datetime(&last_modified) {
-                let value = HeaderValue::from_str(&formatted)
-                    .map_err(|err| AppError::internal(AnyError::new(err)))?;
-                response
-                    .headers_mut()
-                    .insert(HeaderName::from_static("last-modified"), value);
-            }
-        }
-
-        apply_attachment_headers(&mut response, Some(metadata), &key)?;
-    } else {
-        apply_attachment_headers(&mut response, None, &key)?;
-    }
-
-    response.headers_mut().insert(
-        HeaderName::from_static("cache-control"),
-        HeaderValue::from_static("private, max-age=2592000, immutable"),
-    );
-
-    let response = finalize_doc_response(response, &access)?;
-    Ok(response)
+    build_blob_download_response(
+        download,
+        &path.key,
+        "private, max-age=2592000, immutable",
+        ctx.blob_context(),
+        || AppError::comment_attachment_not_found(ctx.workspace_id(), ctx.doc_id(), &path.key),
+    )
 }
 
 pub(crate) async fn get_doc_markdown_handler(
-    Path((workspace_id, doc_id)): Path<(String, String)>,
+    Path(path): Path<DocPath>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
-    let response = build_doc_markdown_response(&state, &workspace_id, &doc_id).await?;
+    let response = build_doc_markdown_response(&state, &path.workspace_id, &path.doc_id).await?;
     Ok(Json(response))
 }
 
 pub(crate) async fn get_doc_diff_handler(
-    Path((workspace_id, doc_id)): Path<(String, String)>,
+    Path(path): Path<DocPath>,
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
@@ -144,8 +155,8 @@ pub(crate) async fn get_doc_diff_handler(
     doc_diff_response(
         &state,
         &headers,
-        &workspace_id,
-        &doc_id,
+        &path.workspace_id,
+        &path.doc_id,
         RpcAccessRequirement::Optional,
         DocAccessIntent::Standard,
         body,
@@ -154,15 +165,15 @@ pub(crate) async fn get_doc_diff_handler(
 }
 
 pub(crate) async fn get_doc_binary_handler(
-    Path((workspace_id, doc_id)): Path<(String, String)>,
+    Path(path): Path<DocPath>,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     doc_binary_response(
         &state,
         &headers,
-        &workspace_id,
-        &doc_id,
+        &path.workspace_id,
+        &path.doc_id,
         RpcAccessRequirement::Optional,
         DocAccessIntent::Standard,
     )
@@ -170,25 +181,24 @@ pub(crate) async fn get_doc_binary_handler(
 }
 
 pub(crate) async fn get_doc_history_handler(
-    Path((workspace_id, doc_id)): Path<(String, String)>,
+    Path(path): Path<DocPath>,
     Query(query): Query<HistoryQuery>,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    ensure_workspace_exists(&state, &workspace_id).await?;
-
-    let access = resolve_doc_access(
-        &state,
+    let ctx = DocAccessContext::new(
+        state.clone(),
         &headers,
-        &workspace_id,
-        &doc_id,
+        path.workspace_id,
+        path.doc_id,
         RpcAccessRequirement::Optional,
         DocAccessIntent::RequireAuthenticatedRead,
     )
     .await?;
 
     let history =
-        history::fetch_history_records(&state, &workspace_id, &doc_id, query.limit).await?;
+        history::fetch_history_records(ctx.state(), ctx.workspace_id(), ctx.doc_id(), query.limit)
+            .await?;
 
     let items = history
         .into_iter()
@@ -196,33 +206,29 @@ pub(crate) async fn get_doc_history_handler(
         .collect::<Vec<_>>();
 
     let response = Json(items).into_response();
-    let response = finalize_doc_response(response, &access)?;
-    Ok(response)
+    ctx.finalize_response(response)
 }
 
 pub(crate) async fn get_doc_history_snapshot_handler(
-    Path((workspace_id, doc_id, timestamp)): Path<(String, String, String)>,
+    Path(path): Path<DocHistorySnapshotPath>,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    ensure_workspace_exists(&state, &workspace_id).await?;
-
-    let access = resolve_doc_access(
-        &state,
+    let ctx = DocAccessContext::new(
+        state.clone(),
         &headers,
-        &workspace_id,
-        &doc_id,
+        path.workspace_id,
+        path.doc_id,
         RpcAccessRequirement::Optional,
         DocAccessIntent::RequireAuthenticatedRead,
     )
     .await?;
-    let timestamp = parse_history_timestamp(&timestamp)?;
 
-    let snapshot = state
-        .document_store
-        .fetch_history_as_of(&workspace_id, &doc_id, timestamp)
-        .await
-        .map_err(AppError::from_anyhow)?
+    let timestamp = parse_history_timestamp(&path.timestamp)?;
+
+    let snapshot = ctx
+        .fetch_history_snapshot(timestamp)
+        .await?
         .ok_or_else(|| AppError::not_found("history not found"))?;
 
     let mut builder = Response::builder()
@@ -230,8 +236,8 @@ pub(crate) async fn get_doc_history_snapshot_handler(
         .header("content-type", "application/octet-stream")
         .header("content-length", snapshot.len().to_string());
 
-    if access.metadata.public {
-        if let Ok(mode) = HeaderValue::from_str(access.metadata.mode.as_str()) {
+    if ctx.metadata().public {
+        if let Ok(mode) = HeaderValue::from_str(ctx.metadata().mode.as_str()) {
             builder = builder.header(HeaderName::from_static(HEADER_PUBLISH_MODE), mode);
         }
     }
@@ -240,14 +246,13 @@ pub(crate) async fn get_doc_history_snapshot_handler(
         .body(Body::from(snapshot))
         .map_err(|err| AppError::internal(AnyError::new(err)))?;
 
-    let response = finalize_doc_response(response, &access)?;
-    Ok(response)
+    ctx.finalize_response(response)
 }
 
 async fn build_doc_content_response(
     state: &AppState,
-    workspace_id: &str,
-    doc_id: &str,
+    workspace_id: &WorkspaceId,
+    doc_id: &DocId,
     query: &DocContentQuery,
 ) -> Result<DocContentResponse, AppError> {
     let metadata = doc_metadata::fetch_required(state, workspace_id, doc_id).await?;
@@ -267,8 +272,8 @@ async fn build_doc_content_response(
 
 async fn build_doc_markdown_response(
     state: &AppState,
-    workspace_id: &str,
-    doc_id: &str,
+    workspace_id: &WorkspaceId,
+    doc_id: &DocId,
 ) -> Result<DocMarkdownResponse, AppError> {
     let metadata = doc_metadata::fetch_required(state, workspace_id, doc_id).await?;
     let markdown = state
@@ -288,33 +293,30 @@ async fn build_doc_markdown_response(
 async fn doc_binary_response(
     state: &AppState,
     headers: &HeaderMap,
-    workspace_id: &str,
-    doc_id: &str,
+    workspace_id: &WorkspaceId,
+    doc_id: &DocId,
     rpc_requirement: RpcAccessRequirement,
     intent: DocAccessIntent,
 ) -> Result<Response, AppError> {
-    ensure_workspace_exists(state, workspace_id).await?;
-
-    let access = resolve_doc_access(
-        state,
+    let ctx = DocAccessContext::new(
+        state.clone(),
         headers,
-        workspace_id,
-        doc_id,
+        workspace_id.clone(),
+        doc_id.clone(),
         rpc_requirement,
         intent,
     )
     .await?;
 
-    let (snapshot, updated_at) =
-        workspace_snapshot_or_not_found(state, workspace_id, doc_id).await?;
+    let (snapshot, updated_at) = ctx.workspace_snapshot().await?;
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/octet-stream")
         .header("content-length", snapshot.len().to_string());
 
-    if access.metadata.public {
-        if let Ok(mode) = HeaderValue::from_str(access.metadata.mode.as_str()) {
+    if ctx.metadata().public {
+        if let Ok(mode) = HeaderValue::from_str(ctx.metadata().mode.as_str()) {
             builder = builder.header(HeaderName::from_static(HEADER_PUBLISH_MODE), mode);
         }
     }
@@ -329,8 +331,7 @@ async fn doc_binary_response(
             .map_err(|err| AppError::internal(AnyError::new(err)))?,
     );
 
-    let response = finalize_doc_response(response, &access)?;
-    Ok(response)
+    ctx.finalize_response(response)
 }
 
 fn prefer_or_metadata(value: String, fallback: Option<String>) -> String {
@@ -344,24 +345,23 @@ fn prefer_or_metadata(value: String, fallback: Option<String>) -> String {
 async fn doc_diff_response(
     state: &AppState,
     headers: &HeaderMap,
-    workspace_id: &str,
-    doc_id: &str,
+    workspace_id: &WorkspaceId,
+    doc_id: &DocId,
     rpc_requirement: RpcAccessRequirement,
     intent: DocAccessIntent,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let access = resolve_doc_access(
-        state,
+    let ctx = DocAccessContext::new(
+        state.clone(),
         headers,
-        workspace_id,
-        doc_id,
+        workspace_id.to_owned(),
+        doc_id.to_owned(),
         rpc_requirement,
         intent,
     )
     .await?;
 
-    let (snapshot, updated_at) =
-        workspace_snapshot_or_not_found(state, workspace_id, doc_id).await?;
+    let (snapshot, updated_at) = ctx.workspace_snapshot().await?;
 
     let doc = doc_from_snapshot_bytes(&snapshot).map_err(AppError::internal)?;
 
@@ -408,17 +408,7 @@ async fn doc_diff_response(
         .map_err(|err| AppError::internal(AnyError::new(err)))?,
     );
 
-    let response = finalize_doc_response(response, &access)?;
-    Ok(response)
-}
-
-fn finalize_doc_response(
-    mut response: Response,
-    access: &RestDocAccess,
-) -> Result<Response, AppError> {
-    append_doc_access_headers(&mut response, access)?;
-    append_set_cookie_headers(&mut response, &access.set_cookies)?;
-    Ok(response)
+    ctx.finalize_response(response)
 }
 
 fn doc_from_snapshot_bytes(bytes: &[u8]) -> Result<YrsDoc, AnyError> {
@@ -431,52 +421,11 @@ fn doc_from_snapshot_bytes(bytes: &[u8]) -> Result<YrsDoc, AnyError> {
     Ok(doc)
 }
 
-fn append_doc_access_headers(
-    response: &mut Response,
-    access: &RestDocAccess,
-) -> Result<(), AppError> {
-    let headers = response.headers_mut();
-    headers.insert(
-        HeaderName::from_static(HEADER_WORKSPACE_ID),
-        HeaderValue::from_str(&access.metadata.workspace_id)
-            .map_err(|err| AppError::internal(AnyError::new(err)))?,
-    );
-    headers.insert(
-        HeaderName::from_static(HEADER_DOC_ID),
-        HeaderValue::from_str(&access.metadata.id)
-            .map_err(|err| AppError::internal(AnyError::new(err)))?,
-    );
-
-    if let Some(user) = &access.user {
-        headers.insert(
-            HeaderName::from_static(HEADER_USER_ID),
-            HeaderValue::from_str(&user.id)
-                .map_err(|err| AppError::internal(AnyError::new(err)))?,
-        );
-    }
-
-    if let Some(role) = access.workspace_role {
-        headers.insert(
-            HeaderName::from_static(HEADER_WORKSPACE_ROLE),
-            HeaderValue::from_static(permission_header_value(role)),
-        );
-    }
-
-    if let Some(role) = access.doc_role {
-        headers.insert(
-            HeaderName::from_static(HEADER_DOC_ROLE),
-            HeaderValue::from_static(doc_role_header_value(role)),
-        );
-    }
-
-    Ok(())
-}
-
 async fn require_doc_publish_permission(
     state: &AppState,
     headers: &HeaderMap,
-    workspace_id: &str,
-    doc_id: &str,
+    workspace_id: &WorkspaceId,
+    doc_id: &DocId,
 ) -> Result<AuthenticatedRestSession, AppError> {
     require_doc_permission_rest(
         state,
@@ -492,8 +441,8 @@ async fn require_doc_publish_permission(
 async fn require_doc_permission_rest<F>(
     state: &AppState,
     headers: &HeaderMap,
-    workspace_id: &str,
-    doc_id: &str,
+    workspace_id: &WorkspaceId,
+    doc_id: &DocId,
     predicate: F,
     error_message: &'static str,
 ) -> Result<AuthenticatedRestSession, AppError>
@@ -521,12 +470,13 @@ where
 }
 
 pub(crate) async fn publish_doc_handler(
-    Path((workspace_id, doc_id)): Path<(String, String)>,
+    Path(path): Path<DocPath>,
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<PublishDocRequest>,
 ) -> Result<Response, AppError> {
-    let auth = require_doc_publish_permission(&state, &headers, &workspace_id, &doc_id).await?;
+    let auth =
+        require_doc_publish_permission(&state, &headers, &path.workspace_id, &path.doc_id).await?;
 
     let doc_mode = payload
         .mode
@@ -535,7 +485,8 @@ pub(crate) async fn publish_doc_handler(
         .unwrap_or(Some(DocPublishMode::Page))
         .ok_or_else(|| AppError::bad_request("invalid publish mode"))?;
 
-    let metadata = doc_metadata::publish_doc(&state, &workspace_id, &doc_id, doc_mode).await?;
+    let metadata =
+        doc_metadata::publish_doc(&state, &path.workspace_id, &path.doc_id, doc_mode).await?;
 
     let mut response = Json(DocumentMetadataResponse::from(metadata)).into_response();
     append_set_cookie_headers(&mut response, &auth.set_cookies)?;
@@ -543,13 +494,14 @@ pub(crate) async fn publish_doc_handler(
 }
 
 pub(crate) async fn unpublish_doc_handler(
-    Path((workspace_id, doc_id)): Path<(String, String)>,
+    Path(path): Path<DocPath>,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let auth = require_doc_publish_permission(&state, &headers, &workspace_id, &doc_id).await?;
+    let auth =
+        require_doc_publish_permission(&state, &headers, &path.workspace_id, &path.doc_id).await?;
 
-    let metadata = doc_metadata::unpublish_doc(&state, &workspace_id, &doc_id).await?;
+    let metadata = doc_metadata::unpublish_doc(&state, &path.workspace_id, &path.doc_id).await?;
 
     let mut response = Json(DocumentMetadataResponse::from(metadata)).into_response();
     append_set_cookie_headers(&mut response, &auth.set_cookies)?;
@@ -592,6 +544,33 @@ mod tests {
         types::{DocContentQuery, PublishDocRequest},
         utils::crdt::encode_state_vector,
     };
+
+    fn doc_path(workspace_id: &str, doc_id: &str) -> Path<DocPath> {
+        Path(DocPath::from((
+            workspace_id.to_string(),
+            doc_id.to_string(),
+        )))
+    }
+
+    fn attachment_path(workspace_id: &str, doc_id: &str, key: &str) -> Path<DocAttachmentPath> {
+        Path(DocAttachmentPath::from((
+            workspace_id.to_string(),
+            doc_id.to_string(),
+            key.to_string(),
+        )))
+    }
+
+    fn history_snapshot_path(
+        workspace_id: &str,
+        doc_id: &str,
+        timestamp: &str,
+    ) -> Path<DocHistorySnapshotPath> {
+        Path(DocHistorySnapshotPath::from((
+            workspace_id.to_string(),
+            doc_id.to_string(),
+            timestamp.to_string(),
+        )))
+    }
 
     fn session_cookie_value(session_id: &str, user_id: Option<&str>) -> HeaderValue {
         let value = if let Some(user_id) = user_id {
@@ -654,7 +633,7 @@ mod tests {
         headers.insert(COOKIE, session_cookie_value(&session.id, None));
 
         let response = get_comment_attachment_handler(
-            Path((workspace_id.clone(), doc_id.clone(), attachment_key.clone())),
+            attachment_path(&workspace_id, &doc_id, &attachment_key),
             State(state.clone()),
             headers,
         )
@@ -701,7 +680,7 @@ mod tests {
         let expected = parse_doc_content(&snapshot, false).expect("parse snapshot");
 
         let response = get_doc_content_handler(
-            Path((workspace_id.clone(), doc_id.clone())),
+            doc_path(&workspace_id, &doc_id),
             State(state.clone()),
             Query(DocContentQuery { full: None }),
         )
@@ -720,7 +699,7 @@ mod tests {
     async fn get_doc_content_handler_returns_not_found() {
         let (_temp_dir, _database, state) = setup_state().await;
         let err = match get_doc_content_handler(
-            Path(("missing-workspace".into(), "missing-doc".into())),
+            doc_path("missing-workspace", "missing-doc"),
             State(state.clone()),
             Query(DocContentQuery { full: None }),
         )
@@ -747,7 +726,7 @@ mod tests {
         let full_expected = parse_doc_content(&snapshot, true).expect("parse full snapshot");
 
         let baseline = get_doc_content_handler(
-            Path((workspace_id.clone(), doc_id.clone())),
+            doc_path(&workspace_id, &doc_id),
             State(state.clone()),
             Query(DocContentQuery { full: None }),
         )
@@ -762,7 +741,7 @@ mod tests {
         assert_eq!(json["summary"], partial_expected.summary);
 
         let full_response = get_doc_content_handler(
-            Path((workspace_id.clone(), doc_id.clone())),
+            doc_path(&workspace_id, &doc_id),
             State(state.clone()),
             Query(DocContentQuery {
                 full: Some("true".to_string()),
@@ -791,13 +770,11 @@ mod tests {
         let expected =
             parse_doc_markdown(&workspace_id, &snapshot).expect("parse markdown snapshot");
 
-        let response = get_doc_markdown_handler(
-            Path((workspace_id.clone(), doc_id.clone())),
-            State(state.clone()),
-        )
-        .await
-        .expect("doc markdown response")
-        .into_response();
+        let response =
+            get_doc_markdown_handler(doc_path(&workspace_id, &doc_id), State(state.clone()))
+                .await
+                .expect("doc markdown response")
+                .into_response();
 
         let (_parts, body) = response.into_parts();
         let bytes = to_bytes(body, usize::MAX).await.unwrap();
@@ -810,7 +787,7 @@ mod tests {
     async fn get_doc_markdown_handler_returns_not_found() {
         let (_temp_dir, _database, state) = setup_state().await;
         let err = match get_doc_markdown_handler(
-            Path(("missing-workspace".into(), "missing-doc".into())),
+            doc_path("missing-workspace", "missing-doc"),
             State(state.clone()),
         )
         .await
@@ -868,7 +845,7 @@ mod tests {
             .expect("update snapshot");
 
         let response = get_doc_diff_handler(
-            Path((workspace_id.clone(), doc_id.clone())),
+            doc_path(&workspace_id, &doc_id),
             State(state.clone()),
             request_headers,
             Bytes::new(),
@@ -933,7 +910,7 @@ mod tests {
     async fn get_doc_diff_handler_returns_not_found() {
         let (_temp_dir, _database, state) = setup_state().await;
         let err = match get_doc_diff_handler(
-            Path(("missing-workspace".into(), "missing-doc".into())),
+            doc_path("missing-workspace", "missing-doc"),
             State(state.clone()),
             HeaderMap::new(),
             Bytes::new(),
@@ -987,11 +964,7 @@ mod tests {
 
         let timestamp_ms = created_at * 1_000 + 500;
         let response = get_doc_history_snapshot_handler(
-            Path((
-                workspace_id.clone(),
-                doc_id.clone(),
-                timestamp_ms.to_string(),
-            )),
+            history_snapshot_path(&workspace_id, &doc_id, &timestamp_ms.to_string()),
             State(state.clone()),
             headers,
         )
@@ -1020,7 +993,7 @@ mod tests {
         headers.insert(COOKIE, session_cookie_value(&session.id, Some(&owner_id)));
 
         let err = publish_doc_handler(
-            Path((workspace_id.clone(), doc_id.clone())),
+            doc_path(&workspace_id, &doc_id),
             State(state.clone()),
             headers,
             Json(PublishDocRequest {
@@ -1051,7 +1024,7 @@ mod tests {
         headers.insert(COOKIE, session_cookie_value(&session.id, Some(&owner_id)));
 
         let err = unpublish_doc_handler(
-            Path((workspace_id.clone(), doc_id.clone())),
+            doc_path(&workspace_id, &doc_id),
             State(state.clone()),
             headers,
         )
@@ -1080,7 +1053,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(COOKIE, cookie_value.clone());
         let response = publish_doc_handler(
-            Path((workspace_id.clone(), doc_id.clone())),
+            doc_path(&workspace_id, &doc_id),
             State(state.clone()),
             headers,
             Json(PublishDocRequest {
@@ -1107,7 +1080,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(COOKIE, cookie_value.clone());
         let response = unpublish_doc_handler(
-            Path((workspace_id.clone(), doc_id.clone())),
+            doc_path(&workspace_id, &doc_id),
             State(state.clone()),
             headers,
         )
@@ -1124,7 +1097,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(COOKIE, cookie_value);
         let response = publish_doc_handler(
-            Path((workspace_id.clone(), doc_id.clone())),
+            doc_path(&workspace_id, &doc_id),
             State(state.clone()),
             headers,
             Json(PublishDocRequest { mode: None }),
@@ -1160,7 +1133,7 @@ mod tests {
         headers.insert(COOKIE, session_cookie_value(&session.id, Some(owner_id)));
 
         publish_doc_handler(
-            Path((workspace_id.to_string(), doc_id.to_string())),
+            doc_path(workspace_id, doc_id),
             State(state.clone()),
             headers,
             Json(PublishDocRequest {
@@ -1179,7 +1152,7 @@ mod tests {
         insert_document(&database, &workspace_id, &doc_id, false, "page").await;
 
         let err = get_doc_binary_handler(
-            Path((workspace_id.clone(), doc_id.clone())),
+            doc_path(&workspace_id, &doc_id),
             State(state.clone()),
             HeaderMap::new(),
         )
@@ -1200,7 +1173,7 @@ mod tests {
         headers.insert(COOKIE, session_cookie_value(&session.id, Some(&owner_id)));
 
         let response = get_doc_binary_handler(
-            Path((workspace_id.clone(), doc_id.clone())),
+            doc_path(&workspace_id, &doc_id),
             State(state.clone()),
             headers,
         )
@@ -1219,7 +1192,7 @@ mod tests {
         publish_doc(&state, &workspace_id, &doc_id, &owner_id, "page").await;
 
         let response = get_doc_binary_handler(
-            Path((workspace_id.clone(), doc_id.clone())),
+            doc_path(&workspace_id, &doc_id),
             State(state.clone()),
             HeaderMap::new(),
         )
@@ -1256,7 +1229,7 @@ mod tests {
         );
 
         let err = get_doc_binary_handler(
-            Path((workspace_id.clone(), doc_id.clone())),
+            doc_path(&workspace_id, &doc_id),
             State(state.clone()),
             headers,
         )
@@ -1295,7 +1268,7 @@ mod tests {
         headers.insert(COOKIE, session_cookie_value(&session.id, Some(&viewer.id)));
 
         let response = get_doc_binary_handler(
-            Path((workspace_id.clone(), doc_id.clone())),
+            doc_path(&workspace_id, &doc_id),
             State(state.clone()),
             headers,
         )

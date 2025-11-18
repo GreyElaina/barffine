@@ -406,7 +406,7 @@ pub(crate) fn encode_doc_cursor(metadata: &DocumentMetadata, kind: DocCursorKind
         DocCursorKind::CreatedAt => metadata.created_at,
         DocCursorKind::UpdatedAt => metadata.updated_at,
     };
-    let payload = format!("{timestamp}:{}", metadata.id);
+    let payload = format!("{timestamp}:{}", metadata.id.as_str());
     BASE64.encode(payload)
 }
 
@@ -415,11 +415,14 @@ pub(crate) fn decode_doc_cursor(cursor: &str) -> Result<DocumentCursor, AppError
 
     let (timestamp, id) = parse_timestamp_cursor(&decoded)?;
 
-    Ok(DocumentCursor { timestamp, id })
+    Ok(DocumentCursor {
+        timestamp,
+        id: id.into(),
+    })
 }
 
 pub(crate) fn encode_granted_user_cursor(record: &DocumentRoleRecord) -> String {
-    let payload = format!("{}:{}", record.created_at, record.user_id);
+    let payload = format!("{}:{}", record.created_at, record.user_id.as_str());
     BASE64.encode(payload)
 }
 
@@ -430,7 +433,7 @@ pub(crate) fn decode_granted_user_cursor(cursor: &str) -> Result<DocumentRoleCur
 
     Ok(DocumentRoleCursor {
         created_at,
-        user_id,
+        user_id: user_id.into(),
     })
 }
 
@@ -660,10 +663,10 @@ pub(crate) async fn ensure_doc_owner_role(
         if user_exists {
             candidate
         } else {
-            workspace.owner_id.clone()
+            workspace.owner_id.to_string()
         }
     } else {
-        workspace.owner_id.clone()
+        workspace.owner_id.to_string()
     };
 
     state
@@ -946,10 +949,10 @@ impl DocType {
             &roles[..]
         };
 
-        let user_ids = visible
+        let user_ids: Vec<String> = visible
             .iter()
-            .map(|record| record.user_id.clone())
-            .collect::<Vec<_>>();
+            .map(|record| record.user_id.to_string())
+            .collect();
         let users = state
             .user_store
             .find_by_ids(&user_ids)
@@ -963,7 +966,7 @@ impl DocType {
         let edges = visible
             .into_iter()
             .filter_map(|record| {
-                user_map.get(&record.user_id).map(|user| {
+                user_map.get(record.user_id.as_str()).map(|user| {
                     let cursor = encode_granted_user_cursor(record);
                     let node = GrantedDocUserType {
                         role: doc_role_from_str(&record.role),
@@ -1347,8 +1350,8 @@ mod tests {
             .await
             .expect("fetch metadata")
             .expect("duplicated doc metadata");
-        assert_eq!(metadata.id, duplicated_id);
-        assert_eq!(metadata.workspace_id, workspace_id);
+        assert_eq!(metadata.id, duplicated_id.into());
+        assert_eq!(metadata.workspace_id, workspace_id.clone().into());
         assert_eq!(metadata.title.as_deref(), Some(new_title));
     }
 

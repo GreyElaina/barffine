@@ -325,8 +325,8 @@ impl From<DocumentMetadata> for DocumentMetadataResponse {
         } = metadata;
 
         Self {
-            id,
-            workspace_id,
+            id: id.into_inner(),
+            workspace_id: workspace_id.into_inner(),
             created_at,
             updated_at,
             default_role,

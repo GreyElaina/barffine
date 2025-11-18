@@ -6,6 +6,7 @@ use sqlx::{Pool, Row, Sqlite, sqlite::SqliteRow};
 use crate::{
     comment_attachment::{CommentAttachmentRecord, CommentAttachmentUpsert},
     db::comment_attachment_repo::CommentAttachmentRepository,
+    ids::{DocId, UserId, WorkspaceId},
 };
 
 pub struct SqliteCommentAttachmentRepository {
@@ -25,14 +26,16 @@ impl SqliteCommentAttachmentRepository {
             .unwrap_or_else(Utc::now);
 
         CommentAttachmentRecord {
-            workspace_id: row.get("workspace_id"),
-            doc_id: row.get("doc_id"),
+            workspace_id: WorkspaceId::from(row.get::<String, _>("workspace_id")),
+            doc_id: DocId::from(row.get::<String, _>("doc_id")),
             key: row.get("key"),
             name: row.get("name"),
             mime: row.get("mime"),
             size: row.get("size"),
             created_at,
-            created_by: row.get::<Option<String>, _>("created_by"),
+            created_by: row
+                .get::<Option<String>, _>("created_by")
+                .map(UserId::from),
         }
     }
 }

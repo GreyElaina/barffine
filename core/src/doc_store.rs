@@ -19,6 +19,7 @@ use crate::{
     },
     doc::DocEngine,
     doc_update_log::{DocUpdateLogReaderRef, DocUpdateRecord},
+    ids::{DocId, WorkspaceId},
 };
 
 pub const DOC_UPDATE_LOG_LIMIT: i64 = 200;
@@ -76,8 +77,8 @@ pub struct DocumentSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DocumentMetadata {
-    pub id: String,
-    pub workspace_id: String,
+    pub id: crate::ids::DocId,
+    pub workspace_id: crate::ids::WorkspaceId,
     pub created_at: i64,
     pub updated_at: i64,
     pub default_role: String,
@@ -96,8 +97,8 @@ pub struct DocumentMetadata {
 
 #[derive(Debug, Clone)]
 pub struct UserShareTokenRecord {
-    pub workspace_id: String,
-    pub doc_id: String,
+    pub workspace_id: WorkspaceId,
+    pub doc_id: DocId,
     pub token: String,
     pub created_at: i64,
 }
@@ -105,13 +106,13 @@ pub struct UserShareTokenRecord {
 #[derive(Debug, Clone)]
 pub struct DocumentCursor {
     pub timestamp: i64,
-    pub id: String,
+    pub id: DocId,
 }
 
 #[derive(Clone)]
 pub struct DocumentCompactionJob {
-    pub workspace_id: String,
-    pub doc_id: String,
+    pub workspace_id: WorkspaceId,
+    pub doc_id: DocId,
     pub source: CompactionSource,
 }
 
@@ -202,8 +203,8 @@ impl DocumentStore {
         if Self::metadata_backfill_changed(&metadata, &updated) {
             self.doc_repo
                 .backfill_metadata(MetadataBackfillParams {
-                    workspace_id: updated.workspace_id.clone(),
-                    doc_id: updated.id.clone(),
+                    workspace_id: updated.workspace_id.to_string(),
+                    doc_id: updated.id.to_string(),
                     title: updated.title.clone(),
                     summary: updated.summary.clone(),
                     creator_id: updated.creator_id.clone(),
@@ -385,8 +386,8 @@ impl DocumentStore {
         self.doc_repo.insert_doc_record(insert_params).await?;
 
         let metadata = DocumentMetadata {
-            id: doc_id.to_owned(),
-            workspace_id: workspace_id.to_owned(),
+            id: DocId::from(doc_id),
+            workspace_id: WorkspaceId::from(workspace_id),
             created_at: now_ts,
             updated_at: now_ts,
             default_role: "manager".to_string(),
@@ -890,8 +891,8 @@ impl DocumentStore {
         }
 
         Ok(Some(DocumentCompactionJob {
-            workspace_id: workspace_id.to_owned(),
-            doc_id: doc_id.to_owned(),
+            workspace_id: WorkspaceId::from(workspace_id.to_owned()),
+            doc_id: DocId::from(doc_id.to_owned()),
             source,
         }))
     }
@@ -913,8 +914,8 @@ impl DocumentStore {
             .unwrap_or_else(Self::now_millis);
 
         Ok(CompactionApplyParams {
-            workspace_id: job.workspace_id,
-            doc_id: job.doc_id,
+            workspace_id: job.workspace_id.into_inner(),
+            doc_id: job.doc_id.into_inner(),
             snapshot: merged_snapshot,
             updated_at,
             title: meta.title,
@@ -1153,8 +1154,8 @@ mod tests {
     #[test]
     fn merge_parsed_metadata_fills_missing_fields() {
         let mut metadata = DocumentMetadata {
-            id: "doc-1".to_string(),
-            workspace_id: "ws-1".to_string(),
+            id: DocId::from("doc-1"),
+            workspace_id: WorkspaceId::from("ws-1"),
             created_at: 0,
             updated_at: 0,
             default_role: "manager".to_string(),
@@ -1193,8 +1194,8 @@ mod tests {
     #[test]
     fn merge_parsed_metadata_preserves_existing_values() {
         let mut metadata = DocumentMetadata {
-            id: "doc-2".to_string(),
-            workspace_id: "ws-2".to_string(),
+            id: DocId::from("doc-2"),
+            workspace_id: WorkspaceId::from("ws-2"),
             created_at: 5_000,
             updated_at: 6_000,
             default_role: "manager".to_string(),

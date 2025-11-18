@@ -2,9 +2,12 @@ use async_graphql::{Context, Enum, ID, InputObject, Json, Object, Result as Grap
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
 
-use barffine_core::notification::{
-    CommentChangeAction as CoreCommentChangeAction, CommentChangeRecord, CommentRecord,
-    CommentReplyRecord, CommentVisibility,
+use barffine_core::{
+    ids::{DocId, UserId, WorkspaceId},
+    notification::{
+        CommentChangeAction as CoreCommentChangeAction, CommentChangeRecord, CommentRecord,
+        CommentReplyRecord, CommentVisibility,
+    },
 };
 
 use crate::graphql::PublicUserType;
@@ -251,7 +254,7 @@ impl ReplyObjectType {
         let state = ctx.data::<AppState>()?;
         let user = state
             .user_service
-            .fetch_user(&self.record.author_id)
+            .fetch_user(self.record.author_id.as_str())
             .await
             .map_err(map_app_error)?;
         Ok(PublicUserType::from_user(&user))
@@ -309,14 +312,14 @@ impl CommentObjectType {
 
     #[graphql(name = "docId")]
     async fn doc_id(&self) -> &str {
-        &self.record.doc_id
+        self.record.doc_id.as_str()
     }
 
     async fn user(&self, ctx: &Context<'_>) -> GraphQLResult<PublicUserType> {
         let state = ctx.data::<AppState>()?;
         let user = state
             .user_service
-            .fetch_user(&self.record.author_id)
+            .fetch_user(self.record.author_id.as_str())
             .await
             .map_err(map_app_error)?;
         Ok(PublicUserType::from_user(&user))
@@ -357,9 +360,9 @@ pub fn build_comment_record(
 ) -> CommentRecord {
     CommentRecord {
         id,
-        workspace_id,
-        doc_id,
-        author_id,
+        workspace_id: WorkspaceId::from(workspace_id),
+        doc_id: DocId::from(doc_id),
+        author_id: UserId::from(author_id),
         body: serde_json::to_string(&content).unwrap_or_else(|_| "null".to_string()),
         visibility: CommentVisibility::Workspace,
         metadata,
@@ -379,7 +382,7 @@ pub fn build_reply_record(
     CommentReplyRecord {
         id,
         comment_id,
-        author_id,
+        author_id: UserId::from(author_id),
         body: serde_json::to_string(&content).unwrap_or_else(|_| "null".to_string()),
         metadata,
         created_at: Utc::now(),

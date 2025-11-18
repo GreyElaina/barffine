@@ -25,3 +25,4 @@ thiserror = { workspace = true }
 fastrand = { workspace = true }
 logfire = { workspace = true }
 parking_lot = { workspace = true }
+barffine-server = { path = "../../server" }

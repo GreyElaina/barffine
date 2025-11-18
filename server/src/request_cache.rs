@@ -4,7 +4,10 @@ use std::{
 };
 
 use barffine_core::{
-    doc_roles::DocumentRoleRecord, doc_store::DocumentMetadata, user::UserRecord,
+    doc_roles::DocumentRoleRecord,
+    doc_store::DocumentMetadata,
+    ids::{DocId, UserId, WorkspaceId},
+    user::UserRecord,
     workspace::WorkspaceRecord,
 };
 use dashmap::DashMap;
@@ -197,7 +200,7 @@ impl RequestDocPermissionCache {
 
 #[derive(Default)]
 pub struct RequestWorkspaceCache {
-    inner: DashMap<String, Arc<OnceCell<WorkspaceRecord>>>,
+    inner: DashMap<WorkspaceId, Arc<OnceCell<WorkspaceRecord>>>,
 }
 
 impl RequestWorkspaceCache {
@@ -210,9 +213,10 @@ impl RequestWorkspaceCache {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<WorkspaceRecord, AppError>>,
     {
+        let key = WorkspaceId::from(workspace_id);
         let cell = self
             .inner
-            .entry(workspace_id.to_owned())
+            .entry(key)
             .or_insert_with(|| Arc::new(OnceCell::new()))
             .clone();
 
@@ -239,7 +243,7 @@ impl RequestWorkspaceCache {
 
 #[derive(Default)]
 pub struct RequestUserCache {
-    inner: DashMap<String, Arc<OnceCell<Option<UserRecord>>>>,
+    inner: DashMap<UserId, Arc<OnceCell<Option<UserRecord>>>>,
 }
 
 impl RequestUserCache {
@@ -252,9 +256,10 @@ impl RequestUserCache {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<Option<UserRecord>, AppError>>,
     {
+        let key = UserId::from(user_id);
         let cell = self
             .inner
-            .entry(user_id.to_owned())
+            .entry(key)
             .or_insert_with(|| Arc::new(OnceCell::new()))
             .clone();
 
@@ -273,13 +278,13 @@ impl RequestUserCache {
     }
 
     pub(crate) fn invalidate(&self, user_id: &str) {
-        self.inner.remove(user_id);
+        self.inner.remove(&UserId::from(user_id));
     }
 }
 
 #[derive(Default)]
 pub struct RequestUserAdminCache {
-    inner: DashMap<String, Arc<OnceCell<bool>>>,
+    inner: DashMap<UserId, Arc<OnceCell<bool>>>,
 }
 
 impl RequestUserAdminCache {
@@ -292,9 +297,10 @@ impl RequestUserAdminCache {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<bool, AppError>>,
     {
+        let key = UserId::from(user_id);
         let cell = self
             .inner
-            .entry(user_id.to_owned())
+            .entry(key)
             .or_insert_with(|| Arc::new(OnceCell::new()))
             .clone();
 
@@ -313,26 +319,29 @@ impl RequestUserAdminCache {
     }
 
     pub(crate) fn invalidate(&self, user_id: &str) {
-        self.inner.remove(user_id);
+        self.inner.remove(&UserId::from(user_id));
     }
 }
 
 #[derive(Clone, Eq)]
 struct CacheKey {
-    workspace_id: String,
-    doc_id: String,
+    workspace_id: WorkspaceId,
+    doc_id: DocId,
 }
 
 impl CacheKey {
     fn new(workspace_id: &str, doc_id: &str) -> Self {
         Self {
-            workspace_id: workspace_id.to_owned(),
-            doc_id: doc_id.to_owned(),
+            workspace_id: WorkspaceId::from(workspace_id),
+            doc_id: DocId::from(doc_id),
         }
     }
 
     fn from_metadata(metadata: &DocumentMetadata) -> Self {
-        Self::new(&metadata.workspace_id, &metadata.id)
+        Self {
+            workspace_id: metadata.workspace_id.clone(),
+            doc_id: metadata.id.clone(),
+        }
     }
 }
 
@@ -351,17 +360,17 @@ impl Hash for CacheKey {
 
 #[derive(Clone, Eq)]
 struct PermissionCacheKey {
-    workspace_id: String,
-    doc_id: String,
-    user_id: String,
+    workspace_id: WorkspaceId,
+    doc_id: DocId,
+    user_id: UserId,
 }
 
 impl PermissionCacheKey {
     fn new(workspace_id: &str, doc_id: &str, user_id: &str) -> Self {
         Self {
-            workspace_id: workspace_id.to_owned(),
-            doc_id: doc_id.to_owned(),
-            user_id: user_id.to_owned(),
+            workspace_id: WorkspaceId::from(workspace_id),
+            doc_id: DocId::from(doc_id),
+            user_id: UserId::from(user_id),
         }
     }
 }

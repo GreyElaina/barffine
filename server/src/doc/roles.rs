@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use barffine_core::{
     doc_roles::{DocumentRoleRecord, DocumentRoleStore},
+    ids::UserId,
     notification::NotificationRecord,
     user_settings::NotificationPreferenceKind,
     workspace::WorkspaceRecord,
@@ -51,7 +52,7 @@ pub async fn enqueue_notification_record(
 
     let record = NotificationRecord {
         id: Uuid::new_v4().to_string(),
-        user_id: recipient_id.to_owned(),
+        user_id: UserId::from(recipient_id.to_owned()),
         kind: kind.to_owned(),
         payload,
         read: false,
@@ -108,8 +109,8 @@ pub async fn notify_owner_and_creator(
     event: &str,
 ) -> Result<(), AppError> {
     let mut targets: HashSet<&str> = HashSet::new();
-    if workspace.owner_id != actor_id {
-        targets.insert(&workspace.owner_id);
+    if workspace.owner_id.as_str() != actor_id {
+        targets.insert(workspace.owner_id.as_str());
     }
     if let Some(creator_id) = creator_id {
         if creator_id != actor_id {
@@ -278,7 +279,7 @@ pub async fn transfer_doc_owner(
         .map_err(AppError::from_anyhow)?;
 
     for owner in owners {
-        if owner.user_id == new_owner_id {
+        if owner.user_id.as_str() == new_owner_id {
             continue;
         }
 
@@ -326,7 +327,7 @@ async fn ensure_assignable_user(
 ) -> Result<(), AppError> {
     state.user_service.fetch_user(user_id).await?;
 
-    if workspace.owner_id == user_id {
+    if workspace.owner_id.as_str() == user_id {
         Err(AppError::bad_request(owner_error))
     } else {
         Ok(())

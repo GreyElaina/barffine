@@ -1,11 +1,9 @@
 // Blob storage handlers
 
-use anyhow::Error as AnyError;
 use axum::{
     Json,
-    body::Body,
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header::HeaderName},
+    http::HeaderMap,
     response::{IntoResponse, Response},
 };
 use barffine_core::blob::BlobDescriptor;
@@ -13,13 +11,11 @@ use barffine_core::blob::BlobDescriptor;
 use crate::{
     auth::resolve_workspace_access,
     error::AppError,
-    handlers::headers::{
-        HEADER_USER_ID, HEADER_WORKSPACE_ID, HEADER_WORKSPACE_ROLE, permission_header_value,
-    },
-    http::{append_set_cookie_headers, http_date_from_datetime},
     state::AppState,
-    types::{BlobDownloadQuery, PresignedUrlResponse, WorkspaceAccess},
-    utils::attachments::apply_attachment_headers,
+    types::{BlobDownloadQuery, PresignedUrlResponse},
+    utils::blob_download::{
+        BlobResponseContext, apply_blob_response_context, build_blob_download_response,
+    },
 };
 
 pub(crate) async fn get_workspace_blob_handler(
@@ -39,104 +35,26 @@ pub(crate) async fn get_workspace_blob_handler(
         .map_err(AppError::from_anyhow)?
         .ok_or_else(|| AppError::blob_not_found(&workspace_id, &blob_name))?;
 
-    if let Some(location) = download.location {
-        if query.redirect.as_deref() == Some("manual") {
-            let response = Json(PresignedUrlResponse {
-                url: location.uri.clone(),
-            })
-            .into_response();
-            let response = finalize_workspace_response(response, &access)?;
-            return Ok(response);
-        }
-
-        let response = Response::builder()
-            .status(StatusCode::FOUND)
-            .header("location", location.uri)
-            .body(Body::empty())
-            .map_err(|err| AppError::internal(AnyError::new(err)))?;
-
-        let response = finalize_workspace_response(response, &access)?;
+    if download.location.is_some() && query.redirect.as_deref() == Some("manual") {
+        let mut response = Json(PresignedUrlResponse {
+            url: download
+                .location
+                .as_ref()
+                .map(|loc| loc.uri.clone())
+                .unwrap_or_default(),
+        })
+        .into_response();
+        apply_blob_response_context(&mut response, BlobResponseContext::Workspace(&access))?;
         return Ok(response);
     }
 
-    let bytes = download
-        .bytes
-        .ok_or_else(|| AppError::blob_not_found(&workspace_id, &blob_name))?;
-
-    let mut response = Response::builder()
-        .status(StatusCode::OK)
-        .body(Body::from(bytes))
-        .map_err(|err| AppError::internal(AnyError::new(err)))?;
-
-    if let Some(metadata) = download.metadata.as_ref() {
-        if let Some(length) = metadata.content_length {
-            let value = HeaderValue::from_str(&length.to_string())
-                .map_err(|err| AppError::internal(AnyError::new(err)))?;
-            response
-                .headers_mut()
-                .insert(HeaderName::from_static("content-length"), value);
-        }
-
-        if let Some(last_modified) = metadata.last_modified {
-            if let Some(formatted) = http_date_from_datetime(&last_modified) {
-                let value = HeaderValue::from_str(&formatted)
-                    .map_err(|err| AppError::internal(AnyError::new(err)))?;
-                response
-                    .headers_mut()
-                    .insert(HeaderName::from_static("last-modified"), value);
-            }
-        }
-
-        apply_attachment_headers(&mut response, Some(metadata), &blob_name)?;
-    } else {
-        apply_attachment_headers(&mut response, None, &blob_name)?;
-    }
-
-    response.headers_mut().insert(
-        HeaderName::from_static("cache-control"),
-        HeaderValue::from_static("public, max-age=2592000, immutable"),
-    );
-
-    let response = finalize_workspace_response(response, &access)?;
-    Ok(response)
-}
-
-fn finalize_workspace_response(
-    mut response: Response,
-    access: &WorkspaceAccess,
-) -> Result<Response, AppError> {
-    append_workspace_headers(&mut response, access)?;
-    append_set_cookie_headers(&mut response, &access.set_cookies)?;
-    Ok(response)
-}
-
-fn append_workspace_headers(
-    response: &mut Response,
-    access: &WorkspaceAccess,
-) -> Result<(), AppError> {
-    let headers = response.headers_mut();
-    headers.insert(
-        HeaderName::from_static(HEADER_WORKSPACE_ID),
-        HeaderValue::from_str(&access.workspace.id)
-            .map_err(|err| AppError::internal(AnyError::new(err)))?,
-    );
-
-    if let Some(user) = &access.user {
-        headers.insert(
-            HeaderName::from_static(HEADER_USER_ID),
-            HeaderValue::from_str(&user.id)
-                .map_err(|err| AppError::internal(AnyError::new(err)))?,
-        );
-    }
-
-    if let Some(role) = access.workspace_role {
-        headers.insert(
-            HeaderName::from_static(HEADER_WORKSPACE_ROLE),
-            HeaderValue::from_static(permission_header_value(role)),
-        );
-    }
-
-    Ok(())
+    build_blob_download_response(
+        download,
+        &blob_name,
+        "public, max-age=2592000, immutable",
+        BlobResponseContext::Workspace(&access),
+        || AppError::blob_not_found(&workspace_id, &blob_name),
+    )
 }
 
 #[cfg(test)]

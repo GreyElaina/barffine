@@ -50,6 +50,7 @@ pub mod comment_repo;
 pub mod doc_public_link_store;
 pub mod doc_repo;
 pub mod doc_role_repo;
+pub mod errors;
 pub mod postgres;
 pub mod rocks;
 pub mod sql;
@@ -59,6 +60,8 @@ pub mod user_repo;
 pub mod user_settings_repo;
 pub mod workspace_feature_repo;
 pub mod workspace_repo;
+
+pub use errors::is_unique_violation;
 
 #[derive(Clone)]
 pub struct RepositoryRegistry {

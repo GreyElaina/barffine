@@ -2,18 +2,21 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::db::{Database, comment_attachment_repo::CommentAttachmentRepositoryRef};
+use crate::{
+    db::{Database, comment_attachment_repo::CommentAttachmentRepositoryRef},
+    ids::{DocId, UserId, WorkspaceId},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommentAttachmentRecord {
-    pub workspace_id: String,
-    pub doc_id: String,
+    pub workspace_id: WorkspaceId,
+    pub doc_id: DocId,
     pub key: String,
     pub name: String,
     pub mime: String,
     pub size: i64,
     pub created_at: DateTime<Utc>,
-    pub created_by: Option<String>,
+    pub created_by: Option<UserId>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +78,7 @@ mod tests {
         config::{AppConfig, BlobStoreBackend, DocDataBackend},
         db::{user_repo::CreateUserParams, workspace_repo::CreateWorkspaceParams},
         doc_store::DocumentStore,
+        ids::{UserId, WorkspaceId},
     };
     use chrono::Utc;
     use tempfile::TempDir;
@@ -116,8 +120,8 @@ mod tests {
         repos
             .workspace_repo()
             .create_workspace(CreateWorkspaceParams {
-                id: "workspace".to_string(),
-                owner_id: "user".to_string(),
+                id: WorkspaceId::from("workspace"),
+                owner_id: UserId::from("user"),
                 name: "Test Workspace".to_string(),
                 created_at: now,
                 public: false,
@@ -158,13 +162,16 @@ mod tests {
             .await
             .expect("upsert attachment");
 
-        assert_eq!(record.workspace_id, "workspace");
-        assert_eq!(record.doc_id, "doc");
+        assert_eq!(record.workspace_id.as_str(), "workspace");
+        assert_eq!(record.doc_id.as_str(), "doc");
         assert_eq!(record.key, "key");
         assert_eq!(record.name, "file.txt");
         assert_eq!(record.mime, "text/plain");
         assert_eq!(record.size, 42);
-        assert_eq!(record.created_by.as_deref(), Some("user"));
+        assert_eq!(
+            record.created_by.as_ref().map(|id| id.as_str()),
+            Some("user")
+        );
 
         let fetched = store
             .get("workspace", "doc", "key")

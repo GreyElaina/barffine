@@ -120,7 +120,7 @@ impl DocAccessService {
         let mut workspace_role: Option<Permission> = None;
 
         if let Some(user_id) = user_id {
-            if user_id == workspace.owner_id {
+            if user_id == workspace.owner_id.as_str() {
                 workspace_role = Some(Permission::Owner);
             } else if let Some(role) = self
                 .workspace_service

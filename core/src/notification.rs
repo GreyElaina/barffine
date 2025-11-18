@@ -4,6 +4,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+use crate::ids::{DocId, UserId, WorkspaceId};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CommentVisibility {
     Private,
@@ -14,9 +16,9 @@ pub enum CommentVisibility {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommentRecord {
     pub id: String,
-    pub workspace_id: String,
-    pub doc_id: String,
-    pub author_id: String,
+    pub workspace_id: WorkspaceId,
+    pub doc_id: DocId,
+    pub author_id: UserId,
     pub body: String,
     pub visibility: CommentVisibility,
     pub metadata: JsonValue,
@@ -29,7 +31,7 @@ pub struct CommentRecord {
 pub struct CommentReplyRecord {
     pub id: String,
     pub comment_id: String,
-    pub author_id: String,
+    pub author_id: UserId,
     pub body: String,
     pub metadata: JsonValue,
     pub created_at: DateTime<Utc>,
@@ -47,8 +49,8 @@ pub struct CommentChangeRecord {
     pub action: CommentChangeAction,
     pub id: String,
     pub comment_id: Option<String>,
-    pub workspace_id: String,
-    pub doc_id: String,
+    pub workspace_id: WorkspaceId,
+    pub doc_id: DocId,
     pub item: JsonValue,
     pub updated_at: DateTime<Utc>,
     pub change_row_id: i64,
@@ -79,7 +81,7 @@ pub struct CommentCursor {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationRecord {
     pub id: String,
-    pub user_id: String,
+    pub user_id: UserId,
     pub kind: String,
     pub payload: JsonValue,
     pub read: bool,
@@ -145,9 +147,9 @@ mod tests {
     fn comment_visibility_defaults() {
         let comment = CommentRecord {
             id: "comment".into(),
-            workspace_id: "ws".into(),
-            doc_id: "doc".into(),
-            author_id: "user".into(),
+            workspace_id: WorkspaceId::from("ws"),
+            doc_id: DocId::from("doc"),
+            author_id: UserId::from("user"),
             body: "Hello".into(),
             resolved: false,
             visibility: CommentVisibility::Workspace,

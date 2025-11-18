@@ -1,7 +1,9 @@
+use crate::ids::{UserId, WorkspaceId};
+
 #[derive(Debug, Clone)]
 pub struct WorkspaceMemberRecord {
-    pub workspace_id: String,
-    pub user_id: String,
+    pub workspace_id: WorkspaceId,
+    pub user_id: UserId,
     pub role: String,
     pub status: String,
     pub inviter_id: Option<String>,

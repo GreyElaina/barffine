@@ -7,9 +7,8 @@ use axum::http::{
 use serde_json::Value as JsonValue;
 use socketioxide::SocketIo;
 use socketioxide::adapter::Adapter;
-use socketioxide::handler::ConnectMiddleware;
+use socketioxide::handler::{ConnectMiddleware, Value};
 use socketioxide::layer::SocketIoLayer;
-use socketioxide_core::Value;
 use tracing::{error, info, warn};
 
 use crate::{
@@ -21,20 +20,13 @@ use crate::{
 };
 
 pub(crate) fn build_socket(
-    state: Arc<AppState>,
     runtime: Arc<SocketRuntimeState>,
 ) -> (SocketIoLayer, SocketIo) {
-    let mut builder = SocketIo::builder().with_state(runtime.clone());
-
-    if let Some(prefix) = state.server_path.as_deref() {
-        let path: Cow<'static, str> = Cow::Owned(format!("{prefix}/socket.io"));
-        builder = builder.req_path(path);
-    }
-
-    // Align with AFFiNE defaults (100 MB) to avoid premature disconnects
-    builder = builder.max_payload(100_000_000).max_buffer_size(16_384);
-
-    builder.build_layer()
+    SocketIo::builder()
+        .with_state(runtime.clone())
+        .max_payload(100_000_000)
+        .max_buffer_size(16_384)
+        .build_layer()
 }
 
 #[derive(Clone)]

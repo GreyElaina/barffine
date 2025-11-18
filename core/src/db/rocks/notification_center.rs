@@ -9,6 +9,7 @@ use serde_json::Value as JsonValue;
 
 use crate::{
     doc_data::RocksDocDataStore,
+    ids::UserId,
     notification::{NotificationCenter, NotificationRecord},
 };
 
@@ -62,7 +63,7 @@ impl RocksNotificationCenter {
     fn serialize_record(record: &NotificationRecord) -> Result<Vec<u8>> {
         let stored = StoredNotification {
             id: record.id.clone(),
-            user_id: record.user_id.clone(),
+            user_id: record.user_id.to_string(),
             kind: record.kind.clone(),
             payload: record.payload.clone(),
             read: record.read,
@@ -84,7 +85,7 @@ impl RocksNotificationCenter {
             .ok_or_else(|| anyhow!("invalid updated_at timestamp"))?;
         Ok(NotificationRecord {
             id: stored.id,
-            user_id: stored.user_id,
+            user_id: UserId::from(stored.user_id),
             kind: stored.kind,
             payload: stored.payload,
             read: stored.read,
@@ -199,7 +200,7 @@ impl NotificationCenter for RocksNotificationCenter {
     async fn enqueue(&self, mut notification: NotificationRecord) -> Result<()> {
         notification.read = false;
         let timestamp = notification.created_at.timestamp();
-        let list_key = Self::list_key(&notification.user_id, timestamp, &notification.id);
+        let list_key = Self::list_key(notification.user_id.as_str(), timestamp, &notification.id);
         let id_key = Self::id_key(&notification.id);
         let value = Self::serialize_record(&notification)?;
 
@@ -209,7 +210,7 @@ impl NotificationCenter for RocksNotificationCenter {
         batch.put_cf(cf, list_key.as_bytes(), value);
         batch.put_cf(cf, id_key.as_bytes(), list_key.as_bytes());
         db.write(batch)?;
-        self.increment_count(&notification.user_id, 1)?;
+        self.increment_count(notification.user_id.as_str(), 1)?;
         Ok(())
     }
 

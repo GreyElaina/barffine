@@ -1,5 +1,7 @@
 // Authentication and authorization logic
 
+use std::sync::Arc;
+
 use argon2::{
     Argon2,
     password_hash::{
@@ -53,6 +55,23 @@ impl AuthState for SocketRuntimeState {
 
     fn doc_access_service(&self) -> &DocAccessService {
         self.doc_access_service.as_ref()
+    }
+}
+
+impl<T> AuthState for Arc<T>
+where
+    T: AuthState + ?Sized,
+{
+    fn user_service(&self) -> &UserService {
+        (**self).user_service()
+    }
+
+    fn workspace_service(&self) -> &WorkspaceService {
+        (**self).workspace_service()
+    }
+
+    fn doc_access_service(&self) -> &DocAccessService {
+        (**self).doc_access_service()
     }
 }
 
@@ -139,7 +158,7 @@ where
 
     let mut workspace_role: Option<Permission> = None;
     if let Some(user_record) = user.as_ref() {
-        if user_record.id == workspace.owner_id {
+        if user_record.id == workspace.owner_id.as_str() {
             workspace_role = Some(Permission::Owner);
         } else if state.workspace_service().is_admin(&user_record.id).await? {
             workspace_role = Some(Permission::Admin);

@@ -26,8 +26,8 @@ use super::{OAuthAccount, OAuthProviderKind, OAuthState};
 
 pub fn oauth_router() -> Router<AppState> {
     Router::new()
-        .route("/api/oauth/preflight", post(oauth_preflight_handler))
-        .route("/api/oauth/callback", post(oauth_callback_handler))
+        .route("/oauth/preflight", post(oauth_preflight_handler))
+        .route("/oauth/callback", post(oauth_callback_handler))
 }
 
 #[derive(Deserialize)]

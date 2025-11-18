@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value as JsonValue, json};
 
 use barffine_core::{
-    feature::FeatureNamespace, notification::NotificationRecord, user,
+    feature::FeatureNamespace, ids::WorkspaceId, notification::NotificationRecord, user,
     workspace::DEFAULT_WORKSPACE_NAME,
 };
 
@@ -285,7 +285,7 @@ mod tests {
         testing::{insert_document, seed_workspace, setup_state},
     };
     use async_graphql::{Request as GraphQLRequest, Value as GraphQLValue};
-    use barffine_core::notification::NotificationRecord;
+use barffine_core::{ids::UserId, notification::NotificationRecord};
     use chrono::{Duration, Utc};
     use serde_json::json;
     use uuid::Uuid;
@@ -760,7 +760,7 @@ mod tests {
         let now = Utc::now();
         let record = NotificationRecord {
             id: Uuid::new_v4().to_string(),
-            user_id: user.id.clone(),
+            user_id: UserId::from(user.id.clone()),
             kind: "comment".to_string(),
             payload: json!({ "workspaceId": "ws", "docId": "doc" }),
             read: false,
@@ -834,7 +834,7 @@ mod tests {
 
         let older = NotificationRecord {
             id: Uuid::new_v4().to_string(),
-            user_id: user.id.clone(),
+            user_id: UserId::from(user.id.clone()),
             kind: "comment".to_string(),
             payload: json!({ "workspaceId": "ws", "docId": "older" }),
             read: false,
@@ -843,7 +843,7 @@ mod tests {
         };
         let newer = NotificationRecord {
             id: Uuid::new_v4().to_string(),
-            user_id: user.id.clone(),
+            user_id: UserId::from(user.id.clone()),
             kind: "comment".to_string(),
             payload: json!({ "workspaceId": "ws", "docId": "newer" }),
             read: false,
@@ -1167,13 +1167,13 @@ fn notification_type_str(value: NotificationTypeEnum) -> &'static str {
 
 struct NotificationLookups {
     users: HashMap<String, JsonValue>,
-    workspaces: HashMap<String, JsonValue>,
+    workspaces: HashMap<WorkspaceId, JsonValue>,
 }
 
 impl NotificationLookups {
     async fn gather(state: &AppState, notifications: &[NotificationRecord]) -> GraphQLResult<Self> {
         let mut user_ids: HashSet<String> = HashSet::new();
-        let mut workspace_ids: HashSet<String> = HashSet::new();
+        let mut workspace_ids: HashSet<WorkspaceId> = HashSet::new();
 
         for record in notifications {
             if let JsonValue::Object(map) = &record.payload {
@@ -1183,7 +1183,7 @@ impl NotificationLookups {
 
                 if let Some(workspace_id) = map.get("workspaceId").and_then(|value| value.as_str())
                 {
-                    workspace_ids.insert(workspace_id.to_string());
+                    workspace_ids.insert(WorkspaceId::from(workspace_id));
                 }
             }
         }
@@ -1212,7 +1212,10 @@ impl NotificationLookups {
 
         let mut workspaces = HashMap::new();
         if !workspace_ids.is_empty() {
-            let ids: Vec<String> = workspace_ids.into_iter().collect();
+            let ids: Vec<String> = workspace_ids
+                .into_iter()
+                .map(|id| id.into_inner())
+                .collect();
             let records = state
                 .workspace_store
                 .find_by_ids(&ids)
@@ -1225,7 +1228,7 @@ impl NotificationLookups {
                 let display_name = WorkspaceService::normalized_workspace_title(&record.name)
                     .unwrap_or(DEFAULT_WORKSPACE_NAME)
                     .to_string();
-                let url = format_workspace_url(base_url, &workspace_id);
+                let url = format_workspace_url(base_url, workspace_id.as_str());
                 workspaces.insert(
                     workspace_id,
                     json!({
@@ -1245,7 +1248,7 @@ impl NotificationLookups {
     }
 
     fn workspace(&self, workspace_id: &str) -> Option<&JsonValue> {
-        self.workspaces.get(workspace_id)
+        self.workspaces.get(&WorkspaceId::from(workspace_id))
     }
 }
 

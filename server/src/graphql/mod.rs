@@ -284,8 +284,8 @@ mod tests {
     #[test]
     fn doc_cursor_roundtrip() {
         let metadata = DocumentMetadata {
-            id: "doc-1".to_string(),
-            workspace_id: "ws-1".to_string(),
+            id: "doc-1".to_string().into(),
+            workspace_id: "ws-1".to_string().into(),
             created_at: 12_000,
             updated_at: 12_345,
             default_role: "manager".to_string(),
@@ -315,10 +315,12 @@ mod tests {
 
     #[test]
     fn granted_user_cursor_roundtrip() {
+        use barffine_core::ids::{DocId, UserId, WorkspaceId};
+
         let record = DocumentRoleRecord {
-            workspace_id: "ws-1".to_string(),
-            doc_id: "doc-1".to_string(),
-            user_id: "user-9".to_string(),
+            workspace_id: WorkspaceId::from("ws-1"),
+            doc_id: DocId::from("doc-1"),
+            user_id: UserId::from("user-9"),
             role: "editor".to_string(),
             created_at: 12_345,
         };

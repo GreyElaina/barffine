@@ -514,7 +514,6 @@ dependencies = [
  "serde_urlencoded",
  "snap",
  "socketioxide",
- "socketioxide-core",
  "sqlx",
  "tempfile",
  "thiserror 2.0.17",
@@ -559,6 +558,7 @@ name = "bench-runner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "barffine-server",
  "chrono",
  "clap",
  "fastrand",

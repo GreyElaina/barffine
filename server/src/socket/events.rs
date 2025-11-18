@@ -17,9 +17,10 @@ use yrs::updates::decoder::Decode;
 use yrs::{Doc as YrsDoc, ReadTxn, StateVector, Transact, Update};
 
 use crate::{
-    auth::{DocAccessIntent, RpcAccessRequirement, resolve_doc_access, resolve_workspace_access},
+    auth::{DocAccessIntent, RpcAccessRequirement, resolve_workspace_access},
     doc::{
         channels::doc_channel_key,
+        context::DocAccessContext,
         sync::{UpdateBroadcastContext, apply_doc_updates},
     },
     error::AppError,
@@ -30,17 +31,17 @@ use crate::{
         rooms::{RoomKind, SpaceType, space_room_name},
         types::{SocketRequestContext, SocketSpanRegistry, SocketUserContext},
     },
-    state::{AppState, DocSessionKey, SocketBroadcastMeta, SocketRuntimeState},
+    state::{AppState, DocSessionKey, SocketBroadcastMeta, SocketRuntimeState, SpaceKeyId},
     types::RestDocAccess,
     utils::crdt::{decode_state_vector, encode_state_vector},
 };
-
+use barffine_core::ids::{DocId, WorkspaceId};
 use dashmap::DashMap;
 
 const DOC_ACCESS_CACHE_TTL: Duration = Duration::from_secs(2);
 
 struct SocketDocAccessCache {
-    inner: DashMap<(String, String), CachedDocAccess>,
+    inner: DashMap<(WorkspaceId, DocId), CachedDocAccess>,
 }
 
 impl SocketDocAccessCache {
@@ -50,8 +51,8 @@ impl SocketDocAccessCache {
         }
     }
 
-    fn get(&self, workspace_id: &str, doc_id: &str) -> Option<RestDocAccess> {
-        let key = (workspace_id.to_string(), doc_id.to_string());
+    fn get(&self, workspace_id: &WorkspaceId, doc_id: &DocId) -> Option<RestDocAccess> {
+        let key = (workspace_id.clone(), doc_id.clone());
         if let Some(mut entry) = self.inner.get_mut(&key) {
             if entry.is_valid() {
                 entry.refresh();
@@ -62,14 +63,14 @@ impl SocketDocAccessCache {
         None
     }
 
-    fn insert(&self, workspace_id: &str, doc_id: &str, access: RestDocAccess) {
-        let key = (workspace_id.to_string(), doc_id.to_string());
+    fn insert(&self, workspace_id: &WorkspaceId, doc_id: &DocId, access: RestDocAccess) {
+        let key = (workspace_id.clone(), doc_id.clone());
         let cached = CachedDocAccess::new(access);
         self.inner.insert(key, cached);
     }
 
-    fn remove(&self, workspace_id: &str, doc_id: &str) {
-        let key = (workspace_id.to_string(), doc_id.to_string());
+    fn remove(&self, workspace_id: &WorkspaceId, doc_id: &DocId) {
+        let key = (workspace_id.clone(), doc_id.clone());
         self.inner.remove(&key);
     }
 }
@@ -83,9 +84,22 @@ impl Default for SocketDocAccessCache {
 async fn finalize_doc_session(state: &SocketRuntimeState, key: &DocSessionKey) {
     state
         .doc_cache
-        .close_session(key.space_type, &key.space_id, &key.doc_id)
+        .close_session(
+            key.space_type,
+            match &key.space_id {
+                SpaceKeyId::Workspace(id) => id.as_str(),
+                SpaceKeyId::Userspace(id) => id.as_str(),
+            },
+            &key.doc_id,
+        )
         .await;
-    let channel_key = doc_channel_key(&key.space_id, &key.doc_id);
+    let channel_key = doc_channel_key(
+        match &key.space_id {
+            SpaceKeyId::Workspace(id) => id.as_str(),
+            SpaceKeyId::Userspace(id) => id.as_str(),
+        },
+        &key.doc_id,
+    );
     state.sync_hub.remove_channel(&channel_key);
 }
 
@@ -284,28 +298,33 @@ fn ensure_doc_delete_permission(access: &RestDocAccess) -> Result<(), AppError> 
 }
 
 async fn resolve_doc_access_cached(
-    runtime: &SocketRuntimeState,
+    runtime: Arc<SocketRuntimeState>,
     cache: &SocketDocAccessCache,
     user: &SocketUserContext,
-    workspace_id: &str,
-    doc_id: &str,
-) -> Result<RestDocAccess, AppError> {
+    workspace_id: &WorkspaceId,
+    doc_id: &DocId,
+) -> Result<DocAccessContext<Arc<SocketRuntimeState>>, AppError> {
     if let Some(access) = cache.get(workspace_id, doc_id) {
-        return Ok(access);
+        return Ok(DocAccessContext::from_access(
+            runtime,
+            workspace_id.clone(),
+            doc_id.clone(),
+            access,
+        ));
     }
 
     let headers = user.header_map()?;
-    let access = resolve_doc_access(
-        runtime,
+    let ctx = DocAccessContext::new(
+        runtime.clone(),
         &headers,
-        workspace_id,
-        doc_id,
+        workspace_id.clone(),
+        doc_id.clone(),
         RpcAccessRequirement::Optional,
         DocAccessIntent::Standard,
     )
     .await?;
-    cache.insert(workspace_id, doc_id, access.clone());
-    Ok(access)
+    cache.insert(workspace_id, doc_id, ctx.access().clone());
+    Ok(ctx)
 }
 
 fn ensure_userspace_owner(user: &SocketUserContext, space_id: &str) -> Result<(), AppError> {
@@ -642,12 +661,15 @@ async fn handle_space_load_doc(
 
         let (snapshot_bytes, timestamp) = match payload.space_type {
             SpaceType::Workspace => {
+                let workspace_id = WorkspaceId::from(payload.space_id.clone());
+                let doc_id = DocId::from(payload.doc_id.clone());
+
                 if let Err(err) = resolve_doc_access_cached(
-                    runtime.as_ref(),
+                    runtime.clone(),
                     doc_access_cache.as_ref(),
                     &user,
-                    &payload.space_id,
-                    &payload.doc_id,
+                    &workspace_id,
+                    &doc_id,
                 )
                 .await
                 {
@@ -665,7 +687,7 @@ async fn handle_space_load_doc(
                 match runtime
                     .doc_cache
                     .clone()
-                    .snapshot(SpaceType::Workspace, &payload.space_id, &payload.doc_id)
+                    .snapshot(SpaceType::Workspace, workspace_id.as_str(), doc_id.as_str())
                     .await
                 {
                     Ok(snapshot) => snapshot,
@@ -927,12 +949,15 @@ async fn handle_space_push_doc_update(
 
         match payload.space_type {
             SpaceType::Workspace => {
-                let mut access = match resolve_doc_access_cached(
-                    runtime.as_ref(),
+                let workspace_id = WorkspaceId::from(payload.space_id.clone());
+                let doc_id = DocId::from(payload.doc_id.clone());
+
+                let ctx = match resolve_doc_access_cached(
+                    runtime.clone(),
                     doc_access_cache.as_ref(),
                     &user,
-                    &payload.space_id,
-                    &payload.doc_id,
+                    &workspace_id,
+                    &doc_id,
                 )
                 .await
                 {
@@ -942,6 +967,8 @@ async fn handle_space_push_doc_update(
                         return;
                     }
                 };
+
+                let mut access = ctx.into_access();
 
                 if access.metadata.blocked {
                     ack_error::<PushDocUpdateResponse>(
@@ -960,8 +987,8 @@ async fn handle_space_push_doc_update(
                 let cache_result = match apply_doc_updates(
                     runtime.as_ref(),
                     SpaceType::Workspace,
-                    &payload.space_id,
-                    &payload.doc_id,
+                    workspace_id.as_str(),
+                    doc_id.as_str(),
                     vec![update_bytes.clone()],
                     UpdateBroadcastContext {
                         editor_id: Some(user.user_id.as_str()),
@@ -978,7 +1005,7 @@ async fn handle_space_push_doc_update(
                 };
 
                 access.metadata.updated_at = cache_result.timestamp;
-                doc_access_cache.insert(&payload.space_id, &payload.doc_id, access);
+                doc_access_cache.insert(&workspace_id, &doc_id, access);
 
                 let timestamp = Some(cache_result.timestamp);
                 runtime.request_deduper.store(
@@ -1114,12 +1141,15 @@ async fn handle_space_push_doc_updates(
 
         match space_type {
             SpaceType::Workspace => {
-                let mut access = match resolve_doc_access_cached(
-                    runtime.as_ref(),
+                let workspace_id = WorkspaceId::from(space_id.clone());
+                let doc_id_typed = DocId::from(doc_id.clone());
+
+                let ctx = match resolve_doc_access_cached(
+                    runtime.clone(),
                     doc_access_cache.as_ref(),
                     &user,
-                    &space_id,
-                    &doc_id,
+                    &workspace_id,
+                    &doc_id_typed,
                 )
                 .await
                 {
@@ -1129,6 +1159,8 @@ async fn handle_space_push_doc_updates(
                         return;
                     }
                 };
+
+                let mut access = ctx.into_access();
 
                 if access.metadata.blocked {
                     ack_error::<PushDocUpdateResponse>(
@@ -1149,8 +1181,8 @@ async fn handle_space_push_doc_updates(
                     .clone()
                     .apply_updates(
                         SpaceType::Workspace,
-                        &space_id,
-                        &doc_id,
+                        workspace_id.as_str(),
+                        doc_id_typed.as_str(),
                         update_bytes.clone(),
                         Some(user.user_id.as_str()),
                     )
@@ -1168,7 +1200,7 @@ async fn handle_space_push_doc_updates(
                 };
 
                 access.metadata.updated_at = cache_result.timestamp;
-                doc_access_cache.insert(&space_id, &doc_id, access);
+                doc_access_cache.insert(&workspace_id, &doc_id_typed, access);
 
                 let timestamp = Some(cache_result.timestamp);
                 runtime.request_deduper.store(
@@ -1349,12 +1381,15 @@ async fn handle_space_delete_doc(
 
         match payload.space_type {
             SpaceType::Workspace => {
-                let access = match resolve_doc_access_cached(
-                    runtime.as_ref(),
+                let workspace_id = WorkspaceId::from(payload.space_id.clone());
+                let doc_id = DocId::from(payload.doc_id.clone());
+
+                let ctx = match resolve_doc_access_cached(
+                    runtime.clone(),
                     doc_access_cache.as_ref(),
                     &user,
-                    &payload.space_id,
-                    &payload.doc_id,
+                    &workspace_id,
+                    &doc_id,
                 )
                 .await
                 {
@@ -1365,6 +1400,8 @@ async fn handle_space_delete_doc(
                     }
                 };
 
+                let access = ctx.access();
+
                 if access.metadata.blocked {
                     ack_error::<DeleteDocResponse>(
                         ack,
@@ -1374,7 +1411,7 @@ async fn handle_space_delete_doc(
                     return;
                 }
 
-                if let Err(err) = ensure_doc_delete_permission(&access) {
+                if let Err(err) = ensure_doc_delete_permission(access) {
                     ack_error::<DeleteDocResponse>(ack, err, Some(&request.request_id));
                     return;
                 }
@@ -1385,7 +1422,7 @@ async fn handle_space_delete_doc(
                     .await
                 {
                     Ok(true) => {
-                        doc_access_cache.remove(&payload.space_id, &payload.doc_id);
+                        doc_access_cache.remove(&workspace_id, &doc_id);
                         runtime
                             .doc_cache
                             .clone()
@@ -1984,7 +2021,14 @@ mod tests {
             .expect("create user");
         let workspace = state
             .workspace_store
-            .create(&user.id, Some("Switching Space"), None, None, None, None)
+            .create(
+                &barffine_core::ids::UserId::from(user.id.clone()),
+                Some("Switching Space"),
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("create workspace");
 
@@ -2009,7 +2053,7 @@ mod tests {
                 .expect("cache snapshot");
             let first_session = state.doc_sessions.register(
                 socket_id,
-                DocSessionKey::new(SpaceType::Workspace, workspace.id.clone(), doc_id.clone()),
+                DocSessionKey::workspace(workspace.id.clone(), DocId::from(doc_id.clone())),
             );
             if first_session {
                 state
@@ -2044,8 +2088,7 @@ mod tests {
                     .doc_sessions
                     .remove_doc(SpaceType::Workspace, &workspace.id, &doc_id);
             assert!(removed, "doc should be removed on awareness leave");
-            let key =
-                DocSessionKey::new(SpaceType::Workspace, workspace.id.clone(), doc_id.clone());
+            let key = DocSessionKey::workspace(workspace.id.clone(), DocId::from(doc_id.clone()));
             finalize_doc_session(runtime.as_ref(), &key).await;
         }
 

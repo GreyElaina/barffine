@@ -2,12 +2,11 @@
 
 use std::sync::OnceLock;
 
-use anyhow::Error as AnyError;
 use argon2::password_hash::Error as PasswordHashError;
 use axum::{
     Json,
     extract::State,
-    http::{HeaderMap, HeaderValue, StatusCode, header::SET_COOKIE},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use barffine_core::feature::FeatureNamespace;
@@ -17,11 +16,9 @@ use tracing::error;
 
 use crate::{
     auth::{authenticate_with_password, generate_password_hash, pad_session_response},
-    cookies::{
-        USER_COOKIE_NAME, build_session_cookie, build_user_cookie, clear_session_cookie,
-        clear_user_cookie, extract_cookie, extract_session_token,
-    },
+    cookies::{USER_COOKIE_NAME, extract_cookie, extract_session_token},
     error::AppError,
+    handlers::session_cookies::SessionCookies,
     http::append_set_cookie_headers,
     state::{AppState, FeatureSnapshotPayload},
     types::{
@@ -88,11 +85,6 @@ async fn create_admin_user_locked(
         .await
         .map_err(AppError::from_anyhow)?;
 
-    let cookies = vec![
-        build_session_cookie(&session.id, session.expires_at),
-        build_user_cookie(&user.id, session.expires_at),
-    ];
-
     let mut response = Json(CreateUserResponse {
         id: user.id.clone(),
         email: user.email.clone(),
@@ -100,7 +92,10 @@ async fn create_admin_user_locked(
     })
     .into_response();
 
-    append_set_cookie_headers(&mut response, &cookies)?;
+    SessionCookies::new()
+        .set_session(&session.id, session.expires_at)
+        .set_user(&user.id, session.expires_at)
+        .apply(&mut response)?;
     Ok(response)
 }
 
@@ -184,10 +179,10 @@ pub(crate) async fn sign_out_handler(
     }
 
     let mut response = Json(json!({})).into_response();
-    append_set_cookie_headers(
-        &mut response,
-        &[clear_session_cookie(), clear_user_cookie()],
-    )?;
+    SessionCookies::new()
+        .clear_session()
+        .clear_user()
+        .apply(&mut response)?;
     Ok(response)
 }
 
@@ -213,25 +208,18 @@ pub(crate) async fn create_session_handler(
     let email = email.trim();
     let (user, session) = authenticate_with_password(&state, email, &password).await?;
 
-    let session_cookie = build_session_cookie(&session.id, session.expires_at);
-    let user_cookie = build_user_cookie(&user.id, session.expires_at);
-
-    let response = CreateSessionResponse {
+    let session_id = session.id.clone();
+    let user_id = user.id.clone();
+    let mut resp = Json(CreateSessionResponse {
         session_id: session.id,
         user_id: user.id,
-    };
-
-    let mut resp = Json(response).into_response();
+    })
+    .into_response();
     *resp.status_mut() = StatusCode::CREATED;
-
-    let session_header = HeaderValue::from_str(&session_cookie)
-        .map_err(|err| AppError::internal(AnyError::new(err)))?;
-    resp.headers_mut().append(SET_COOKIE, session_header);
-
-    let user_header = HeaderValue::from_str(&user_cookie)
-        .map_err(|err| AppError::internal(AnyError::new(err)))?;
-    resp.headers_mut().append(SET_COOKIE, user_header);
-
+    SessionCookies::new()
+        .set_session(&session_id, session.expires_at)
+        .set_user(&user_id, session.expires_at)
+        .apply(&mut resp)?;
     Ok(resp)
 }
 
@@ -254,13 +242,11 @@ pub(crate) async fn sign_in_handler(
 
     let (user, session) = authenticate_with_password(&state, &email, &password).await?;
 
-    let cookies = vec![
-        build_session_cookie(&session.id, session.expires_at),
-        build_user_cookie(&user.id, session.expires_at),
-    ];
-
     let mut response = Json(SessionUser::from(&user)).into_response();
-    append_set_cookie_headers(&mut response, &cookies)?;
+    SessionCookies::new()
+        .set_session(&session.id, session.expires_at)
+        .set_user(&user.id, session.expires_at)
+        .apply(&mut response)?;
     Ok(response)
 }
 
@@ -278,16 +264,10 @@ pub(crate) async fn delete_session_handler(
 
     let Some(session_id) = session_id else {
         let mut response = ().into_response();
-        response.headers_mut().append(
-            SET_COOKIE,
-            HeaderValue::from_str(&clear_session_cookie())
-                .map_err(|err| AppError::internal(AnyError::new(err)))?,
-        );
-        response.headers_mut().append(
-            SET_COOKIE,
-            HeaderValue::from_str(&clear_user_cookie())
-                .map_err(|err| AppError::internal(AnyError::new(err)))?,
-        );
+        SessionCookies::new()
+            .clear_session()
+            .clear_user()
+            .apply(&mut response)?;
         return Ok(response);
     };
 
@@ -318,17 +298,10 @@ pub(crate) async fn delete_session_handler(
         .map_err(AppError::from_anyhow)?;
 
     let mut response = ().into_response();
-    response.headers_mut().append(
-        SET_COOKIE,
-        HeaderValue::from_str(&clear_session_cookie())
-            .map_err(|err| AppError::internal(AnyError::new(err)))?,
-    );
-    response.headers_mut().append(
-        SET_COOKIE,
-        HeaderValue::from_str(&clear_user_cookie())
-            .map_err(|err| AppError::internal(AnyError::new(err)))?,
-    );
-
+    SessionCookies::new()
+        .clear_session()
+        .clear_user()
+        .apply(&mut response)?;
     Ok(response)
 }
 
@@ -352,16 +325,10 @@ pub(crate) async fn refresh_session_handler(
         .map_err(AppError::from_anyhow)?
     else {
         let mut response = ().into_response();
-        response.headers_mut().append(
-            SET_COOKIE,
-            HeaderValue::from_str(&clear_session_cookie())
-                .map_err(|err| AppError::internal(AnyError::new(err)))?,
-        );
-        response.headers_mut().append(
-            SET_COOKIE,
-            HeaderValue::from_str(&clear_user_cookie())
-                .map_err(|err| AppError::internal(AnyError::new(err)))?,
-        );
+        SessionCookies::new()
+            .clear_session()
+            .clear_user()
+            .apply(&mut response)?;
         *response.status_mut() = StatusCode::UNAUTHORIZED;
         return Ok(response);
     };
@@ -378,20 +345,15 @@ pub(crate) async fn refresh_session_handler(
         }
     }
 
-    let session_cookie =
-        HeaderValue::from_str(&build_session_cookie(&session.id, session.expires_at))
-            .map_err(|err| AppError::internal(AnyError::new(err)))?;
-    let user_cookie =
-        HeaderValue::from_str(&build_user_cookie(&session.user_id, session.expires_at))
-            .map_err(|err| AppError::internal(AnyError::new(err)))?;
-
     let mut response = Json(CreateSessionResponse {
         session_id: session.id.clone(),
         user_id: session.user_id.clone(),
     })
     .into_response();
-    response.headers_mut().append(SET_COOKIE, session_cookie);
-    response.headers_mut().append(SET_COOKIE, user_cookie);
+    SessionCookies::new()
+        .set_session(&session.id, session.expires_at)
+        .set_user(&session.user_id, session.expires_at)
+        .apply(&mut response)?;
 
     Ok(response)
 }

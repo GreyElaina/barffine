@@ -1,0 +1,5 @@
+mutation DuplicateDoc($input: DuplicateDocInput!) {
+  duplicateDoc(input: $input) {
+    id
+  }
+}

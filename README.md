@@ -16,7 +16,7 @@ Barffine is an [AFFiNE](https://github.com/toeverything/AFFiNE) compatible backe
    cargo run -p barffine-server -- create-admin <email> <password>
    ```
    The command is idempotent; rerunning it rotates the password if the user already exists.
-5. Verify the instance with `curl http://127.0.0.1:8081/health` and point your AFFiNE client at the same base URL.
+5. Verify the instance with `curl http://127.0.0.1:8081/api/health` and point your AFFiNE client at the same base URL (REST endpoints only exist under the `/api` prefix).
 
 ## Docker deployment
 
@@ -67,7 +67,6 @@ Key variables:
 | `BARFFINE_DOC_STORE_BACKEND` | unset | Selects where full document exports are stored (e.g., for downloads). |
 | `BARFFINE_NOTIFICATION_CENTER_BACKEND` | unset / `auto` | Optional override for the notification backend. See “Notification center backend” below for supported values and defaults. |
 | `BARFFINE_BASE_URL` | Derived from host/port | Used to build absolute links returned to clients. Set when exposing Barffine behind a proxy. |
-| `BARFFINE_SERVER_HOST` / `BARFFINE_SERVER_PORT` | `127.0.0.1` / `8081` | Populate compatibility metadata surfaced to AFFiNE clients / Proxy. |
 | `BARFFINE_SERVER_PATH` / `BARFFINE_SERVER_SUB_PATH` | unset | Mount the API under a prefix when sitting behind a reverse proxy. |
 | `AFFINE_VERSION`, `DEPLOYMENT_TYPE`, `SERVER_FLAVOR` | `0.25.0`, `selfhosted`, `allinone` | Advertise compatibility and deployment flavour in `/info`. |
 | `BARFFINE_SERVER_FEATURES` | empty | Comma or semicolon separated list enabling feature flags (e.g., `comment,indexer`). |

@@ -8,6 +8,7 @@ use sqlx::{Pool, Postgres, Row, postgres::PgRow};
 
 use crate::{
     db::Database,
+    ids::UserId,
     notification::{NotificationCenter, NotificationRecord},
 };
 
@@ -39,7 +40,7 @@ impl PostgresNotificationCenter {
     fn map_row(row: PgRow) -> NotificationRecord {
         NotificationRecord {
             id: row.get("id"),
-            user_id: row.get("user_id"),
+            user_id: UserId::from(row.get::<String, _>("user_id")),
             kind: row.get("kind"),
             payload: Self::deserialize_payload(row.get("payload")),
             read: row.get::<i64, _>("read") != 0,
@@ -59,7 +60,7 @@ impl NotificationCenter for PostgresNotificationCenter {
              VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&notification.id)
-        .bind(&notification.user_id)
+        .bind(notification.user_id.as_str())
         .bind(&notification.kind)
         .bind(payload)
         .bind(if notification.read { 1_i64 } else { 0_i64 })

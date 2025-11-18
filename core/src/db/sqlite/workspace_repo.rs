@@ -4,6 +4,7 @@ use sqlx::{Pool, QueryBuilder, Row, Sqlite, sqlite::SqliteRow};
 
 use crate::{
     db::workspace_repo::{CreateWorkspaceParams, UpdateWorkspaceParams, WorkspaceRepository},
+    ids::{UserId, WorkspaceId},
     workspace::{
         UserWorkspaceMembership, WorkspaceInviteLinkRecord, WorkspaceMemberWithUser,
         WorkspaceRecord,
@@ -22,9 +23,9 @@ impl SqliteWorkspaceRepository {
 
     fn map_workspace_row(row: SqliteRow) -> WorkspaceRecord {
         WorkspaceRecord {
-            id: row.get("id"),
+            id: WorkspaceId::from(row.get::<String, _>("id")),
             name: row.get("name"),
-            owner_id: row.get("owner_id"),
+            owner_id: UserId::from(row.get::<String, _>("owner_id")),
             created_at: row.get("created_at"),
             public: row.get::<i64, _>("public") != 0,
             enable_ai: row.get::<i64, _>("enable_ai") != 0,
@@ -38,8 +39,8 @@ impl SqliteWorkspaceRepository {
 
     fn map_member_row(row: SqliteRow) -> WorkspaceMemberWithUser {
         WorkspaceMemberWithUser {
-            workspace_id: row.get("workspace_id"),
-            user_id: row.get("user_id"),
+            workspace_id: WorkspaceId::from(row.get::<String, _>("workspace_id")),
+            user_id: UserId::from(row.get::<String, _>("user_id")),
             role: row.get("role"),
             status: row.get("status"),
             email: row.get("email"),
@@ -186,9 +187,9 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
                  last_check_embeddings
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(&id)
+        .bind(id.as_str())
         .bind(&name)
-        .bind(&owner_id)
+        .bind(owner_id.as_str())
         .bind(created_at)
         .bind(public)
         .bind(enable_ai)
@@ -477,8 +478,8 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
         .await?;
 
         Ok(row.map(|row| WorkspaceMemberRecord {
-            workspace_id: row.get("workspace_id"),
-            user_id: row.get("user_id"),
+            workspace_id: WorkspaceId::from(row.get::<String, _>("workspace_id")),
+            user_id: UserId::from(row.get::<String, _>("user_id")),
             role: row.get("role"),
             status: row.get("status"),
             inviter_id: row.get("inviter_id"),

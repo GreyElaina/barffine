@@ -20,7 +20,7 @@ use crate::{
         sniff_mime as sniff_avatar_mime,
     },
     user::helpers::is_valid_email,
-    utils::{attachments::sanitize_attachment_filename, db::is_unique_violation},
+    utils::attachments::sanitize_attachment_filename,
     workspace::{
         invites::{self as workspace_invites, InviteLinkLookup},
         members::{self as workspace_members, MemberAcceptance},
@@ -30,6 +30,7 @@ use crate::{
 use barffine_core::{
     blob::{BlobDescriptor, BlobMetadata},
     comment_attachment::CommentAttachmentUpsert,
+    db::is_unique_violation,
     user_settings::UserNotificationSettingsUpdate,
 };
 use chrono::{DateTime, Utc};
@@ -1718,7 +1719,7 @@ impl MutationRoot {
                 }
             };
 
-            if user_record.id == workspace.owner_id {
+            if user_record.id.as_str() == workspace.owner_id.as_str() {
                 sent_success = false;
                 error_payload = Some(json!({ "message": "owner already has access" }));
             } else if user_record.id == request_user.user_id {
@@ -1892,7 +1893,7 @@ impl MutationRoot {
         };
 
         if let Some(ref hinted) = workspace_id_hint {
-            if !hinted.trim().is_empty() && hinted.trim() != invitation.workspace_id {
+            if !hinted.trim().is_empty() && hinted.trim() != invitation.workspace_id.as_str() {
                 return Err(map_app_error(
                     AppError::bad_request("invalid invitation").with_name("INVALID_INVITATION"),
                 ));

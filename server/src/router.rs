@@ -51,134 +51,19 @@ fn build_base_router(state: AppState) -> Router {
         .allow_headers(AllowHeaders::mirror_request())
         .allow_credentials(true);
 
+    let api_scope = if state
+        .server_path
+        .as_deref()
+        .is_some_and(|prefix| prefix.ends_with("/api"))
+    {
+        api_router()
+    } else {
+        with_api_prefix(api_router())
+    };
+
     let router = Router::new()
-        // Health & Info
         .route("/", get(index_handler))
-        .route("/health", get(health_handler))
-        .route("/feature", get(feature_handler))
-        .route("/info", get(info_handler))
-        // Admin Setup
-        .route(
-            "/api/setup/create-admin-user",
-            post(create_admin_user_handler),
-        )
-        .route("/create-admin-user", post(create_admin_user_handler))
-        // Authentication
-        .route("/preflight", post(preflight_handler))
-        .route("/sign-in", post(sign_in_handler))
-        .route("/session", get(get_session_handler))
-        .route("/user", get(current_user_handler))
-        .route("/sign-out", get(sign_out_handler))
-        .route("/api/auth/preflight", post(preflight_handler))
-        .route("/api/auth/sign-in", post(sign_in_handler))
-        .route("/api/auth/session", get(get_session_handler))
-        .route("/api/auth/user", get(current_user_handler))
-        .route("/api/auth/sign-out", get(sign_out_handler))
-        .merge(oauth_router())
-        // Sessions
-        .route(
-            "/sessions",
-            get(list_sessions_handler)
-                .post(create_session_handler)
-                .delete(delete_session_handler),
-        )
-        .route(
-            "/api/auth/sessions",
-            get(list_sessions_handler)
-                .post(create_session_handler)
-                .delete(delete_session_handler),
-        )
-        .route("/sessions/refresh", post(refresh_session_handler))
-        .route("/api/auth/sessions/refresh", post(refresh_session_handler))
-        // Users
-        .route("/users", post(create_user_handler).get(get_users_handler))
-        .route("/users/{id}", get(get_user_handler))
-        .route("/api/avatars/{key}", get(get_avatar_handler))
-        // Workspaces
-        .route("/workspaces", post(create_workspace_handler))
-        .route("/api/workspaces", post(create_workspace_handler))
-        .route(
-            "/workspaces/{workspace_id}/content",
-            get(get_workspace_content_handler),
-        )
-        .route(
-            "/api/workspaces/{workspace_id}/content",
-            get(get_workspace_content_handler),
-        )
-        .route(
-            "/workspaces/{workspace_id}/blobs/{name}",
-            get(get_workspace_blob_handler),
-        )
-        .route(
-            "/api/workspaces/{workspace_id}/blobs/{name}",
-            get(get_workspace_blob_handler),
-        )
-        // Documents
-        .route(
-            "/workspaces/{workspace_id}/docs/{doc_id}",
-            get(get_doc_binary_handler),
-        )
-        .route(
-            "/api/workspaces/{workspace_id}/docs/{doc_id}",
-            get(get_doc_binary_handler),
-        )
-        .route(
-            "/workspaces/{workspace_id}/docs/{doc_id}/content",
-            get(get_doc_content_handler),
-        )
-        .route(
-            "/api/workspaces/{workspace_id}/docs/{doc_id}/content",
-            get(get_doc_content_handler),
-        )
-        .route(
-            "/workspaces/{workspace_id}/docs/{doc_id}/markdown",
-            get(get_doc_markdown_handler),
-        )
-        .route(
-            "/api/workspaces/{workspace_id}/docs/{doc_id}/markdown",
-            get(get_doc_markdown_handler),
-        )
-        .route(
-            "/workspaces/{workspace_id}/docs/{doc_id}/diff",
-            post(get_doc_diff_handler),
-        )
-        .route(
-            "/api/workspaces/{workspace_id}/docs/{doc_id}/diff",
-            post(get_doc_diff_handler),
-        )
-        .route(
-            "/workspaces/{workspace_id}/docs/{doc_id}/public",
-            post(publish_doc_handler).delete(unpublish_doc_handler),
-        )
-        .route(
-            "/api/workspaces/{workspace_id}/docs/{doc_id}/public",
-            post(publish_doc_handler).delete(unpublish_doc_handler),
-        )
-        .route(
-            "/workspaces/{workspace_id}/docs/{doc_id}/history",
-            get(get_doc_history_handler),
-        )
-        .route(
-            "/api/workspaces/{workspace_id}/docs/{doc_id}/history",
-            get(get_doc_history_handler),
-        )
-        .route(
-            "/workspaces/{workspace_id}/docs/{doc_id}/histories/{timestamp}",
-            get(get_doc_history_snapshot_handler),
-        )
-        .route(
-            "/api/workspaces/{workspace_id}/docs/{doc_id}/histories/{timestamp}",
-            get(get_doc_history_snapshot_handler),
-        )
-        .route(
-            "/workspaces/{workspace_id}/docs/{doc_id}/comment-attachments/{key}",
-            get(get_comment_attachment_handler),
-        )
-        .route(
-            "/api/workspaces/{workspace_id}/docs/{doc_id}/comment-attachments/{key}",
-            get(get_comment_attachment_handler),
-        )
-        // GraphQL
+        .merge(api_scope)
         .route(
             "/graphql",
             get(graphql::graphql_playground)
@@ -214,4 +99,97 @@ fn build_base_router(state: AppState) -> Router {
 
 fn add_legacy_doc_service_routes(router: Router<AppState>) -> Router<AppState> {
     router
+}
+
+fn api_router() -> Router<AppState> {
+    Router::new()
+        .merge(status_router())
+        .nest("/setup", setup_router())
+        .nest("/auth", auth_router())
+        .merge(user_router())
+        .merge(workspace_router())
+        .merge(oauth_router())
+}
+
+fn status_router() -> Router<AppState> {
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/feature", get(feature_handler))
+        .route("/info", get(info_handler))
+}
+
+fn setup_router() -> Router<AppState> {
+    Router::new().route("/create-admin-user", post(create_admin_user_handler))
+}
+
+fn auth_router() -> Router<AppState> {
+    Router::new()
+        .route("/preflight", post(preflight_handler))
+        .route("/sign-in", post(sign_in_handler))
+        .route("/session", get(get_session_handler))
+        .route("/user", get(current_user_handler))
+        .route("/sign-out", get(sign_out_handler))
+        .route(
+            "/sessions",
+            get(list_sessions_handler)
+                .post(create_session_handler)
+                .delete(delete_session_handler),
+        )
+        .route("/sessions/refresh", post(refresh_session_handler))
+}
+
+fn user_router() -> Router<AppState> {
+    Router::new()
+        .route("/users", post(create_user_handler).get(get_users_handler))
+        .route("/users/{id}", get(get_user_handler))
+        .route("/avatars/{key}", get(get_avatar_handler))
+}
+
+fn workspace_router() -> Router<AppState> {
+    Router::new()
+        .route("/workspaces", post(create_workspace_handler))
+        .route(
+            "/workspaces/{workspace_id}/content",
+            get(get_workspace_content_handler),
+        )
+        .route(
+            "/workspaces/{workspace_id}/blobs/{name}",
+            get(get_workspace_blob_handler),
+        )
+        .route(
+            "/workspaces/{workspace_id}/docs/{doc_id}",
+            get(get_doc_binary_handler),
+        )
+        .route(
+            "/workspaces/{workspace_id}/docs/{doc_id}/content",
+            get(get_doc_content_handler),
+        )
+        .route(
+            "/workspaces/{workspace_id}/docs/{doc_id}/markdown",
+            get(get_doc_markdown_handler),
+        )
+        .route(
+            "/workspaces/{workspace_id}/docs/{doc_id}/diff",
+            post(get_doc_diff_handler),
+        )
+        .route(
+            "/workspaces/{workspace_id}/docs/{doc_id}/public",
+            post(publish_doc_handler).delete(unpublish_doc_handler),
+        )
+        .route(
+            "/workspaces/{workspace_id}/docs/{doc_id}/history",
+            get(get_doc_history_handler),
+        )
+        .route(
+            "/workspaces/{workspace_id}/docs/{doc_id}/histories/{timestamp}",
+            get(get_doc_history_snapshot_handler),
+        )
+        .route(
+            "/workspaces/{workspace_id}/docs/{doc_id}/comment-attachments/{key}",
+            get(get_comment_attachment_handler),
+        )
+}
+
+fn with_api_prefix(router: Router<AppState>) -> Router<AppState> {
+    Router::new().nest("/api", router)
 }

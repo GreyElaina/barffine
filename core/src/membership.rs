@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::workspace_member::WorkspaceMemberRecord;
+use crate::{ids::WorkspaceId, workspace_member::WorkspaceMemberRecord};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WorkspaceRole {
@@ -25,7 +25,7 @@ pub enum InvitationStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceInvitation {
     pub id: String,
-    pub workspace_id: String,
+    pub workspace_id: WorkspaceId,
     pub email: String,
     pub role: WorkspaceRole,
     pub status: InvitationStatus,
@@ -54,7 +54,7 @@ mod tests {
     fn invitation_defaults() {
         let invitation = WorkspaceInvitation {
             id: "inv".into(),
-            workspace_id: "ws".into(),
+            workspace_id: WorkspaceId::from("ws"),
             email: "user@example.com".into(),
             role: WorkspaceRole::Member,
             status: InvitationStatus::Pending,

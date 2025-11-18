@@ -20,6 +20,7 @@ use crate::{
         UserShareTokenRecord,
     },
     doc_update_log::DocUpdateLogReader,
+    ids::{DocId, WorkspaceId},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,8 +41,8 @@ impl RocksDocumentRecord {
         created_at: i64,
     ) -> Self {
         let metadata = DocumentMetadata {
-            id: doc_id,
-            workspace_id,
+            id: DocId::from(doc_id),
+            workspace_id: WorkspaceId::from(workspace_id),
             created_at,
             updated_at: created_at,
             default_role: "manager".to_string(),
@@ -349,10 +350,11 @@ impl DocRepository for RocksDocRepository {
             DocumentListOrder::CreatedAsc => {
                 records.sort_by_key(|rec| (rec.metadata.created_at, rec.metadata.id.clone()));
                 if let Some(cursor) = cursor {
+                    let cursor_id = cursor.id.as_str();
                     records.retain(|rec| {
                         rec.metadata.created_at > cursor.timestamp
                             || (rec.metadata.created_at == cursor.timestamp
-                                && rec.metadata.id > cursor.id)
+                                && rec.metadata.id.as_str() > cursor_id)
                     });
                 }
             }
@@ -364,10 +366,11 @@ impl DocRepository for RocksDocRepository {
                     )
                 });
                 if let Some(cursor) = cursor {
+                    let cursor_id = cursor.id.as_str();
                     records.retain(|rec| {
                         rec.metadata.updated_at < cursor.timestamp
                             || (rec.metadata.updated_at == cursor.timestamp
-                                && rec.metadata.id < cursor.id)
+                                && rec.metadata.id.as_str() < cursor_id)
                     });
                 }
             }
@@ -571,8 +574,8 @@ impl DocRepository for RocksDocRepository {
                 && meta.share_token.as_deref() == Some(token.as_str())
             {
                 tokens.push(UserShareTokenRecord {
-                    workspace_id,
-                    doc_id,
+                    workspace_id: WorkspaceId::from(workspace_id),
+                    doc_id: DocId::from(doc_id),
                     token,
                     created_at,
                 });
@@ -629,8 +632,8 @@ impl DocRepository for RocksDocRepository {
         };
 
         let mut new_meta = source.metadata.clone();
-        new_meta.id = new_doc_id.clone();
-        new_meta.workspace_id = target_workspace_id.clone();
+        new_meta.id = DocId::from(new_doc_id.clone());
+        new_meta.workspace_id = WorkspaceId::from(target_workspace_id.clone());
         new_meta.created_at = now;
         new_meta.updated_at = now;
         new_meta.public = false;
@@ -762,7 +765,7 @@ impl DocRepository for RocksDocRepository {
         Ok(records
             .into_iter()
             .filter(|rec| after.map_or(true, |threshold| rec.metadata.updated_at > threshold))
-            .map(|rec| (rec.metadata.id, rec.metadata.updated_at))
+            .map(|rec| (rec.metadata.id.into_inner(), rec.metadata.updated_at))
             .collect())
     }
 
@@ -1075,8 +1078,8 @@ mod tests {
             .await
             .unwrap()
             .expect("metadata present");
-        assert_eq!(meta.id, "doc");
-        assert_eq!(meta.workspace_id, "ws");
+        assert_eq!(meta.id, DocId::from("doc"));
+        assert_eq!(meta.workspace_id, WorkspaceId::from("ws"));
         assert_eq!(meta.title.as_deref(), Some("Title"));
         assert_eq!(meta.created_at, created_at);
         assert_eq!(meta.updated_at, created_at);
@@ -1293,8 +1296,8 @@ mod tests {
 
         // 只应返回 ws1/doc-ok
         assert_eq!(tokens.len(), 1);
-        assert_eq!(tokens[0].workspace_id, "ws1");
-        assert_eq!(tokens[0].doc_id, "doc-ok");
+        assert_eq!(tokens[0].workspace_id, WorkspaceId::from("ws1"));
+        assert_eq!(tokens[0].doc_id, DocId::from("doc-ok"));
         assert_eq!(tokens[0].token, "token-ok");
     }
 

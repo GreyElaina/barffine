@@ -180,7 +180,7 @@ async fn prepare_state() -> Result<WorkloadContext> {
     let workspace = state
         .workspace_store
         .create(
-            &owner.id,
+            &owner.id.clone().into(),
             Some("Profiler Workspace"),
             Some(false),
             Some(false),
@@ -199,7 +199,7 @@ async fn prepare_state() -> Result<WorkloadContext> {
 
     Ok(WorkloadContext {
         state,
-        workspace_id: workspace.id,
+        workspace_id: workspace.id.to_string(),
         doc_id,
         owner_id: owner.id,
         _db_guard: tmp_dir,

@@ -180,7 +180,7 @@ impl BlobStorage for RocksBlobStorage {
 
         Ok(BlobLocation::new(
             format!(
-                "/workspaces/{}/blobs/{}",
+                "/api/workspaces/{}/blobs/{}",
                 descriptor.workspace_id, descriptor.key
             ),
             None,
@@ -225,7 +225,7 @@ impl BlobStorage for RocksBlobStorage {
     ) -> Result<BlobLocation> {
         Ok(BlobLocation::new(
             format!(
-                "/workspaces/{}/blobs/{}",
+                "/api/workspaces/{}/blobs/{}",
                 descriptor.workspace_id, descriptor.key
             ),
             None,

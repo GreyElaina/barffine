@@ -1,14 +1,15 @@
-use std::error::Error as StdError;
-
 use anyhow::Error as AnyError;
 use sqlx::{Error as SqlxError, error::DatabaseError};
+use std::error::Error as StdError;
 
 const POSTGRES_UNIQUE_VIOLATION: &str = "23505";
 const SQLITE_UNIQUE_VIOLATION: &str = "2067";
 const SQLITE_PRIMARY_KEY_VIOLATION: &str = "1555";
 
+/// Returns `true` if the provided error represents a uniqueness constraint
+/// violation on any supported backend.
 pub fn is_unique_violation(err: &AnyError) -> bool {
-    err.chain().any(|cause| is_unique_violation_cause(cause))
+    err.chain().any(is_unique_violation_cause)
 }
 
 fn is_unique_violation_cause(cause: &(dyn StdError + 'static)) -> bool {
@@ -49,8 +50,8 @@ fn matches_sqlx_unique(err: &SqlxError) -> bool {
 
 fn database_code_is_unique(err: &(dyn DatabaseError + 'static)) -> bool {
     err.code()
-        .map(|code| {
-            let code = code.as_ref();
+        .map(|code_ref| {
+            let code = code_ref.as_ref();
             matches!(
                 code,
                 POSTGRES_UNIQUE_VIOLATION | SQLITE_UNIQUE_VIOLATION | SQLITE_PRIMARY_KEY_VIOLATION

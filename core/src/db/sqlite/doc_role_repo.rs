@@ -5,6 +5,7 @@ use sqlx::{Pool, Row, Sqlite, sqlite::SqliteRow};
 use crate::{
     db::doc_role_repo::DocRoleRepository,
     doc_roles::{DocumentRoleCursor, DocumentRoleRecord},
+    ids::{DocId, UserId, WorkspaceId},
 };
 
 pub struct SqliteDocRoleRepository {
@@ -18,9 +19,9 @@ impl SqliteDocRoleRepository {
 
     fn map_row(row: SqliteRow) -> DocumentRoleRecord {
         DocumentRoleRecord {
-            workspace_id: row.get("workspace_id"),
-            doc_id: row.get("doc_id"),
-            user_id: row.get("user_id"),
+            workspace_id: WorkspaceId::from(row.get::<String, _>("workspace_id")),
+            doc_id: DocId::from(row.get::<String, _>("doc_id")),
+            user_id: UserId::from(row.get::<String, _>("user_id")),
             role: row.get("role"),
             created_at: row.get::<i64, _>("created_at"),
         }
@@ -90,7 +91,7 @@ impl DocRoleRepository for SqliteDocRoleRepository {
             .bind(doc_id)
             .bind(cursor.created_at)
             .bind(cursor.created_at)
-            .bind(&cursor.user_id)
+            .bind(cursor.user_id.as_str())
             .bind(limit)
             .fetch_all(&self.pool)
             .await?
@@ -157,9 +158,9 @@ impl DocRoleRepository for SqliteDocRoleRepository {
                  ON CONFLICT(workspace_id, doc_id, user_id)
                  DO UPDATE SET role = excluded.role, created_at = excluded.created_at",
             )
-            .bind(&role.workspace_id)
-            .bind(&role.doc_id)
-            .bind(&role.user_id)
+            .bind(role.workspace_id.as_str())
+            .bind(role.doc_id.as_str())
+            .bind(role.user_id.as_str())
             .bind(&role.role)
             .bind(role.created_at)
             .execute(&mut *tx)

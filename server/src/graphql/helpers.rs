@@ -133,7 +133,7 @@ pub(crate) async fn workspace_permission_for_user(
     workspace: &core_workspace::WorkspaceRecord,
     user_id: &str,
 ) -> Result<Option<ResolvedWorkspacePermission>, AppError> {
-    if user_id == workspace.owner_id {
+    if user_id == workspace.owner_id.as_str() {
         return Ok(Some(ResolvedWorkspacePermission {
             permission: Permission::Owner,
             from_membership: false,

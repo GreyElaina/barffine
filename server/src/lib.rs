@@ -22,7 +22,9 @@ pub mod utils;
 pub mod workspace;
 
 pub use error::AppError;
-pub use state::{AppState, StateBuildConfig, build_state, build_state_with_config};
+pub use state::{
+    AppState, BackgroundTasks, StateBuildConfig, build_state, build_state_with_config,
+};
 
 pub const DEFAULT_HISTORY_LIMIT: i64 = 20;
 pub const MAX_HISTORY_LIMIT: i64 = 100;

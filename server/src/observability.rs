@@ -465,18 +465,16 @@ const DEFAULT_RATE: f64 = 0.1;
 
 fn default_rules() -> Vec<RouteRule> {
     vec![
-        RouteRule::new("/health", 0.0, "health"),
-        RouteRule::new("/feature", 0.0, "feature"),
+        RouteRule::new("/api/health", 0.0, "health"),
+        RouteRule::new("/api/feature", 0.0, "feature"),
+        RouteRule::new("/api/info", 0.0, "info"),
         RouteRule::new("/socket.io", 0.02, "socket"),
         RouteRule::new("/api/setup", 1.0, "setup"),
         RouteRule::new("/api/auth", 1.0, "auth"),
-        RouteRule::new("/sign-in", 1.0, "auth"),
-        RouteRule::new("/session", 1.0, "auth"),
+        RouteRule::new("/api/oauth", 1.0, "auth"),
         RouteRule::new("/api/workspaces", 0.3, "workspace"),
-        RouteRule::new("/workspaces", 0.2, "workspace"),
         RouteRule::new("/api/users", 0.4, "user"),
-        RouteRule::new("/users", 0.2, "user"),
-        RouteRule::new("/api/blobs", 0.15, "blob"),
+        RouteRule::new("/api/avatars", 0.4, "user"),
         RouteRule::new("/rpc/", 0.3, "rpc"),
         RouteRule::new("/graphql", 0.5, "graphql"),
     ]

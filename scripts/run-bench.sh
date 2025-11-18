@@ -150,7 +150,7 @@ SERVER_PID=$!
 echo $SERVER_PID > barffine.pid
 
 for attempt in {1..30}; do
-  if curl -sf http://127.0.0.1:8081/health >/dev/null 2>&1; then
+  if curl -sf http://127.0.0.1:8081/api/health >/dev/null 2>&1; then
     echo "[bench] server is up"
     break
   fi

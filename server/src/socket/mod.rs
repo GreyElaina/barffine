@@ -13,7 +13,7 @@ use crate::state::AppState;
 pub(crate) fn build_socket_layer(state: AppState) -> (SocketIoLayer, Arc<SocketIo>) {
     let shared = Arc::new(state);
     let runtime = shared.runtime();
-    let (layer, io) = auth::build_socket(shared.clone(), runtime.clone());
+    let (layer, io) = auth::build_socket(runtime.clone());
     events::register_namespace(&io, shared, runtime);
     (layer, Arc::new(io))
 }

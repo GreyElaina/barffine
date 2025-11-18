@@ -1,0 +1,15 @@
+query WorkspaceDocs($workspaceId: ID!, $first: Int!, $after: String) {
+  workspace(id: $workspaceId) {
+    docs(pagination: { first: $first, after: $after }) {
+      edges {
+        node {
+          id
+        }
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+query WorkspaceComments($workspaceId: ID!, $docId: ID!, $pagination: PaginationInput) {
+  workspace(id: $workspaceId) {
+    comments(docId: $docId, pagination: $pagination) {
+      totalCount
+      edges {
+        node {
+          id
+          resolved
+        }
+      }
+    }
+  }
+}

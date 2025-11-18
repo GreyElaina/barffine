@@ -70,7 +70,7 @@ impl BlobStorage for SqlBlobStorage {
 
         Ok(BlobLocation::new(
             format!(
-                "/workspaces/{}/blobs/{}",
+                "/api/workspaces/{}/blobs/{}",
                 descriptor.workspace_id, descriptor.key
             ),
             None,
@@ -115,7 +115,7 @@ impl BlobStorage for SqlBlobStorage {
     ) -> Result<BlobLocation> {
         Ok(BlobLocation::new(
             format!(
-                "/workspaces/{}/blobs/{}",
+                "/api/workspaces/{}/blobs/{}",
                 descriptor.workspace_id, descriptor.key
             ),
             None,
@@ -149,6 +149,7 @@ mod tests {
         blob::{AVATAR_STORAGE_NAMESPACE, BlobDescriptor, BlobMetadata},
         config::{AppConfig, BlobStoreBackend, DocDataBackend},
         db::{Database, user_repo::CreateUserParams, workspace_repo::CreateWorkspaceParams},
+        ids::{UserId, WorkspaceId},
     };
     use tempfile::TempDir;
 
@@ -192,8 +193,8 @@ mod tests {
         repos
             .workspace_repo()
             .create_workspace(CreateWorkspaceParams {
-                id: "workspace".to_string(),
-                owner_id: "owner".to_string(),
+                id: WorkspaceId::from("workspace"),
+                owner_id: UserId::from("owner"),
                 name: "Workspace".to_string(),
                 created_at: now,
                 public: false,

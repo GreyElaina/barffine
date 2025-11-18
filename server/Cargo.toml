@@ -43,7 +43,6 @@ pkcs8.workspace = true
 once_cell.workspace = true
 dotenvy.workspace = true
 socketioxide.workspace = true
-socketioxide-core.workspace = true
 logfire.workspace = true
 axum-tracing-opentelemetry.workspace = true
 axum-otel-metrics.workspace = true

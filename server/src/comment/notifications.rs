@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 
-use barffine_core::notification::{CommentRecord, CommentReplyRecord};
+use barffine_core::{
+    ids::UserId,
+    notification::{CommentRecord, CommentReplyRecord},
+};
 use serde_json::json;
 
 use crate::{AppError, AppState, doc::roles, graphql::doc_permissions_for_user_internal};
@@ -42,7 +45,9 @@ pub async fn notify_comment_reply(
     let mut notify_ids =
         collect_workspace_owner_target(state, actor_id, comment, &mention_ids).await?;
 
-    if comment.author_id != actor_id && !mention_ids.contains(&comment.author_id) {
+    if comment.author_id.as_str() != actor_id
+        && !mention_ids.contains(comment.author_id.as_str())
+    {
         notify_ids.insert(comment.author_id.clone());
     }
 
@@ -53,8 +58,10 @@ pub async fn notify_comment_reply(
         .map_err(AppError::from_anyhow)?;
 
     for existing in replies {
-        if existing.author_id != actor_id && !mention_ids.contains(&existing.author_id) {
-            notify_ids.insert(existing.author_id);
+        if existing.author_id.as_str() != actor_id
+            && !mention_ids.contains(existing.author_id.as_str())
+        {
+            notify_ids.insert(existing.author_id.clone());
         }
     }
 
@@ -86,8 +93,8 @@ async fn resolve_mentions(
 
         if let Some(perms) = doc_permissions_for_user_internal(
             state,
-            &comment.workspace_id,
-            &comment.doc_id,
+            comment.workspace_id.as_str(),
+            comment.doc_id.as_str(),
             mention,
         )
         .await?
@@ -106,15 +113,16 @@ async fn collect_workspace_owner_target(
     actor_id: &str,
     comment: &CommentRecord,
     mention_ids: &HashSet<String>,
-) -> Result<HashSet<String>, AppError> {
+) -> Result<HashSet<UserId>, AppError> {
     let workspace = state
         .workspace_service
-        .fetch_workspace(&comment.workspace_id)
+        .fetch_workspace(comment.workspace_id.as_str())
         .await?;
 
-    let mut notify_ids = HashSet::new();
-    if workspace.owner_id != actor_id && !mention_ids.contains(&workspace.owner_id) {
-        notify_ids.insert(workspace.owner_id);
+    let mut notify_ids: HashSet<UserId> = HashSet::new();
+    if workspace.owner_id.as_str() != actor_id && !mention_ids.contains(workspace.owner_id.as_str())
+    {
+        notify_ids.insert(workspace.owner_id.clone());
     }
 
     Ok(notify_ids)
@@ -128,7 +136,7 @@ async fn dispatch_notifications(
     doc_title: Option<&str>,
     doc_mode: Option<&str>,
     mention_ids: &HashSet<String>,
-    notify_ids: &HashSet<String>,
+    notify_ids: &HashSet<UserId>,
 ) -> Result<(), AppError> {
     for user_id in mention_ids {
         enqueue_notification(

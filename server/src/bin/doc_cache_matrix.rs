@@ -513,7 +513,7 @@ async fn prepare_state_with_config(doc_cache_config: DocCacheConfig) -> Result<W
     let workspace = state
         .workspace_store
         .create(
-            &owner.id,
+            &owner.id.clone().into(),
             Some("Matrix Workspace"),
             Some(false),
             Some(false),
@@ -532,7 +532,7 @@ async fn prepare_state_with_config(doc_cache_config: DocCacheConfig) -> Result<W
 
     Ok(WorkloadContext {
         state,
-        workspace_id: workspace.id,
+        workspace_id: workspace.id.to_string(),
         doc_id,
         owner_id: owner.id,
         _db_guard: tmp_dir,

@@ -8,6 +8,7 @@ use crate::{
         Database,
         comment_repo::{CommentChangeRow, CommentRepositoryRef},
     },
+    ids::{DocId, WorkspaceId},
     notification::{
         CommentChangeAction, CommentChangeRecord, CommentRecord, CommentRecordWithCursor,
         CommentReplyRecord, CommentStore,
@@ -66,8 +67,8 @@ impl CommentStore for RepositoryCommentStore {
         self.comment_repo.insert_comment(&comment).await?;
         self.comment_repo
             .insert_comment_change(
-                &comment.workspace_id,
-                &comment.doc_id,
+                comment.workspace_id.as_str(),
+                comment.doc_id.as_str(),
                 Some(&comment.id),
                 None,
                 CommentChangeAction::Update,
@@ -95,8 +96,8 @@ impl CommentStore for RepositoryCommentStore {
         self.comment_repo.update_comment(&comment).await?;
         self.comment_repo
             .insert_comment_change(
-                &comment.workspace_id,
-                &comment.doc_id,
+                comment.workspace_id.as_str(),
+                comment.doc_id.as_str(),
                 Some(&comment.id),
                 None,
                 CommentChangeAction::Update,
@@ -158,8 +159,8 @@ impl CommentStore for RepositoryCommentStore {
         if let Some(parent) = self.comment_repo.fetch_comment(&reply.comment_id).await? {
             self.comment_repo
                 .insert_comment_change(
-                    &parent.workspace_id,
-                    &parent.doc_id,
+                    parent.workspace_id.as_str(),
+                    parent.doc_id.as_str(),
                     Some(&parent.id),
                     Some(&reply.id),
                     CommentChangeAction::Update,
@@ -186,8 +187,8 @@ impl CommentStore for RepositoryCommentStore {
         if let Some(parent) = self.comment_repo.fetch_comment(&reply.comment_id).await? {
             self.comment_repo
                 .insert_comment_change(
-                    &parent.workspace_id,
-                    &parent.doc_id,
+                    parent.workspace_id.as_str(),
+                    parent.doc_id.as_str(),
                     Some(&parent.id),
                     Some(&reply.id),
                     CommentChangeAction::Update,
@@ -323,8 +324,8 @@ impl CommentStore for RepositoryCommentStore {
                 action,
                 id: item_id,
                 comment_id: comment_id.clone(),
-                workspace_id: workspace_id.to_string(),
-                doc_id: doc_id.to_string(),
+                workspace_id: WorkspaceId::from(workspace_id.to_string()),
+                doc_id: DocId::from(doc_id.to_string()),
                 item: payload.clone(),
                 updated_at,
                 change_row_id: row_id,

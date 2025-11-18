@@ -91,10 +91,25 @@ pub(crate) async fn seed_workspace(state: &AppState) -> (String, String) {
         .expect("create user");
     let workspace = state
         .workspace_store
-        .create(&user.id, Some("Test Workspace"), None, None, None, None)
+        .create(
+            &state
+                .user_store
+                .find_by_email("tester@example.com")
+                .await
+                .unwrap()
+                .unwrap()
+                .id
+                .clone()
+                .into(),
+            Some("Test Workspace"),
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("create workspace");
-    (workspace.id, user.id)
+    (workspace.id.to_string(), user.id)
 }
 
 pub(crate) async fn insert_document(

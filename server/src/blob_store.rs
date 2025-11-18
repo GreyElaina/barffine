@@ -53,7 +53,7 @@ impl BlobStorage for InMemoryBlobStorage {
 
         Ok(BlobLocation::new(
             format!(
-                "/workspaces/{}/blobs/{}",
+                "/api/workspaces/{}/blobs/{}",
                 descriptor.workspace_id, descriptor.key
             ),
             None,
@@ -91,7 +91,7 @@ impl BlobStorage for InMemoryBlobStorage {
     ) -> Result<BlobLocation> {
         Ok(BlobLocation::new(
             format!(
-                "/workspaces/{}/blobs/{}",
+                "/api/workspaces/{}/blobs/{}",
                 descriptor.workspace_id, descriptor.key
             ),
             None,

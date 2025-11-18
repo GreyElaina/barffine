@@ -7,6 +7,7 @@ use crate::{
         Database,
         workspace_repo::{CreateWorkspaceParams, UpdateWorkspaceParams, WorkspaceRepositoryRef},
     },
+    ids::{UserId, WorkspaceId},
     workspace_member::WorkspaceMemberRecord,
 };
 
@@ -23,9 +24,9 @@ const WORKSPACE_MEMBER_STATUS_NORMALIZATION: &[(&str, &str)] = &[
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceRecord {
-    pub id: String,
+    pub id: WorkspaceId,
     pub name: String,
-    pub owner_id: String,
+    pub owner_id: UserId,
     pub created_at: i64,
     pub public: bool,
     pub enable_ai: bool,
@@ -38,8 +39,8 @@ pub struct WorkspaceRecord {
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceMemberWithUser {
-    pub workspace_id: String,
-    pub user_id: String,
+    pub workspace_id: WorkspaceId,
+    pub user_id: UserId,
     pub role: String,
     pub status: String,
     pub email: String,
@@ -56,18 +57,18 @@ pub struct WorkspaceMemberWithUser {
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceInviteLinkRecord {
-    pub workspace_id: String,
+    pub workspace_id: WorkspaceId,
     pub token: String,
     pub expires_at: i64,
-    pub inviter_id: String,
+    pub inviter_id: UserId,
     pub created_at: i64,
 }
 
 #[derive(Debug, Clone)]
 pub struct UserWorkspaceMembership {
-    pub workspace_id: String,
+    pub workspace_id: WorkspaceId,
     pub workspace_name: String,
-    pub workspace_owner_id: String,
+    pub workspace_owner_id: UserId,
     pub workspace_created_at: i64,
     pub role: String,
 }
@@ -109,14 +110,14 @@ impl WorkspaceStore {
 
     pub async fn create(
         &self,
-        owner_id: &str,
+        owner_id: &UserId,
         name: Option<&str>,
         public: Option<bool>,
         enable_ai: Option<bool>,
         enable_doc_embedding: Option<bool>,
         enable_url_preview: Option<bool>,
     ) -> Result<WorkspaceRecord> {
-        let id = Uuid::new_v4().to_string();
+        let id = WorkspaceId::new(Uuid::new_v4().to_string());
         let created_at = Utc::now().timestamp();
         let public = public.unwrap_or(false);
         let enable_ai = enable_ai.unwrap_or(true);
@@ -133,8 +134,8 @@ impl WorkspaceStore {
 
         self.workspace_repo
             .create_workspace(CreateWorkspaceParams {
-                id,
-                owner_id: owner_id.to_owned(),
+                id: id.clone(),
+                owner_id: owner_id.clone(),
                 name: resolved_name,
                 created_at,
                 public,

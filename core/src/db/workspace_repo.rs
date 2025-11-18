@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 use crate::{
+    ids::{UserId, WorkspaceId},
     workspace::{
         UserWorkspaceMembership, WorkspaceInviteLinkRecord, WorkspaceMemberWithUser,
         WorkspaceRecord,
@@ -12,8 +13,8 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct CreateWorkspaceParams {
-    pub id: String,
-    pub owner_id: String,
+    pub id: WorkspaceId,
+    pub owner_id: UserId,
     pub name: String,
     pub created_at: i64,
     pub public: bool,

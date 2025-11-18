@@ -4,10 +4,13 @@ use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
 use sqlx::{Pool, Postgres, Row, postgres::PgRow};
 
-use crate::db::comment_repo::{CommentChangeRow, CommentRepository};
-use crate::notification::{
-    CommentChangeAction, CommentRecord, CommentRecordWithCursor, CommentReplyRecord,
-    CommentVisibility,
+use crate::{
+    db::comment_repo::{CommentChangeRow, CommentRepository},
+    ids::{DocId, UserId, WorkspaceId},
+    notification::{
+        CommentChangeAction, CommentRecord, CommentRecordWithCursor, CommentReplyRecord,
+        CommentVisibility,
+    },
 };
 
 pub struct PostgresCommentRepository {
@@ -38,9 +41,9 @@ impl PostgresCommentRepository {
     fn map_comment(row: PgRow) -> CommentRecord {
         CommentRecord {
             id: row.get("id"),
-            workspace_id: row.get("workspace_id"),
-            doc_id: row.get("doc_id"),
-            author_id: row.get("author_id"),
+            workspace_id: WorkspaceId::from(row.get::<String, _>("workspace_id")),
+            doc_id: DocId::from(row.get::<String, _>("doc_id")),
+            author_id: UserId::from(row.get::<String, _>("author_id")),
             body: Self::deserialize_body(row.get("body")),
             visibility: CommentVisibility::Workspace,
             metadata: Self::deserialize_metadata(row.get("metadata")),
@@ -54,7 +57,7 @@ impl PostgresCommentRepository {
         CommentReplyRecord {
             id: row.get("id"),
             comment_id: row.get("comment_id"),
-            author_id: row.get("author_id"),
+            author_id: UserId::from(row.get::<String, _>("author_id")),
             body: Self::deserialize_body(row.get("body")),
             metadata: Self::deserialize_metadata(row.get("metadata")),
             created_at: DateTime::<Utc>::from_timestamp(row.get("created_at"), 0).unwrap(),
@@ -85,9 +88,9 @@ impl CommentRepository for PostgresCommentRepository {
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&comment.id)
-        .bind(&comment.workspace_id)
-        .bind(&comment.doc_id)
-        .bind(&comment.author_id)
+        .bind(comment.workspace_id.as_str())
+        .bind(comment.doc_id.as_str())
+        .bind(comment.author_id.as_str())
         .bind(Self::serialize_body(&comment.body))
         .bind(Self::serialize_metadata(&comment.metadata))
         .bind(if comment.resolved { 1 } else { 0 })
@@ -167,7 +170,7 @@ impl CommentRepository for PostgresCommentRepository {
         )
         .bind(&reply.id)
         .bind(&reply.comment_id)
-        .bind(&reply.author_id)
+        .bind(reply.author_id.as_str())
         .bind(Self::serialize_body(&reply.body))
         .bind(Self::serialize_metadata(&reply.metadata))
         .bind(reply.created_at.timestamp())

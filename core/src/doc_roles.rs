@@ -13,6 +13,7 @@ use tracing::{error, warn};
 use crate::{
     config::DocStoreBackend,
     db::{Database, rocks::doc_role_backend::RocksDocRoleBackend},
+    ids::{DocId, UserId, WorkspaceId},
 };
 use backend::{DocRoleBackendRef, SqlDocRoleBackend};
 
@@ -22,9 +23,9 @@ const ROLE_UPSERT_FLUSH_DELAY_MS: u64 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentRoleRecord {
-    pub workspace_id: String,
-    pub doc_id: String,
-    pub user_id: String,
+    pub workspace_id: WorkspaceId,
+    pub doc_id: DocId,
+    pub user_id: UserId,
     pub role: String,
     pub created_at: i64,
 }
@@ -32,7 +33,7 @@ pub struct DocumentRoleRecord {
 #[derive(Debug, Clone)]
 pub struct DocumentRoleCursor {
     pub created_at: i64,
-    pub user_id: String,
+    pub user_id: UserId,
 }
 
 #[derive(Clone)]
@@ -117,9 +118,9 @@ impl DocumentRoleStore {
     ) -> Result<()> {
         let created_at = Utc::now().timestamp();
         let record = DocumentRoleRecord {
-            workspace_id: workspace_id.to_owned(),
-            doc_id: doc_id.to_owned(),
-            user_id: user_id.to_owned(),
+            workspace_id: WorkspaceId::from(workspace_id.to_owned()),
+            doc_id: DocId::from(doc_id.to_owned()),
+            user_id: UserId::from(user_id.to_owned()),
             role: role.to_owned(),
             created_at,
         };
@@ -322,9 +323,9 @@ mod tests {
             created_at: i64,
         ) -> Result<()> {
             self.calls.lock().await.push(vec![DocumentRoleRecord {
-                workspace_id: workspace_id.to_owned(),
-                doc_id: doc_id.to_owned(),
-                user_id: user_id.to_owned(),
+                workspace_id: WorkspaceId::from(workspace_id.to_owned()),
+                doc_id: DocId::from(doc_id.to_owned()),
+                user_id: UserId::from(user_id.to_owned()),
                 role: role.to_owned(),
                 created_at,
             }]);

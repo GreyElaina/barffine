@@ -1,19 +1,17 @@
 // User management handlers
 
-use anyhow::Error as AnyError;
 use argon2::password_hash::Error as PasswordHashError;
 use axum::{
     Json,
-    body::Body,
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header::HeaderName},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 
 use crate::{
     auth::generate_password_hash,
     error::AppError,
-    http::{append_set_cookie_headers, http_date_from_datetime},
+    http::append_set_cookie_headers,
     state::AppState,
     types::{
         CreateUserRequest, CreateUserResponse, ListUsersQuery, ListUsersResponse, UserResponse,
@@ -22,8 +20,9 @@ use crate::{
         avatar::{avatar_descriptor, is_valid_avatar_key},
         helpers::normalize_user_list_params,
     },
-    utils::{attachments::apply_attachment_headers, db::is_unique_violation},
+    utils::blob_download::{BlobResponseContext, build_blob_download_response},
 };
+use barffine_core::db::is_unique_violation;
 
 pub(crate) async fn create_user_handler(
     State(state): State<AppState>,
@@ -143,60 +142,13 @@ pub(crate) async fn get_avatar_handler(
             AppError::not_found("user avatar not found").with_name("USER_AVATAR_NOT_FOUND")
         })?;
 
-    if let Some(location) = download.location {
-        let response = Response::builder()
-            .status(StatusCode::FOUND)
-            .header("location", location.uri)
-            .body(Body::empty())
-            .map_err(|err| AppError::internal(AnyError::new(err)))?;
-        return Ok(response);
-    }
-
-    let bytes = download.bytes.ok_or_else(|| {
-        AppError::not_found("user avatar not found").with_name("USER_AVATAR_NOT_FOUND")
-    })?;
-    let byte_len = bytes.len();
-
-    let mut response = Response::builder()
-        .status(StatusCode::OK)
-        .body(Body::from(bytes))
-        .map_err(|err| AppError::internal(AnyError::new(err)))?;
-
-    if let Some(metadata) = download.metadata.as_ref() {
-        if let Some(length) = metadata.content_length {
-            let value = HeaderValue::from_str(&length.to_string())
-                .map_err(|err| AppError::internal(AnyError::new(err)))?;
-            response
-                .headers_mut()
-                .insert(HeaderName::from_static("content-length"), value);
-        }
-
-        if let Some(last_modified) = metadata.last_modified {
-            if let Some(formatted) = http_date_from_datetime(&last_modified) {
-                let value = HeaderValue::from_str(&formatted)
-                    .map_err(|err| AppError::internal(AnyError::new(err)))?;
-                response
-                    .headers_mut()
-                    .insert(HeaderName::from_static("last-modified"), value);
-            }
-        }
-
-        apply_attachment_headers(&mut response, Some(metadata), &key)?;
-    } else {
-        let value = HeaderValue::from_str(&byte_len.to_string())
-            .map_err(|err| AppError::internal(AnyError::new(err)))?;
-        response
-            .headers_mut()
-            .insert(HeaderName::from_static("content-length"), value);
-        apply_attachment_headers(&mut response, None, &key)?;
-    }
-
-    response.headers_mut().insert(
-        HeaderName::from_static("cache-control"),
-        HeaderValue::from_static("public, max-age=31536000, immutable"),
-    );
-
-    Ok(response)
+    build_blob_download_response(
+        download,
+        &key,
+        "public, max-age=31536000, immutable",
+        BlobResponseContext::None,
+        || AppError::not_found("user avatar not found").with_name("USER_AVATAR_NOT_FOUND"),
+    )
 }
 
 #[cfg(test)]

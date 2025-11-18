@@ -17,7 +17,7 @@ use socketioxide::SocketIo;
 use tokio::{
     spawn,
     sync::broadcast,
-    task::spawn_blocking,
+    task::{JoinHandle, spawn_blocking},
     time::{Duration, sleep},
 };
 use tracing::{info, warn};
@@ -64,6 +64,7 @@ use crate::{
     user::service::UserService,
     workspace::service::WorkspaceService,
 };
+use barffine_core::ids::{DocId, UserId, WorkspaceId};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value as JsonValue, json};
 
@@ -109,6 +110,193 @@ pub struct AppState {
     pub socket_runtime: Arc<SocketRuntimeState>,
 }
 
+pub struct BackgroundTasks {
+    doc_compactor: Option<JoinHandle<()>>,
+    doc_cache_reaper: Option<JoinHandle<()>>,
+}
+
+impl BackgroundTasks {
+    pub fn start(state: &AppState) -> Self {
+        let compactor = spawn(doc_compactor_loop(
+            state.document_store.clone(),
+            state.user_doc_store.clone(),
+        ));
+        let reaper = spawn(doc_cache_reaper_loop(state.doc_cache.clone()));
+        Self {
+            doc_compactor: Some(compactor),
+            doc_cache_reaper: Some(reaper),
+        }
+    }
+
+    pub async fn shutdown(mut self) {
+        if let Some(handle) = self.doc_compactor.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        if let Some(handle) = self.doc_cache_reaper.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for BackgroundTasks {
+    fn drop(&mut self) {
+        if let Some(handle) = self.doc_compactor.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.doc_cache_reaper.take() {
+            handle.abort();
+        }
+    }
+}
+
+struct StoreBundle {
+    user_store: UserStore,
+    user_settings: UserSettingsStore,
+    workspace_store: WorkspaceStore,
+    document_store: DocumentStore,
+    user_doc_store: UserDocStore,
+    doc_role_store: DocumentRoleStore,
+    access_token_store: AccessTokenStore,
+    comment_store: Arc<dyn CommentStoreTrait>,
+    comment_attachment_store: CommentAttachmentStore,
+    notification_center: Arc<dyn NotificationCenter>,
+    blob_store: Arc<dyn BlobStorage>,
+    doc_cache: Arc<DocCache>,
+    workspace_embedding_files: Arc<DashMap<String, HashMap<String, WorkspaceEmbeddingFileRecord>>>,
+    workspace_embedding_ignored_docs: Arc<DashMap<String, HashSet<String>>>,
+    copilot_sessions: Arc<DashMap<String, CopilotSessionRecord>>,
+}
+
+impl StoreBundle {
+    fn build(database: &Database, app_config: &AppConfig, config: &StateBuildConfig) -> Self {
+        let workspace_embedding_files = Arc::new(DashMap::new());
+        let workspace_embedding_ignored_docs = Arc::new(DashMap::new());
+        let copilot_sessions = Arc::new(DashMap::new());
+        let comment_attachment_store = CommentAttachmentStore::new(database);
+        let blob_store = create_blob_store(database, app_config);
+        let document_store = DocumentStore::new(database);
+        let user_doc_store = UserDocStore::new(database);
+        let doc_cache = build_doc_cache(
+            app_config,
+            config.doc_cache.clone(),
+            database,
+            &document_store,
+            &user_doc_store,
+        );
+        let user_store = UserStore::new(database);
+        let user_settings = UserSettingsStore::new(database);
+        let workspace_store = WorkspaceStore::new(database);
+        let doc_role_store = DocumentRoleStore::new(database);
+        let access_token_store = AccessTokenStore::new(database);
+        let comment_store = create_comment_store(database);
+        let notification_center = create_notification_center(database);
+
+        Self {
+            user_store,
+            user_settings,
+            workspace_store,
+            document_store,
+            user_doc_store,
+            doc_role_store,
+            access_token_store,
+            comment_store,
+            comment_attachment_store,
+            notification_center,
+            blob_store,
+            doc_cache,
+            workspace_embedding_files,
+            workspace_embedding_ignored_docs,
+            copilot_sessions,
+        }
+    }
+}
+
+struct ServiceBundle {
+    feature_service: FeatureService,
+    user_service: Arc<UserService>,
+    workspace_service: Arc<WorkspaceService>,
+    doc_access_service: Arc<DocAccessService>,
+}
+
+impl ServiceBundle {
+    fn build(
+        stores: &StoreBundle,
+        deterministic_store: DeterministicFeatureStore,
+        workspace_feature_store: WorkspaceFeatureStore,
+        doc_token_signer: Arc<DocTokenSigner>,
+    ) -> Self {
+        let feature_service = FeatureService::new(deterministic_store, workspace_feature_store);
+        let user_service = Arc::new(UserService::new(stores.user_store.clone()));
+        let workspace_service = Arc::new(WorkspaceService::new(
+            stores.workspace_store.clone(),
+            stores.user_store.clone(),
+            stores.document_store.clone(),
+            stores.doc_role_store.clone(),
+            doc_token_signer,
+        ));
+        let doc_access_service = Arc::new(DocAccessService::new(
+            stores.document_store.clone(),
+            stores.doc_role_store.clone(),
+            workspace_service.clone(),
+        ));
+
+        Self {
+            feature_service,
+            user_service,
+            workspace_service,
+            doc_access_service,
+        }
+    }
+}
+
+struct RuntimeBundle {
+    sync_hub: SyncHub,
+    doc_sessions: Arc<DocSessionManager>,
+    socket_runtime: Arc<SocketRuntimeState>,
+    socket_metrics: Arc<SocketMetrics>,
+    request_deduper: Arc<SocketRequestDeduper>,
+    socket_io: Arc<OnceCell<Arc<SocketIo>>>,
+    workspace_embedding_events: broadcast::Sender<WorkspaceEmbeddingEvent>,
+}
+
+impl RuntimeBundle {
+    fn build(stores: &StoreBundle, services: &ServiceBundle) -> Self {
+        let socket_io = Arc::new(OnceCell::new());
+        let socket_metrics = Arc::new(SocketMetrics::default());
+        let (workspace_embedding_events, _) = broadcast::channel(64);
+        let doc_sessions = Arc::new(DocSessionManager::default());
+        let sync_hub = SyncHub::new(socket_io.clone(), socket_metrics.clone());
+        let request_deduper = Arc::new(SocketRequestDeduper::default());
+        let socket_runtime = Arc::new(SocketRuntimeState::new(
+            stores.doc_cache.clone(),
+            doc_sessions.clone(),
+            sync_hub.clone(),
+            request_deduper.clone(),
+            socket_metrics.clone(),
+            stores.workspace_embedding_files.clone(),
+            stores.workspace_embedding_ignored_docs.clone(),
+            workspace_embedding_events.clone(),
+            services.user_service.clone(),
+            services.workspace_service.clone(),
+            services.doc_access_service.clone(),
+            stores.workspace_store.clone(),
+            stores.document_store.clone(),
+            stores.user_doc_store.clone(),
+        ));
+
+        Self {
+            sync_hub,
+            doc_sessions,
+            socket_runtime,
+            socket_metrics,
+            request_deduper,
+            socket_io,
+            workspace_embedding_events,
+        }
+    }
+}
 #[derive(Clone, Default)]
 pub struct StateBuildConfig {
     pub doc_cache: Option<DocCacheConfig>,
@@ -330,17 +518,46 @@ impl SyncHub {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum SpaceKeyId {
+    Workspace(WorkspaceId),
+    Userspace(UserId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct DocSessionKey {
     pub(crate) space_type: SpaceType,
-    pub(crate) space_id: String,
-    pub(crate) doc_id: String,
+    pub(crate) space_id: SpaceKeyId,
+    pub(crate) doc_id: DocId,
 }
 
 impl DocSessionKey {
+    /// Construct a session key from raw IDs coming from the wire.
+    /// This keeps parsing logic in one place while allowing strong typing internally.
     pub(crate) fn new(space_type: SpaceType, space_id: String, doc_id: String) -> Self {
+        let space_id = match space_type {
+            SpaceType::Workspace => SpaceKeyId::Workspace(WorkspaceId::from(space_id)),
+            SpaceType::Userspace => SpaceKeyId::Userspace(UserId::from(space_id)),
+        };
+        let doc_id = DocId::from(doc_id);
         Self {
             space_type,
             space_id,
+            doc_id,
+        }
+    }
+
+    pub(crate) fn workspace(space_id: WorkspaceId, doc_id: DocId) -> Self {
+        Self {
+            space_type: SpaceType::Workspace,
+            space_id: SpaceKeyId::Workspace(space_id),
+            doc_id,
+        }
+    }
+
+    pub(crate) fn userspace(user_id: UserId, doc_id: DocId) -> Self {
+        Self {
+            space_type: SpaceType::Userspace,
+            space_id: SpaceKeyId::Userspace(user_id),
             doc_id,
         }
     }
@@ -397,7 +614,13 @@ impl DocSessionManager {
 
         let mut removed = Vec::new();
         entry.retain(|key| {
-            let keep = key.space_type != space_type || key.space_id != space_id;
+            let same_space = key.space_type == space_type
+                && match (&key.space_type, &key.space_id) {
+                    (SpaceType::Workspace, SpaceKeyId::Workspace(id)) => id.as_str() == space_id,
+                    (SpaceType::Userspace, SpaceKeyId::Userspace(id)) => id.as_str() == space_id,
+                    _ => false,
+                };
+            let keep = !same_space;
             if !keep {
                 removed.push(key.clone());
             }
@@ -685,124 +908,54 @@ pub fn build_state_with_config(
     app_config: &AppConfig,
     config: StateBuildConfig,
 ) -> AppState {
+    let store_bundle = StoreBundle::build(database, app_config, &config);
     let deterministic_store = DeterministicFeatureStore::with_global_defaults();
     let workspace_feature_store = WorkspaceFeatureStore::new(database);
-    let workspace_embedding_files = Arc::new(DashMap::new());
-    let workspace_embedding_ignored_docs = Arc::new(DashMap::new());
-    let copilot_sessions = Arc::new(DashMap::new());
-    let comment_attachment_store = CommentAttachmentStore::new(database);
-    let blob_store = create_blob_store(database, app_config);
     let doc_token_signer = Arc::new(DocTokenSigner::new());
+    let services = ServiceBundle::build(
+        &store_bundle,
+        deterministic_store,
+        workspace_feature_store,
+        doc_token_signer.clone(),
+    );
     let server_path = detect_server_path();
     let base_url = compute_base_url(server_path.as_deref());
     let oauth = Arc::new(OAuthService::new(&base_url));
-    let socket_io = Arc::new(OnceCell::new());
-    let socket_metrics = Arc::new(SocketMetrics::default());
-    let (workspace_embedding_events, _) = broadcast::channel(64);
-    let document_store = DocumentStore::new(database);
-    let user_doc_store = UserDocStore::new(database);
-    let doc_cache = match app_config.doc_store_backend {
-        DocStoreBackend::Sql => {
-            let doc_cache_builder = DocCacheBuilder::new(
-                document_store.clone(),
-                user_doc_store.clone(),
-                database
-                    .doc_data_store()
-                    .map(|store| store as Arc<dyn DocDataBackend>),
-            );
-            Arc::new(if let Some(doc_cache_config) = config.doc_cache.clone() {
-                doc_cache_builder.with_config(doc_cache_config).build()
-            } else {
-                doc_cache_builder.build()
-            })
-        }
-        DocStoreBackend::RocksDb => {
-            // When the doc store backend is RocksDB, we bypass the
-            // in-memory doc cache and go directly to storage for
-            // snapshots/updates.
-            Arc::new(DocCache::new_bypass(
-                document_store.clone(),
-                user_doc_store.clone(),
-            ))
-        }
-    };
-    let user_store = UserStore::new(database);
-    let user_service = Arc::new(UserService::new(user_store.clone()));
-    let user_settings = UserSettingsStore::new(database);
-    let workspace_store = WorkspaceStore::new(database);
-    let doc_role_store = DocumentRoleStore::new(database);
-    let access_token_store = AccessTokenStore::new(database);
-    let comment_store = create_comment_store(database);
-    let notification_center = create_notification_center(database);
-    let workspace_service = Arc::new(WorkspaceService::new(
-        workspace_store.clone(),
-        user_store.clone(),
-        document_store.clone(),
-        doc_role_store.clone(),
-        doc_token_signer.clone(),
-    ));
-    let doc_access_service = Arc::new(DocAccessService::new(
-        document_store.clone(),
-        doc_role_store.clone(),
-        workspace_service.clone(),
-    ));
-    let doc_sessions = Arc::new(DocSessionManager::default());
-    let sync_hub = SyncHub::new(socket_io.clone(), socket_metrics.clone());
-    let request_deduper = Arc::new(SocketRequestDeduper::default());
-    let socket_runtime = Arc::new(SocketRuntimeState::new(
-        doc_cache.clone(),
-        doc_sessions.clone(),
-        sync_hub.clone(),
-        request_deduper.clone(),
-        socket_metrics.clone(),
-        workspace_embedding_files.clone(),
-        workspace_embedding_ignored_docs.clone(),
-        workspace_embedding_events.clone(),
-        user_service.clone(),
-        workspace_service.clone(),
-        doc_access_service.clone(),
-        workspace_store.clone(),
-        document_store.clone(),
-        user_doc_store.clone(),
-    ));
+    let runtime = RuntimeBundle::build(&store_bundle, &services);
 
-    let state = AppState {
-        user_store,
-        user_settings,
-        workspace_store,
-        document_store,
-        user_doc_store,
-        doc_role_store,
-        access_token_store,
-        comment_store,
-        comment_attachment_store,
-        notification_center: notification_center.clone(),
-        sync_hub,
-        doc_sessions,
-        doc_cache,
+    AppState {
+        user_store: store_bundle.user_store.clone(),
+        user_settings: store_bundle.user_settings.clone(),
+        workspace_store: store_bundle.workspace_store.clone(),
+        document_store: store_bundle.document_store.clone(),
+        user_doc_store: store_bundle.user_doc_store.clone(),
+        doc_role_store: store_bundle.doc_role_store.clone(),
+        access_token_store: store_bundle.access_token_store.clone(),
+        comment_store: store_bundle.comment_store.clone(),
+        comment_attachment_store: store_bundle.comment_attachment_store.clone(),
+        notification_center: store_bundle.notification_center.clone(),
+        sync_hub: runtime.sync_hub.clone(),
+        doc_sessions: runtime.doc_sessions.clone(),
+        doc_cache: store_bundle.doc_cache.clone(),
         metadata: ServerMetadata::load(),
-        feature_service: FeatureService::new(deterministic_store, workspace_feature_store),
-        user_service,
-        workspace_service,
-        doc_access_service,
-        blob_store,
-        workspace_embedding_files,
-        workspace_embedding_ignored_docs,
-        copilot_sessions,
+        feature_service: services.feature_service,
+        user_service: services.user_service.clone(),
+        workspace_service: services.workspace_service.clone(),
+        doc_access_service: services.doc_access_service.clone(),
+        blob_store: store_bundle.blob_store.clone(),
+        workspace_embedding_files: store_bundle.workspace_embedding_files.clone(),
+        workspace_embedding_ignored_docs: store_bundle.workspace_embedding_ignored_docs.clone(),
+        copilot_sessions: store_bundle.copilot_sessions.clone(),
         doc_token_signer,
         server_path,
         base_url,
-        socket_io,
-        socket_metrics,
-        workspace_embedding_events,
+        socket_io: runtime.socket_io.clone(),
+        socket_metrics: runtime.socket_metrics.clone(),
+        workspace_embedding_events: runtime.workspace_embedding_events.clone(),
         oauth,
-        request_deduper,
-        socket_runtime,
-    };
-
-    spawn_background_tasks(&state);
-
-    state
+        request_deduper: runtime.request_deduper.clone(),
+        socket_runtime: runtime.socket_runtime.clone(),
+    }
 }
 
 fn create_notification_center(database: &Database) -> Arc<dyn NotificationCenter> {
@@ -876,6 +1029,34 @@ fn create_blob_store(database: &Database, app_config: &AppConfig) -> Arc<dyn Blo
             RocksBlobStorage::open(&app_config.blob_store_path)
                 .unwrap_or_else(|err| panic!("failed to open rocksdb blob store: {err}")),
         ),
+    }
+}
+
+fn build_doc_cache(
+    app_config: &AppConfig,
+    doc_cache_config: Option<DocCacheConfig>,
+    database: &Database,
+    document_store: &DocumentStore,
+    user_doc_store: &UserDocStore,
+) -> Arc<DocCache> {
+    match app_config.doc_store_backend {
+        DocStoreBackend::Sql => {
+            let builder = DocCacheBuilder::new(
+                document_store.clone(),
+                user_doc_store.clone(),
+                database
+                    .doc_data_store()
+                    .map(|store| store as Arc<dyn DocDataBackend>),
+            );
+            match doc_cache_config {
+                Some(cfg) => Arc::new(builder.with_config(cfg).build()),
+                None => Arc::new(builder.build()),
+            }
+        }
+        DocStoreBackend::RocksDb => Arc::new(DocCache::new_bypass(
+            document_store.clone(),
+            user_doc_store.clone(),
+        )),
     }
 }
 
@@ -983,23 +1164,6 @@ fn pick_non_empty_env(vars: &[&str]) -> Option<String> {
         }
     }
     None
-}
-
-fn spawn_background_tasks(state: &AppState) {
-    start_doc_compactor(state.document_store.clone(), state.user_doc_store.clone());
-    start_doc_cache_reaper(state.doc_cache.clone());
-}
-
-fn start_doc_compactor(document_store: DocumentStore, user_doc_store: UserDocStore) {
-    spawn(async move {
-        doc_compactor_loop(document_store, user_doc_store).await;
-    });
-}
-
-fn start_doc_cache_reaper(doc_cache: Arc<DocCache>) {
-    spawn(async move {
-        doc_cache_reaper_loop(doc_cache).await;
-    });
 }
 
 const DOC_COMPACTION_INTERVAL: Duration = Duration::from_secs(60);

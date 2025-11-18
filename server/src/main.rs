@@ -6,8 +6,11 @@
 pub use barffine_server::*;
 
 use anyhow::{Context, anyhow, bail};
-use barffine_core::{config::AppConfig, db::Database, user::UserStore};
-use barffine_server::utils::db::is_unique_violation;
+use barffine_core::{
+    config::AppConfig,
+    db::{Database, is_unique_violation},
+    user::UserStore,
+};
 use barffine_server::workspace::service::WorkspaceCreationParams;
 use clap::{Args, Parser, Subcommand};
 #[cfg(debug_assertions)]
@@ -160,6 +163,7 @@ async fn run_serve(config: AppConfig) -> anyhow::Result<()> {
     );
     let database = Database::connect(&config).await?;
     let state = build_state(&database, &config);
+    let background_tasks = BackgroundTasks::start(&state);
     state
         .workspace_store
         .normalize_member_statuses()
@@ -191,6 +195,8 @@ async fn run_serve(config: AppConfig) -> anyhow::Result<()> {
     {
         error!(?error, "server terminated with error");
     }
+
+    background_tasks.shutdown().await;
 
     if let Some(profiler) = profiler {
         profiler.finish();

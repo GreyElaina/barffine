@@ -15,6 +15,8 @@ pub const AVATAR_STORAGE_NAMESPACE: &str = "__avatars__";
 /// Descriptor for a blob belonging to a workspace or document context.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlobDescriptor {
+    /// Logical bucket for the blob. For normal blobs this is a `WorkspaceId`,
+    /// for special namespaces (e.g. avatars) it is the raw namespace string.
     pub workspace_id: String,
     pub key: String,
 }
@@ -145,12 +147,12 @@ mod tests {
 /// Logical scope for blob persistence (workspace vs. special namespaces such as avatars).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlobScope {
-    Workspace { workspace_id: String },
+    Workspace { workspace_id: crate::ids::WorkspaceId },
     Namespace { namespace: String },
 }
 
 impl BlobScope {
-    pub fn workspace(workspace_id: impl Into<String>) -> Self {
+    pub fn workspace(workspace_id: impl Into<crate::ids::WorkspaceId>) -> Self {
         Self::Workspace {
             workspace_id: workspace_id.into(),
         }

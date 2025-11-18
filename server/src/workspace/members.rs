@@ -62,7 +62,7 @@ fn ensure_not_owner(
     user_id: &str,
     error_message: &'static str,
 ) -> Result<(), AppError> {
-    if workspace.owner_id == user_id {
+    if workspace.owner_id.as_str() == user_id {
         Err(AppError::bad_request(error_message))
     } else {
         Ok(())

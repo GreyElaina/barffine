@@ -15,6 +15,7 @@ use crate::{
     crypto::{DocTokenError, DocTokenSigner},
     state::AppState,
 };
+use barffine_core::ids::UserId;
 
 pub struct WorkspaceService {
     workspace_store: WorkspaceStore,
@@ -73,7 +74,7 @@ impl WorkspaceService {
         user_id: Option<&str>,
     ) -> Result<bool, AppError> {
         if let Some(user_id) = user_id {
-            if user_id == workspace.owner_id {
+            if user_id == workspace.owner_id.as_str() {
                 return Ok(true);
             }
 
@@ -216,7 +217,7 @@ impl WorkspaceService {
         let workspace = self
             .workspace_store
             .create(
-                params.owner_id,
+                &UserId::from(params.owner_id),
                 trimmed_name,
                 params.public,
                 params.enable_ai,

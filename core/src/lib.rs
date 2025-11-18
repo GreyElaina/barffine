@@ -11,6 +11,7 @@ pub mod doc_snapshot_store;
 pub mod doc_store;
 pub mod doc_update_log;
 pub mod feature;
+pub mod ids;
 pub mod membership;
 pub mod notification;
 pub mod search;

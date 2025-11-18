@@ -48,10 +48,10 @@ impl UserMembershipType {
         user_id: &str,
         role: crate::graphql::Permission,
     ) -> Self {
-        let is_owner =
-            role == crate::graphql::Permission::Owner || record.workspace_owner_id == user_id;
+        let is_owner = role == crate::graphql::Permission::Owner
+            || record.workspace_owner_id.as_str() == user_id;
         Self {
-            workspace_id: ID(record.workspace_id),
+            workspace_id: ID(record.workspace_id.to_string()),
             workspace_name: record.workspace_name,
             is_owner,
             role,
@@ -74,8 +74,8 @@ pub(crate) struct UserShareTokenType {
 impl From<UserShareTokenRecord> for UserShareTokenType {
     fn from(record: UserShareTokenRecord) -> Self {
         Self {
-            workspace_id: ID(record.workspace_id),
-            doc_id: ID(record.doc_id),
+            workspace_id: ID(record.workspace_id.to_string()),
+            doc_id: ID(record.doc_id.to_string()),
             token: record.token,
             created_at: timestamp_to_datetime(record.created_at),
         }

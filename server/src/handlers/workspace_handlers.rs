@@ -52,7 +52,7 @@ pub(crate) async fn create_workspace_handler(
         .await?;
 
     let response = CreateWorkspaceResponse {
-        id: workspace.id,
+        id: workspace.id.to_string(),
         name: workspace.name,
     };
 
@@ -69,16 +69,6 @@ pub(crate) async fn get_workspace_content_handler(
     let response = workspace_content_response(&workspaces, &workspace_id, &headers, false).await?;
 
     Ok(Json(response))
-}
-
-pub(crate) async fn ensure_workspace_exists(
-    state: &AppState,
-    workspace_id: &str,
-) -> Result<(), AppError> {
-    state
-        .workspace_service
-        .ensure_workspace_exists(workspace_id)
-        .await
 }
 
 async fn workspace_content_response(

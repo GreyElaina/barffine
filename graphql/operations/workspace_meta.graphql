@@ -1,0 +1,7 @@
+query WorkspaceMeta($id: ID!) {
+    workspace(id: $id) {
+        id
+        name
+        public
+    }
+}

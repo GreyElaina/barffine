@@ -16,6 +16,7 @@ use crate::{
         UserShareTokenRecord,
     },
     doc_update_log::DocUpdateLogReader,
+    ids::{DocId, WorkspaceId},
 };
 
 pub struct SqliteDocRepository {
@@ -46,8 +47,8 @@ impl SqliteDocRepository {
             .filter(|_| public);
 
         DocumentMetadata {
-            id: row.get("id"),
-            workspace_id: row.get("workspace_id"),
+            id: DocId::from(row.get::<String, _>("id")),
+            workspace_id: WorkspaceId::from(row.get::<String, _>("workspace_id")),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
             default_role: row.get("default_role"),
@@ -424,8 +425,8 @@ impl DocRepository for SqliteDocRepository {
         Ok(rows
             .into_iter()
             .map(|row| UserShareTokenRecord {
-                workspace_id: row.get("workspace_id"),
-                doc_id: row.get("doc_id"),
+                workspace_id: WorkspaceId::from(row.get::<String, _>("workspace_id")),
+                doc_id: DocId::from(row.get::<String, _>("doc_id")),
                 token: row.get("token"),
                 created_at: row.get::<i64, _>("created_at"),
             })
@@ -602,8 +603,8 @@ impl DocRepository for SqliteDocRepository {
         tx.commit().await?;
 
         Ok(Some(DocumentMetadata {
-            id: new_doc_id,
-            workspace_id: target_workspace_id,
+            id: DocId::from(new_doc_id),
+            workspace_id: WorkspaceId::from(target_workspace_id),
             created_at: now,
             updated_at: now,
             default_role,
@@ -1121,7 +1122,7 @@ async fn list_created(
         .bind(workspace_id)
         .bind(cursor.timestamp)
         .bind(cursor.timestamp)
-        .bind(&cursor.id)
+        .bind(cursor.id.as_str())
         .bind(limit)
         .fetch_all(pool)
         .await?;
@@ -1178,7 +1179,7 @@ async fn list_updated_desc(
         .bind(workspace_id)
         .bind(cursor.timestamp)
         .bind(cursor.timestamp)
-        .bind(&cursor.id)
+        .bind(cursor.id.as_str())
         .bind(limit)
         .fetch_all(pool)
         .await?;

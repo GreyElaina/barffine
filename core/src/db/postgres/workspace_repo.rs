@@ -7,6 +7,7 @@ use crate::{
         postgres::util::bool_to_i64,
         workspace_repo::{CreateWorkspaceParams, UpdateWorkspaceParams, WorkspaceRepository},
     },
+    ids::{UserId, WorkspaceId},
     workspace::{
         UserWorkspaceMembership, WorkspaceInviteLinkRecord, WorkspaceMemberWithUser,
         WorkspaceRecord,
@@ -25,9 +26,9 @@ impl PostgresWorkspaceRepository {
 
     fn map_workspace_row(row: PgRow) -> WorkspaceRecord {
         WorkspaceRecord {
-            id: row.get("id"),
+            id: WorkspaceId::from(row.get::<String, _>("id")),
             name: row.get("name"),
-            owner_id: row.get("owner_id"),
+            owner_id: UserId::from(row.get::<String, _>("owner_id")),
             created_at: row.get("created_at"),
             public: row.get::<i64, _>("public") != 0,
             enable_ai: row.get::<i64, _>("enable_ai") != 0,
@@ -41,8 +42,8 @@ impl PostgresWorkspaceRepository {
 
     fn map_member_row(row: PgRow) -> WorkspaceMemberWithUser {
         WorkspaceMemberWithUser {
-            workspace_id: row.get("workspace_id"),
-            user_id: row.get("user_id"),
+            workspace_id: WorkspaceId::from(row.get::<String, _>("workspace_id")),
+            user_id: UserId::from(row.get::<String, _>("user_id")),
             role: row.get("role"),
             status: row.get("status"),
             email: row.get("email"),
@@ -480,8 +481,8 @@ impl WorkspaceRepository for PostgresWorkspaceRepository {
         .await?;
 
         Ok(row.map(|row| WorkspaceMemberRecord {
-            workspace_id: row.get("workspace_id"),
-            user_id: row.get("user_id"),
+            workspace_id: WorkspaceId::from(row.get::<String, _>("workspace_id")),
+            user_id: UserId::from(row.get::<String, _>("user_id")),
             role: row.get("role"),
             status: row.get("status"),
             inviter_id: row.get("inviter_id"),

@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
+use barffine_server::cookies::parse_set_cookie;
 use parking_lot::Mutex;
 use reqwest::{
     Client, StatusCode,
@@ -174,7 +175,7 @@ impl CookieStore {
     fn ingest(&mut self, headers: &HeaderMap) {
         for value in headers.get_all("set-cookie").iter() {
             if let Ok(text) = value.to_str() {
-                if let Some((name, cookie_value)) = parse_cookie(text) {
+                if let Some((name, cookie_value)) = parse_set_cookie(text) {
                     if let Some(entry) = self.entries.iter_mut().find(|(n, _)| *n == name) {
                         entry.1 = cookie_value;
                     } else {
@@ -186,22 +187,7 @@ impl CookieStore {
     }
 }
 
-fn parse_cookie(raw: &str) -> Option<(String, String)> {
-    let mut parts = raw.split(';');
-    let name_value = parts.next()?.trim();
-    let mut iter = name_value.splitn(2, '=');
-    let name = iter.next()?.trim();
-    let value = iter.next()?.trim();
-    if name.is_empty() {
-        return None;
-    }
-    Some((name.to_string(), value.to_string()))
-}
-
-const CREATE_SESSION_MUTATION: &str = r#"
-mutation CreateSession($input: CreateSessionInput!) {
-    createSession(input: $input) {
-        userId
-    }
-}
-"#;
+const CREATE_SESSION_MUTATION: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../graphql/operations/create_session.graphql"
+));

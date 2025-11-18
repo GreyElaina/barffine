@@ -3,10 +3,12 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::ids::{DocId, WorkspaceId};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchDocument {
-    pub doc_id: String,
-    pub workspace_id: String,
+    pub doc_id: DocId,
+    pub workspace_id: WorkspaceId,
     pub title: Option<String>,
     pub content: String,
     pub updated_at: DateTime<Utc>,
@@ -20,15 +22,15 @@ pub struct SearchResults {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchHit {
-    pub doc_id: String,
-    pub workspace_id: String,
+    pub doc_id: DocId,
+    pub workspace_id: WorkspaceId,
     pub score: f32,
     pub snippet: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchQuery {
-    pub workspace_ids: Vec<String>,
+    pub workspace_ids: Vec<WorkspaceId>,
     pub term: String,
     pub limit: u32,
     pub offset: u32,
@@ -44,7 +46,7 @@ impl SearchQuery {
         }
     }
 
-    pub fn with_workspace(mut self, workspace_id: impl Into<String>) -> Self {
+    pub fn with_workspace(mut self, workspace_id: impl Into<WorkspaceId>) -> Self {
         self.workspace_ids.push(workspace_id.into());
         self
     }
@@ -63,8 +65,11 @@ mod tests {
 
     #[test]
     fn builder_api() {
-        let query = SearchQuery::new("affine").with_workspace("workspace");
+        let query = SearchQuery::new("affine").with_workspace(WorkspaceId::from("workspace"));
         assert_eq!(query.term, "affine");
-        assert_eq!(query.workspace_ids, &["workspace"]);
+        assert_eq!(
+            query.workspace_ids,
+            &[WorkspaceId::from("workspace")]
+        );
     }
 }

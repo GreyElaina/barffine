@@ -184,7 +184,7 @@ pub async fn execute(
                 });
             };
             let path = format!(
-                "/workspaces/{}/docs/{}/content",
+                "/api/workspaces/{}/docs/{}/content",
                 doc.workspace_id, doc.doc_id
             );
             let (status, _) = ctx.client.get_rest(&path, Some(&[("full", "1")])).await?;
@@ -203,7 +203,7 @@ pub async fn execute(
                 });
             };
             let path = format!(
-                "/workspaces/{}/docs/{}/markdown",
+                "/api/workspaces/{}/docs/{}/markdown",
                 doc.workspace_id, doc.doc_id
             );
             let (status, _) = ctx.client.get_rest(&path, None).await?;
@@ -348,72 +348,32 @@ pub async fn duplicate_doc(
     Ok(id)
 }
 
-const WORKSPACES_QUERY: &str = r#"
-query Workspaces {
-    workspaces {
-        id
-        name
-    }
-}
-"#;
+const WORKSPACES_QUERY: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../graphql/operations/workspaces.graphql"
+));
 
-const WORKSPACE_META_QUERY: &str = r#"
-query WorkspaceMeta($id: ID!) {
-    workspace(id: $id) {
-        id
-        name
-        public
-    }
-}
-"#;
+const WORKSPACE_META_QUERY: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../graphql/operations/workspace_meta.graphql"
+));
 
-const CREATE_WORKSPACE_MUTATION: &str = r#"
-mutation CreateWorkspace($input: CreateWorkspaceInput) {
-    createWorkspace(input: $input) {
-        id
-        name
-    }
-}
-"#;
+const CREATE_WORKSPACE_MUTATION: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../graphql/operations/create_workspace.graphql"
+));
 
-const LIST_COMMENTS_QUERY: &str = r#"
-query WorkspaceComments($workspaceId: ID!, $docId: ID!, $pagination: PaginationInput) {
-  workspace(id: $workspaceId) {
-    comments(docId: $docId, pagination: $pagination) {
-      totalCount
-      edges {
-        node {
-          id
-          resolved
-        }
-      }
-    }
-  }
-}
-"#;
+const LIST_COMMENTS_QUERY: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../graphql/operations/list_comments.graphql"
+));
 
-const WORKSPACE_DOCS_QUERY: &str = r#"
-query WorkspaceDocs($workspaceId: ID!, $first: Int!, $after: String) {
-  workspace(id: $workspaceId) {
-    docs(pagination: { first: $first, after: $after }) {
-      edges {
-        node {
-          id
-        }
-      }
-      pageInfo {
-        hasNextPage
-        endCursor
-      }
-    }
-  }
-}
-"#;
+const WORKSPACE_DOCS_QUERY: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../graphql/operations/workspace_docs.graphql"
+));
 
-const DUPLICATE_DOC_MUTATION: &str = r#"
-mutation DuplicateDoc($input: DuplicateDocInput!) {
-  duplicateDoc(input: $input) {
-    id
-  }
-}
-"#;
+const DUPLICATE_DOC_MUTATION: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../graphql/operations/duplicate_doc.graphql"
+));

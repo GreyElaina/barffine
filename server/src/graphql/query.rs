@@ -10,10 +10,7 @@ use crate::oauth::OAuthProviderKind;
 use crate::{
     AppError, AppState,
     doc::{history, metadata as doc_metadata, sync::workspace_snapshot_or_not_found},
-    workspace::{
-        invites::{self as workspace_invites, InviteLinkLookup},
-        service::WorkspaceService,
-    },
+    workspace::invites::{self as workspace_invites, InviteLinkLookup},
 };
 use semver::Version;
 
@@ -343,23 +340,11 @@ impl QueryRoot {
             )));
         }
 
-        let workspace_title = WorkspaceService::normalized_workspace_title(&workspace.name);
-
         state
-            .document_store
-            .ensure_doc_record(
-                &workspace.id,
-                &workspace.id,
-                &workspace.owner_id,
-                workspace_title,
-            )
+            .doc_access_service
+            .ensure_metadata(&workspace, &workspace.id)
             .await
-            .map_err(map_anyhow)?;
-        state
-            .doc_role_store
-            .upsert(&workspace.id, &workspace.id, &workspace.owner_id, "owner")
-            .await
-            .map_err(map_anyhow)?;
+            .map_err(map_app_error)?;
         Ok(WorkspaceType::from(workspace))
     }
 
@@ -430,8 +415,8 @@ impl QueryRoot {
                 .map_err(map_anyhow)?
                 .ok_or_else(|| map_app_error(AppError::not_found("invitation not found")))?;
 
-            workspace_id = Some(member.workspace_id.clone());
-            invitee_user_id = Some(member.user_id.clone());
+            workspace_id = Some(member.workspace_id.to_string());
+            invitee_user_id = Some(member.user_id.to_string());
             status = Some(workspace_member_status_from_str(&member.status));
         } else {
             match workspace_invites::lookup_invite_link_by_token(state, trimmed)
@@ -439,7 +424,7 @@ impl QueryRoot {
                 .map_err(map_app_error)?
             {
                 InviteLinkLookup::Active(link) => {
-                    workspace_id = Some(link.workspace_id.clone());
+                    workspace_id = Some(link.workspace_id.to_string());
                 }
                 InviteLinkLookup::Missing => {
                     return Err(map_app_error(AppError::not_found("invitation not found")));
@@ -511,7 +496,7 @@ impl QueryRoot {
 
         let workspace_info = InvitationWorkspaceType {
             avatar: String::new(),
-            id: ID(workspace.id.clone()),
+            id: ID(workspace.id.to_string()),
             name: workspace.name.clone(),
         };
 
