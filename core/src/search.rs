@@ -67,9 +67,6 @@ mod tests {
     fn builder_api() {
         let query = SearchQuery::new("affine").with_workspace(WorkspaceId::from("workspace"));
         assert_eq!(query.term, "affine");
-        assert_eq!(
-            query.workspace_ids,
-            &[WorkspaceId::from("workspace")]
-        );
+        assert_eq!(query.workspace_ids, &[WorkspaceId::from("workspace")]);
     }
 }

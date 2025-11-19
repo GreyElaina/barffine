@@ -33,9 +33,7 @@ impl PostgresCommentAttachmentRepository {
             mime: row.get("mime"),
             size: row.get("size"),
             created_at,
-            created_by: row
-                .get::<Option<String>, _>("created_by")
-                .map(UserId::from),
+            created_by: row.get::<Option<String>, _>("created_by").map(UserId::from),
         }
     }
 }

@@ -305,6 +305,12 @@ async fn resolve_doc_access_cached(
     doc_id: &DocId,
 ) -> Result<DocAccessContext<Arc<SocketRuntimeState>>, AppError> {
     if let Some(access) = cache.get(workspace_id, doc_id) {
+        debug!(
+            workspace_id = %workspace_id,
+            doc_id = %doc_id,
+            user_id = %user.user_id,
+            "doc access cache hit"
+        );
         return Ok(DocAccessContext::from_access(
             runtime,
             workspace_id.clone(),
@@ -312,6 +318,13 @@ async fn resolve_doc_access_cached(
             access,
         ));
     }
+
+    debug!(
+        workspace_id = %workspace_id,
+        doc_id = %doc_id,
+        user_id = %user.user_id,
+        "doc access cache miss; resolving from services"
+    );
 
     let headers = user.header_map()?;
     let ctx = DocAccessContext::new(
@@ -649,6 +662,13 @@ async fn handle_space_load_doc(
             return;
         }
 
+        debug!(
+            request_id = %request_id_owned,
+            space_id = %space_id_owned,
+            doc_id = %doc_id_owned,
+            "socket space:load-doc after room check"
+        );
+
         let Some(doc_access_cache) = socket.extensions.get::<Arc<SocketDocAccessCache>>() else {
             warn!("socket space:load-doc missing doc access cache");
             ack_error::<LoadDocResponse>(
@@ -658,6 +678,13 @@ async fn handle_space_load_doc(
             );
             return;
         };
+
+        debug!(
+            request_id = %request_id_owned,
+            space_id = %space_id_owned,
+            doc_id = %doc_id_owned,
+            "socket space:load-doc using doc access cache"
+        );
 
         let (snapshot_bytes, timestamp) = match payload.space_type {
             SpaceType::Workspace => {
@@ -725,6 +752,15 @@ async fn handle_space_load_doc(
                 }
             }
         };
+
+        debug!(
+            request_id = %request_id_owned,
+            space_id = %space_id_owned,
+            doc_id = %doc_id_owned,
+            snapshot_len = snapshot_bytes.len(),
+            timestamp,
+            "socket space:load-doc fetched snapshot from cache"
+        );
 
         let doc = match doc_from_snapshot_bytes(&snapshot_bytes) {
             Ok(doc) => doc,
@@ -812,6 +848,13 @@ async fn handle_space_load_doc(
                 );
             }
         }
+
+        debug!(
+            request_id = %request_id_owned,
+            space_id = %space_id_owned,
+            doc_id = %doc_id_owned,
+            "socket space:load-doc registered doc session and opened cache session"
+        );
 
         ack_ok(
             ack,
@@ -933,20 +976,6 @@ async fn handle_space_push_doc_update(
             }
         };
 
-        // If the same space/document/requestId has already been successfully processed once,
-        // reuse the previous timestamp and return to avoid reapplying the exact same logical update
-        // (e.g., due to client retries or network replay).
-        // (e.g., due to client retries or network replay).
-        if let Some(prev_timestamp) = runtime.request_deduper.check(
-            payload.space_type,
-            &payload.space_id,
-            &payload.doc_id,
-            &request.request_id,
-        ) {
-            ack_doc_update(ack, prev_timestamp);
-            return;
-        }
-
         match payload.space_type {
             SpaceType::Workspace => {
                 let workspace_id = WorkspaceId::from(payload.space_id.clone());
@@ -999,22 +1028,29 @@ async fn handle_space_push_doc_update(
                 {
                     Ok(result) => result,
                     Err(err) => {
+                        debug!(
+                            request_id = request.request_id.as_str(),
+                            space_id = payload.space_id.as_str(),
+                            doc_id = payload.doc_id.as_str(),
+                            "socket push-doc-update apply_doc_updates failed; no broadcast"
+                        );
                         ack_error::<PushDocUpdateResponse>(ack, err, Some(&request.request_id));
                         return;
                     }
                 };
 
+                debug!(
+                    request_id = request.request_id.as_str(),
+                    space_id = payload.space_id.as_str(),
+                    doc_id = payload.doc_id.as_str(),
+                    timestamp = cache_result.timestamp,
+                    "socket push-doc-update apply_doc_updates succeeded"
+                );
+
                 access.metadata.updated_at = cache_result.timestamp;
                 doc_access_cache.insert(&workspace_id, &doc_id, access);
 
                 let timestamp = Some(cache_result.timestamp);
-                runtime.request_deduper.store(
-                    payload.space_type,
-                    &payload.space_id,
-                    &payload.doc_id,
-                    &request.request_id,
-                    timestamp,
-                );
                 ack_doc_update(ack, timestamp);
             }
             SpaceType::Userspace => {
@@ -1038,19 +1074,26 @@ async fn handle_space_push_doc_update(
                 {
                     Ok(result) => result,
                     Err(err) => {
+                        debug!(
+                            request_id = request.request_id.as_str(),
+                            space_id = payload.space_id.as_str(),
+                            doc_id = payload.doc_id.as_str(),
+                            "socket push-doc-update (userspace) apply_doc_updates failed; no broadcast"
+                        );
                         ack_error::<PushDocUpdateResponse>(ack, err, Some(&request.request_id));
                         return;
                     }
                 };
 
-                let timestamp = Some(cache_result.timestamp);
-                runtime.request_deduper.store(
-                    payload.space_type,
-                    &payload.space_id,
-                    &payload.doc_id,
-                    &request.request_id,
-                    timestamp,
+                debug!(
+                    request_id = request.request_id.as_str(),
+                    space_id = payload.space_id.as_str(),
+                    doc_id = payload.doc_id.as_str(),
+                    timestamp = cache_result.timestamp,
+                    "socket push-doc-update (userspace) apply_doc_updates succeeded"
                 );
+
+                let timestamp = Some(cache_result.timestamp);
                 ack_doc_update(ack, timestamp);
             }
         }
@@ -1104,17 +1147,6 @@ async fn handle_space_push_doc_updates(
 
         if let Err(err) = ensure_socket_joined_room(&socket, space_type, &space_id) {
             ack_error::<PushDocUpdateResponse>(ack, err, Some(&request.request_id));
-            return;
-        }
-
-        // Repeated batch update requests for the same space/document/requestId will reuse
-        // the previous result.
-        if let Some(prev_timestamp) =
-            runtime
-                .request_deduper
-                .check(space_type, &space_id, &doc_id, &request.request_id)
-        {
-            ack_doc_update(ack, prev_timestamp);
             return;
         }
 
@@ -1176,6 +1208,14 @@ async fn handle_space_push_doc_updates(
                     return;
                 }
 
+                debug!(
+                    request_id = request.request_id.as_str(),
+                    space_id = space_id.as_str(),
+                    doc_id = doc_id.as_str(),
+                    update_count = update_bytes.len(),
+                    "socket push-doc-updates applying workspace updates"
+                );
+
                 let cache_result = match runtime
                     .doc_cache
                     .clone()
@@ -1190,6 +1230,12 @@ async fn handle_space_push_doc_updates(
                 {
                     Ok(result) => result,
                     Err(err) => {
+                        debug!(
+                            request_id = request.request_id.as_str(),
+                            space_id = space_id.as_str(),
+                            doc_id = doc_id.as_str(),
+                            "socket push-doc-updates workspace apply_updates failed; no broadcast"
+                        );
                         ack_error::<PushDocUpdateResponse>(
                             ack,
                             AppError::from_anyhow(err),
@@ -1203,14 +1249,15 @@ async fn handle_space_push_doc_updates(
                 doc_access_cache.insert(&workspace_id, &doc_id_typed, access);
 
                 let timestamp = Some(cache_result.timestamp);
-                runtime.request_deduper.store(
-                    space_type,
-                    &space_id,
-                    &doc_id,
-                    &request.request_id,
-                    timestamp,
-                );
                 let channel_key = doc_channel_key(&space_id, &doc_id);
+                debug!(
+                    request_id = request.request_id.as_str(),
+                    space_id = space_id.as_str(),
+                    doc_id = doc_id.as_str(),
+                    timestamp = cache_result.timestamp,
+                    channel_key = channel_key.as_str(),
+                    "socket push-doc-updates workspace broadcasting via SyncHub"
+                );
                 runtime.sync_hub.publish_updates(
                     &channel_key,
                     &update_bytes,
@@ -1256,6 +1303,14 @@ async fn handle_space_push_doc_updates(
                     return;
                 }
 
+                debug!(
+                    request_id = request.request_id.as_str(),
+                    space_id = space_id.as_str(),
+                    doc_id = doc_id.as_str(),
+                    update_count = update_bytes.len(),
+                    "socket push-doc-updates applying userspace updates"
+                );
+
                 let cache_result = match runtime
                     .doc_cache
                     .clone()
@@ -1270,6 +1325,12 @@ async fn handle_space_push_doc_updates(
                 {
                     Ok(result) => result,
                     Err(err) => {
+                        debug!(
+                            request_id = request.request_id.as_str(),
+                            space_id = space_id.as_str(),
+                            doc_id = doc_id.as_str(),
+                            "socket push-doc-updates userspace apply_updates failed; no broadcast"
+                        );
                         ack_error::<PushDocUpdateResponse>(
                             ack,
                             AppError::from_anyhow(err),
@@ -1280,14 +1341,15 @@ async fn handle_space_push_doc_updates(
                 };
 
                 let timestamp = Some(cache_result.timestamp);
-                runtime.request_deduper.store(
-                    space_type,
-                    &space_id,
-                    &doc_id,
-                    &request.request_id,
-                    timestamp,
-                );
                 let channel_key = doc_channel_key(&space_id, &doc_id);
+                debug!(
+                    request_id = request.request_id.as_str(),
+                    space_id = space_id.as_str(),
+                    doc_id = doc_id.as_str(),
+                    timestamp = cache_result.timestamp,
+                    channel_key = channel_key.as_str(),
+                    "socket push-doc-updates userspace broadcasting via SyncHub"
+                );
                 runtime.sync_hub.publish_updates(
                     &channel_key,
                     &update_bytes,

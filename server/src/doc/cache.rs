@@ -576,6 +576,14 @@ impl DocCache {
         space_id: &str,
         doc_id: &str,
     ) -> DocCacheResult<(Vec<u8>, i64)> {
+        debug!(
+            space_type = ?space_type,
+            space_id,
+            doc_id,
+            mode = ?self.mode,
+            "doc cache snapshot requested"
+        );
+
         if let DocCacheMode::Bypass = self.mode {
             return match space_type {
                 SpaceType::Workspace => {

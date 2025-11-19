@@ -19,9 +19,7 @@ use crate::{
     state::{AppState, SocketRuntimeState},
 };
 
-pub(crate) fn build_socket(
-    runtime: Arc<SocketRuntimeState>,
-) -> (SocketIoLayer, SocketIo) {
+pub(crate) fn build_socket(runtime: Arc<SocketRuntimeState>) -> (SocketIoLayer, SocketIo) {
     SocketIo::builder()
         .with_state(runtime.clone())
         .max_payload(100_000_000)

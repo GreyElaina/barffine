@@ -20,7 +20,7 @@ use tokio::{
     task::{JoinHandle, spawn_blocking},
     time::{Duration, sleep},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use barffine_core::{
     access_token::AccessTokenStore,
@@ -56,10 +56,7 @@ use crate::{
     },
     feature_service::FeatureService,
     graphql::copilot::CopilotSessionRecord,
-    socket::{
-        rooms::{RoomKind, SpaceType, space_room_name},
-        types::SocketRequestDeduper,
-    },
+    socket::rooms::{RoomKind, SpaceType, space_room_name},
     types::SessionUser,
     user::service::UserService,
     workspace::service::WorkspaceService,
@@ -106,7 +103,6 @@ pub struct AppState {
     pub socket_metrics: Arc<SocketMetrics>,
     pub workspace_embedding_events: broadcast::Sender<WorkspaceEmbeddingEvent>,
     pub oauth: Arc<OAuthService>,
-    pub request_deduper: Arc<SocketRequestDeduper>,
     pub socket_runtime: Arc<SocketRuntimeState>,
 }
 
@@ -256,7 +252,6 @@ struct RuntimeBundle {
     doc_sessions: Arc<DocSessionManager>,
     socket_runtime: Arc<SocketRuntimeState>,
     socket_metrics: Arc<SocketMetrics>,
-    request_deduper: Arc<SocketRequestDeduper>,
     socket_io: Arc<OnceCell<Arc<SocketIo>>>,
     workspace_embedding_events: broadcast::Sender<WorkspaceEmbeddingEvent>,
 }
@@ -268,12 +263,10 @@ impl RuntimeBundle {
         let (workspace_embedding_events, _) = broadcast::channel(64);
         let doc_sessions = Arc::new(DocSessionManager::default());
         let sync_hub = SyncHub::new(socket_io.clone(), socket_metrics.clone());
-        let request_deduper = Arc::new(SocketRequestDeduper::default());
         let socket_runtime = Arc::new(SocketRuntimeState::new(
             stores.doc_cache.clone(),
             doc_sessions.clone(),
             sync_hub.clone(),
-            request_deduper.clone(),
             socket_metrics.clone(),
             stores.workspace_embedding_files.clone(),
             stores.workspace_embedding_ignored_docs.clone(),
@@ -291,7 +284,6 @@ impl RuntimeBundle {
             doc_sessions,
             socket_runtime,
             socket_metrics,
-            request_deduper,
             socket_io,
             workspace_embedding_events,
         }
@@ -320,7 +312,6 @@ pub struct SocketRuntimeState {
     pub doc_cache: Arc<DocCache>,
     pub doc_sessions: Arc<DocSessionManager>,
     pub sync_hub: SyncHub,
-    pub request_deduper: Arc<SocketRequestDeduper>,
     pub socket_metrics: Arc<SocketMetrics>,
     pub workspace_embedding_files:
         Arc<DashMap<String, HashMap<String, WorkspaceEmbeddingFileRecord>>>,
@@ -339,7 +330,6 @@ impl SocketRuntimeState {
         doc_cache: Arc<DocCache>,
         doc_sessions: Arc<DocSessionManager>,
         sync_hub: SyncHub,
-        request_deduper: Arc<SocketRequestDeduper>,
         socket_metrics: Arc<SocketMetrics>,
         workspace_embedding_files: Arc<
             DashMap<String, HashMap<String, WorkspaceEmbeddingFileRecord>>,
@@ -357,7 +347,6 @@ impl SocketRuntimeState {
             doc_cache,
             doc_sessions,
             sync_hub,
-            request_deduper,
             socket_metrics,
             workspace_embedding_files,
             workspace_embedding_ignored_docs,
@@ -420,6 +409,12 @@ impl SyncHub {
         updates: &[Vec<u8>],
         meta: Option<SocketBroadcastMeta>,
     ) {
+        debug!(
+            channel_key = key,
+            update_count = updates.len(),
+            has_meta = meta.is_some(),
+            "SyncHub.publish_updates invoked"
+        );
         let sender = self.ensure_sender(key);
         for update in updates {
             let _ = sender.send(SyncEvent::update(update.clone()));
@@ -451,6 +446,10 @@ impl SyncHub {
         meta: Option<&SocketBroadcastMeta>,
     ) {
         let Some(io) = self.socket_io.get() else {
+            debug!(
+                channel_key = key,
+                "SyncHub.broadcast_socket_updates skipped; socket.io not initialized"
+            );
             return;
         };
 
@@ -465,13 +464,25 @@ impl SyncHub {
                     meta.timestamp,
                 )
             } else if let Some((space_id, doc_id)) = parse_doc_channel(key) {
+                debug!(
+                    channel_key = key,
+                    "SyncHub.broadcast_socket_updates using parsed channel without meta"
+                );
                 (SpaceType::Workspace, space_id, doc_id, None, None, None)
             } else {
+                debug!(
+                    channel_key = key,
+                    "SyncHub.broadcast_socket_updates aborted; unable to derive space/doc from key"
+                );
                 return;
             };
 
         let base_updates: Vec<String> = updates.iter().map(|bytes| BASE64.encode(bytes)).collect();
         if base_updates.is_empty() {
+            debug!(
+                channel_key = key,
+                "SyncHub.broadcast_socket_updates skipped; no updates to broadcast"
+            );
             return;
         }
 
@@ -953,7 +964,6 @@ pub fn build_state_with_config(
         socket_metrics: runtime.socket_metrics.clone(),
         workspace_embedding_events: runtime.workspace_embedding_events.clone(),
         oauth,
-        request_deduper: runtime.request_deduper.clone(),
         socket_runtime: runtime.socket_runtime.clone(),
     }
 }

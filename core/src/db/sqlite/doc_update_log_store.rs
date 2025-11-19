@@ -43,7 +43,27 @@ impl SqliteDocUpdateLogStore {
     }
 
     pub fn uses_external_storage(&self) -> bool {
-        self.payloads.uses_external_storage()
+        // NOTE:
+        //   For the SQLite backend we always store doc update payloads inline in the
+        //   `doc_updates.update_blob` column, even if a `DocDataBackend` is configured.
+        //
+        //   When `DocDataBackend::Sqlite` is used, the doc-data store shares the same
+        //   underlying SQLite database and connection pool as the main repositories.
+        //   Treating it as an "external" log store would cause `insert_updates` to:
+        //
+        //     1. Insert a row into `doc_updates` inside a transaction, then
+        //     2. Call `payloads.put_external`, which issues another `UPDATE doc_updates`
+        //        through the pool on a separate connection while the first transaction
+        //        still holds a write lock.
+        //
+        //   This easily leads to `SQLITE_BUSY` / "database is locked" errors and surfaces
+        //   as `failed to store doc update log payload for key log:<id>` during
+        //   `space:push-doc-update`.
+        //
+        //   Only the Rocks-backed `DocDataBackend` should be used for truly external
+        //   log payload storage. For SQLite we disable external payloads here so that
+        //   doc updates are kept inline and written once per row.
+        false
     }
 
     pub async fn insert_updates(

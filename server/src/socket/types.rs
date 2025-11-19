@@ -1,8 +1,5 @@
-use std::{
-    fmt,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::fmt;
+use std::sync::Arc;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use dashmap::DashMap;
@@ -119,83 +116,6 @@ impl SocketSpanRegistry {
 
     pub fn remove_space_span(&self, space_type: SpaceType, space_id: &str) {
         self.spaces.remove(&(space_type, space_id.to_string()));
-    }
-}
-
-/// In-memory, short-lived deduper for socket doc update requests.
-///
-/// Keys are `(space_type, space_id, doc_id, request_id)`, and values store the
-/// last acknowledged timestamp (if any) plus an expiry time. This helps avoid
-/// applying the same logical update multiple times when clients retry with the
-/// same request ID.
-#[derive(Clone)]
-pub struct SocketRequestDeduper {
-    entries: Arc<DashMap<(SpaceType, String, String, String), (Option<i64>, Instant)>>,
-    ttl: Duration,
-}
-
-impl Default for SocketRequestDeduper {
-    fn default() -> Self {
-        Self {
-            entries: Arc::new(DashMap::new()),
-            ttl: Duration::from_secs(60),
-        }
-    }
-}
-
-impl SocketRequestDeduper {
-    pub fn new(ttl: Duration) -> Self {
-        Self {
-            entries: Arc::new(DashMap::new()),
-            ttl,
-        }
-    }
-
-    /// Returns `Some(timestamp)` if this request has been seen recently for the
-    /// same `(space, doc, request_id)` combination; `None` otherwise.
-    pub fn check(
-        &self,
-        space_type: SpaceType,
-        space_id: &str,
-        doc_id: &str,
-        request_id: &str,
-    ) -> Option<Option<i64>> {
-        let key = (
-            space_type,
-            space_id.to_string(),
-            doc_id.to_string(),
-            request_id.to_string(),
-        );
-        let now = Instant::now();
-
-        if let Some(entry) = self.entries.get(&key) {
-            let (timestamp, expires_at) = *entry;
-            if now <= expires_at {
-                return Some(timestamp);
-            }
-        }
-
-        // Entry is missing or expired; remove any stale value.
-        self.entries.remove(&key);
-        None
-    }
-
-    pub fn store(
-        &self,
-        space_type: SpaceType,
-        space_id: &str,
-        doc_id: &str,
-        request_id: &str,
-        timestamp: Option<i64>,
-    ) {
-        let key = (
-            space_type,
-            space_id.to_string(),
-            doc_id.to_string(),
-            request_id.to_string(),
-        );
-        let expires_at = Instant::now() + self.ttl;
-        self.entries.insert(key, (timestamp, expires_at));
     }
 }
 

@@ -144,6 +144,15 @@ pub async fn apply_doc_updates<S>(
 where
     S: DocUpdateState,
 {
+    tracing::debug!(
+        ?space_type,
+        workspace_id = workspace_id,
+        doc_id = doc_id,
+        update_count = updates.len(),
+        has_editor = context.editor_id.is_some(),
+        "apply_doc_updates starting"
+    );
+
     let cache_result = state
         .doc_cache()
         .apply_updates(
@@ -155,6 +164,14 @@ where
         )
         .await
         .map_err(AppError::from_anyhow)?;
+
+    tracing::debug!(
+        ?space_type,
+        workspace_id = workspace_id,
+        doc_id = doc_id,
+        timestamp = cache_result.timestamp,
+        "apply_doc_updates cache apply complete"
+    );
 
     let channel_key = doc_channel_key(workspace_id, doc_id);
     let meta = SocketBroadcastMeta::new(

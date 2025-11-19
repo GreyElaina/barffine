@@ -182,8 +182,11 @@ impl DocRoleBackend for RocksDocRoleBackend {
 
         let mut batch = WriteBatch::default();
         for role in roles {
-            let key =
-                Self::role_key(role.workspace_id.as_str(), role.doc_id.as_str(), role.user_id.as_str());
+            let key = Self::role_key(
+                role.workspace_id.as_str(),
+                role.doc_id.as_str(),
+                role.user_id.as_str(),
+            );
             let value = Self::encode_record(role)?;
             batch.put_cf(self.store.doc_roles_cf(), key.as_bytes(), &value);
         }

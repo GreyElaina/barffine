@@ -45,9 +45,7 @@ pub async fn notify_comment_reply(
     let mut notify_ids =
         collect_workspace_owner_target(state, actor_id, comment, &mention_ids).await?;
 
-    if comment.author_id.as_str() != actor_id
-        && !mention_ids.contains(comment.author_id.as_str())
-    {
+    if comment.author_id.as_str() != actor_id && !mention_ids.contains(comment.author_id.as_str()) {
         notify_ids.insert(comment.author_id.clone());
     }
 

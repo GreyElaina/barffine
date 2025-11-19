@@ -285,7 +285,7 @@ mod tests {
         testing::{insert_document, seed_workspace, setup_state},
     };
     use async_graphql::{Request as GraphQLRequest, Value as GraphQLValue};
-use barffine_core::{ids::UserId, notification::NotificationRecord};
+    use barffine_core::{ids::UserId, notification::NotificationRecord};
     use chrono::{Duration, Utc};
     use serde_json::json;
     use uuid::Uuid;
