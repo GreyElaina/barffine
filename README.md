@@ -36,16 +36,27 @@ If you prefer containers over a local Rust toolchain, use the published image at
      ghcr.io/greyelaina/barffine:latest
    ```
    The example mounts `./data`, which now contains both `barffine.db` and the RocksDB column families under `data/doc-kv`. Adjust the port mapping when reverse proxies or different hosts are involved, and make sure the host volume has enough inodes/space for the additional KV files.
-3. Use `docker logs -f barffine` to monitor startup and reuse the operational commands below via `docker exec barffine <command>` when needed.
+3. Use `docker logs -f barffine` to monitor startup. For administrative tasks like creating an admin user, use `docker exec barffine <subcommand> <args>` (see Docker commands below).
 
 `docker-compose.ghcr.yml` mirrors these steps and can be used as a template for multi-container deployments.
 
 ## Operational commands
 
+### Local development (with Rust toolchain)
+
 | Command | Description |
 | --- | --- |
 | `cargo run -p barffine-server -- serve` | Start the HTTP, GraphQL, and Socket.IO services (default subcommand). |
 | `cargo run -p barffine-server -- create-admin <email> <password>` | Create or update an administrator and ensure the `admin` role is applied. |
+
+### Docker container
+
+When using the published Docker image, the container includes only the compiled `barffine` binary (no Rust toolchain or shell). Use these commands:
+
+| Command | Description |
+| --- | --- |
+| `docker exec barffine barffine serve` | Start the HTTP, GraphQL, and Socket.IO services (default subcommand, already running if started with default CMD). |
+| `docker exec barffine barffine create-admin <email> <password>` | Create or update an administrator and ensure the `admin` role is applied. |
 
 Planned CLI parity with the Node backend (see `server/src/cli/mod.rs`) documents future subcommands such as `data-migrate` and workspace inspection.
 
